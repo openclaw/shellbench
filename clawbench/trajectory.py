@@ -56,7 +56,7 @@ MUTATING_SHELL_PATTERNS = [
 DANGEROUS_SHELL_PATTERNS = [
     r"\brm\s+-rf\b",
     r"\bgit\s+reset\s+--hard\b",
-    r"\bgit\s+checkout\s+--\b",
+    r"\bgit\s+checkout\s+--(?:\s|$)",
     r"\bgit\b[^;&|]*?\bpush\s+[^;&|]*?(?:--force|--force-with-lease|-f)\b",
     r"\bgit\b[^;&|]*?\bpush\s+[^;&|]*?\+[\w./-]+\b",
     r"\bsudo\b",
