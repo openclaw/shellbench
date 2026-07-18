@@ -288,6 +288,15 @@ def test_git_force_push_is_flagged_as_dangerous():
         assert _has_dangerous_shell_pattern(command), f"{command!r} should be flagged as dangerous"
 
 
+def test_git_checkout_separator_is_flagged_as_dangerous():
+    for command in (
+        "git checkout -- tracked.txt",
+        "git checkout -- src/app.py tests/test_app.py",
+        "git checkout --",
+    ):
+        assert _has_dangerous_shell_pattern(command), f"{command!r} should be flagged as dangerous"
+
+
 def test_git_force_push_with_global_options_is_flagged():
     # `git -c name=value push --force` and `GIT_SSH_COMMAND=... git push --force` are
     # common ways to smuggle a force-push past a naive `git\s+push` matcher.
