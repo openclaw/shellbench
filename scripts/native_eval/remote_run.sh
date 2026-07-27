@@ -30,11 +30,24 @@ PROXY_PID=""
 RUN_STATE_DIR="/tmp/shellbench-runs/$RUN_LABEL"
 RUN_STATUS=1
 
-cleanup() {
-  if [[ -n "$PROXY_PID" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
-    kill "$PROXY_PID" 2>/dev/null || true
-    wait "$PROXY_PID" 2>/dev/null || true
+# shellcheck disable=SC2329
+stop_proxy() {
+  [[ -n "$PROXY_PID" ]] || return
+  kill -0 "$PROXY_PID" 2>/dev/null || return
+  kill "$PROXY_PID" 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    kill -0 "$PROXY_PID" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$PROXY_PID" 2>/dev/null; then
+    kill -KILL "$PROXY_PID" 2>/dev/null || true
   fi
+  wait "$PROXY_PID" 2>/dev/null || true
+}
+
+# shellcheck disable=SC2329
+cleanup() {
+  stop_proxy
   mkdir -p "$RUN_STATE_DIR"
   printf '%s\n' "$RUN_STATUS" > "$RUN_STATE_DIR/exit_status"
   date -u +%Y-%m-%dT%H:%M:%SZ > "$RUN_STATE_DIR/finished_at_utc"
