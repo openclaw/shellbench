@@ -143,6 +143,7 @@ class FleetConfig:
     max_attempts: int = 2
     task_concurrency: int = 16
     model_max_runs: dict[str, int] = field(default_factory=dict)
+    provider_max_runs: dict[str, int] = field(default_factory=dict)
     model_task_concurrency: dict[str, int] = field(default_factory=dict)
     crabbox_bin: str = "crabbox"
     python_bin: str = sys.executable
@@ -248,6 +249,7 @@ class FleetController:
         if config.warmup_capacity_backoff_seconds < 0:
             raise ValueError("warmup_capacity_backoff_seconds cannot be negative")
         _validate_model_values(config.model_max_runs, "model_max_runs")
+        _validate_model_values(config.provider_max_runs, "provider_max_runs")
         _validate_model_values(config.model_task_concurrency, "model_task_concurrency")
         self.config = config
         self.executor = executor or SubprocessExecutor()
@@ -400,6 +402,7 @@ class FleetController:
                 "max_leases": self.config.max_leases,
                 "task_concurrency": self.config.task_concurrency,
                 "model_max_runs": self.config.model_max_runs,
+                "provider_max_runs": self.config.provider_max_runs,
                 "model_task_concurrency": self.config.model_task_concurrency,
                 "warmup_capacity_attempts": self.config.warmup_capacity_attempts,
                 "warmup_capacity_backoff_seconds": (
@@ -858,15 +861,28 @@ printf '%s\n' "$pid"
             self._run_spec(entry).model_slug
             for entry in [*active_entries, *pending_reservations]
         )
+        active_providers = Counter(
+            self._run_spec(entry).provider
+            for entry in [*active_entries, *pending_reservations]
+        )
         for entry in candidates:
             pending = entry.get("status") == "planned" or (
                 not entry.get("lease") and entry.get("status") in ACTIVE_RUN_STATUSES
             )
             if not pending:
                 continue
-            model_slug = self._run_spec(entry).model_slug
+            run = self._run_spec(entry)
+            model_slug = run.model_slug
             model_limit = self.config.model_max_runs.get(model_slug)
-            if model_limit is None or active_models[model_slug] < model_limit:
+            provider_limit = self.config.provider_max_runs.get(run.provider)
+            model_available = (
+                model_limit is None or active_models[model_slug] < model_limit
+            )
+            provider_available = (
+                provider_limit is None
+                or active_providers[run.provider] < provider_limit
+            )
+            if model_available and provider_available:
                 return str(entry["run_label"])
         return None
 
@@ -1213,6 +1229,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task-concurrency", type=int, default=16)
     parser.add_argument("--model-max-runs", action="append", default=[], metavar="MODEL=COUNT")
     parser.add_argument(
+        "--provider-max-runs",
+        action="append",
+        default=[],
+        metavar="PROVIDER=COUNT",
+    )
+    parser.add_argument(
         "--model-task-concurrency",
         action="append",
         default=[],
@@ -1241,6 +1263,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.model_max_runs,
         "--model-max-runs",
     )
+    args.provider_max_runs = _parse_model_values(
+        parser,
+        args.provider_max_runs,
+        "--provider-max-runs",
+    )
     args.model_task_concurrency = _parse_model_values(
         parser,
         args.model_task_concurrency,
@@ -1261,6 +1288,7 @@ def main(argv: list[str] | None = None) -> int:
         max_attempts=args.max_attempts,
         task_concurrency=args.task_concurrency,
         model_max_runs=args.model_max_runs,
+        provider_max_runs=args.provider_max_runs,
         model_task_concurrency=args.model_task_concurrency,
         crabbox_bin=args.crabbox_bin,
         python_bin=args.python_bin,

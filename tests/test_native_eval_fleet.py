@@ -278,6 +278,7 @@ def _config(
     max_attempts: int = 2,
     task_concurrency: int = 16,
     model_max_runs: dict[str, int] | None = None,
+    provider_max_runs: dict[str, int] | None = None,
     model_task_concurrency: dict[str, int] | None = None,
     warmup_capacity_attempts: int = 12,
     warmup_capacity_backoff_seconds: float = 0,
@@ -300,6 +301,7 @@ def _config(
         max_attempts=max_attempts,
         task_concurrency=task_concurrency,
         model_max_runs=model_max_runs or {},
+        provider_max_runs=provider_max_runs or {},
         model_task_concurrency=model_task_concurrency or {},
         checkpoint_poll_seconds=1,
         warmup_capacity_attempts=warmup_capacity_attempts,
@@ -463,6 +465,65 @@ def test_model_task_concurrency_override_is_used_at_dispatch(tmp_path: Path) -> 
     }
 
 
+def test_provider_cap_counts_adopted_run_before_dispatching_same_provider(
+    tmp_path: Path,
+) -> None:
+    adopted_label = "openclaw-fable5-full-2-r1-20260727"
+    pending_fable_label = "openclaw-fable5-full-2-r2-20260727"
+    pending_gpt_label = "openclaw-gpt55-full-2-r1-20260727"
+    adopted = _planned(_run_spec(adopted_label, model_slug="fable5"))
+    adopted["status"] = "running"
+    adopted["lease"] = {
+        "id": "cbx_existing",
+        "slug": "existing",
+        "provider": "aws",
+        "state": "active",
+    }
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(
+        run_index,
+        [
+            _planned(_run_spec(pending_fable_label, model_slug="fable5")),
+            _planned(_run_spec(pending_gpt_label)),
+            adopted,
+        ],
+    )
+    config = _config(
+        tmp_path,
+        run_index,
+        max_leases=2,
+        provider_max_runs={"anthropic": 1},
+    )
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={
+            adopted_label: 2,
+            pending_fable_label: 2,
+            pending_gpt_label: 2,
+        },
+        running_labels={adopted_label},
+    )
+    executor.leases["cbx_existing"] = {
+        "id": "cbx_existing",
+        "slug": "existing",
+        "state": "active",
+        "ready": True,
+        "serverType": "c7a.24xlarge",
+        "sshHost": "192.0.2.50",
+        "sshUser": "crabbox",
+        "sshPort": "22",
+        "sshKey": "/tmp/cbx_existing.key",
+    }
+    executor.active_leases = 1
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    assert executor.dispatches == [pending_gpt_label, pending_fable_label]
+    adopted_stop = executor.events.index(("stop", "cbx_existing"))
+    pending_fable_dispatch = executor.events.index(("dispatch", pending_fable_label))
+    assert adopted_stop < pending_fable_dispatch
+
+
 def test_slow_capped_model_does_not_block_refilling_eligible_slot(
     tmp_path: Path,
 ) -> None:
@@ -613,12 +674,15 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
             "fable5=1",
             "--model-max-runs",
             "opus48=2",
+            "--provider-max-runs",
+            "anthropic=2",
             "--model-task-concurrency",
             "fable5=2",
         ]
     )
 
     assert args.model_max_runs == {"fable5": 1, "opus48": 2}
+    assert args.provider_max_runs == {"anthropic": 2}
     assert args.model_task_concurrency == {"fable5": 2}
 
 
@@ -629,6 +693,7 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
         ("--model-max-runs", ["=1"]),
         ("--model-max-runs", ["fable5=nope"]),
         ("--model-max-runs", ["fable5=0"]),
+        ("--provider-max-runs", ["anthropic=0"]),
         ("--model-task-concurrency", ["fable5=-1"]),
         ("--model-task-concurrency", ["fable5=1", "fable5=2"]),
     ],
