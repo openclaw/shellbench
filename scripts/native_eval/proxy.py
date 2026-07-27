@@ -13,7 +13,7 @@ def write_proxy_config(path: Path) -> None:
             "model": f"{model.provider}/{model.provider_model_id}",
             "api_key": f"os.environ/{model.provider.upper()}_API_KEY",
         }
-        if model.slug == "gpt55":
+        if model.slug in {"gpt55", "gpt56-sol"}:
             litellm_params["additional_drop_params"] = ["temperature"]
         model_list.append(
             {

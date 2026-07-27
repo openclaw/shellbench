@@ -4,7 +4,7 @@ from pathlib import Path
 from scripts.native_eval.proxy import write_proxy_config
 
 
-def test_gpt55_proxy_drops_unsupported_temperature(tmp_path: Path):
+def test_openai_proxy_models_drop_unsupported_temperature(tmp_path: Path):
     config_path = tmp_path / "proxy.json"
 
     write_proxy_config(config_path)
@@ -14,4 +14,6 @@ def test_gpt55_proxy_drops_unsupported_temperature(tmp_path: Path):
     assert models["sb-gpt55"]["litellm_params"]["additional_drop_params"] == [
         "temperature"
     ]
-    assert "additional_drop_params" not in models["sb-gpt56-sol"]["litellm_params"]
+    assert models["sb-gpt56-sol"]["litellm_params"]["additional_drop_params"] == [
+        "temperature"
+    ]
