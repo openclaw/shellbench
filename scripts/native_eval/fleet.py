@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -153,6 +154,8 @@ class FleetConfig:
     idle_timeout: str = "12h"
     remote_root: str = "/work/crabbox/shellbench-native"
     checkpoint_poll_seconds: int = 30
+    warmup_capacity_attempts: int = 12
+    warmup_capacity_backoff_seconds: float = 5.0
     runner_archive: Path | None = None
     runner_commit: str | None = None
 
@@ -240,6 +243,10 @@ class FleetController:
             raise ValueError("max_attempts must be at least 1")
         if config.task_concurrency < 1:
             raise ValueError("task_concurrency must be at least 1")
+        if config.warmup_capacity_attempts < 1:
+            raise ValueError("warmup_capacity_attempts must be at least 1")
+        if config.warmup_capacity_backoff_seconds < 0:
+            raise ValueError("warmup_capacity_backoff_seconds cannot be negative")
         _validate_model_values(config.model_max_runs, "model_max_runs")
         _validate_model_values(config.model_task_concurrency, "model_task_concurrency")
         self.config = config
@@ -394,6 +401,10 @@ class FleetController:
                 "task_concurrency": self.config.task_concurrency,
                 "model_max_runs": self.config.model_max_runs,
                 "model_task_concurrency": self.config.model_task_concurrency,
+                "warmup_capacity_attempts": self.config.warmup_capacity_attempts,
+                "warmup_capacity_backoff_seconds": (
+                    self.config.warmup_capacity_backoff_seconds
+                ),
                 "crabbox_cli_version": self.crabbox_cli_version,
                 "controller_started_at_utc": utc_now(),
             }
@@ -513,11 +524,7 @@ class FleetController:
             ]
             if self.config.instance_type:
                 command.extend(["--type", self.config.instance_type])
-            self._checked(
-                command,
-                capture_output=True,
-                description=f"lease Crabbox {slug}",
-            )
+            self._warmup_lease(command, slug)
             existing = self._inspect_lease(slug, required=True)
         self._store.update(
             entry["run_label"],
@@ -525,6 +532,24 @@ class FleetController:
             lease={**existing.to_dict(), "started_at_utc": utc_now()},
         )
         return existing
+
+    def _warmup_lease(self, command: Sequence[str], slug: str) -> None:
+        for attempt in range(1, self.config.warmup_capacity_attempts + 1):
+            result = self.executor.run(command, capture_output=True)
+            if result.returncode == 0:
+                return
+            detail = (result.stderr or result.stdout or "").strip()
+            capacity_pending = all(
+                marker in detail.lower()
+                for marker in ("429", "cost_limit_exceeded", "active lease limit")
+            )
+            if not capacity_pending or attempt == self.config.warmup_capacity_attempts:
+                suffix = f": {detail[:500]}" if detail else ""
+                raise FleetError(
+                    f"lease Crabbox {slug} failed with exit {result.returncode}{suffix}"
+                )
+            if self.config.warmup_capacity_backoff_seconds:
+                time.sleep(self.config.warmup_capacity_backoff_seconds)
 
     def _inspect_lease(
         self,
@@ -1206,6 +1231,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="/work/crabbox/shellbench-native",
     )
     parser.add_argument("--checkpoint-poll-seconds", type=int, default=30)
+    parser.add_argument("--warmup-capacity-attempts", type=int, default=12)
+    parser.add_argument("--warmup-capacity-backoff-seconds", type=float, default=5.0)
     parser.add_argument("--runner-archive", type=Path)
     parser.add_argument("--runner-commit")
     args = parser.parse_args(argv)
@@ -1245,6 +1272,8 @@ def main(argv: list[str] | None = None) -> int:
         idle_timeout=args.idle_timeout,
         remote_root=args.remote_root,
         checkpoint_poll_seconds=args.checkpoint_poll_seconds,
+        warmup_capacity_attempts=args.warmup_capacity_attempts,
+        warmup_capacity_backoff_seconds=args.warmup_capacity_backoff_seconds,
         runner_archive=args.runner_archive,
         runner_commit=args.runner_commit,
     )

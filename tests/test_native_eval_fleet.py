@@ -101,6 +101,7 @@ class FakeExecutor:
         checkpoint_blocks: dict[str, threading.Event] | None = None,
         stop_code: int = 0,
         inspect_errors: set[str] | None = None,
+        warmup_capacity_failures: dict[str, int] | None = None,
     ) -> None:
         self.local_root = local_root
         self.expected_counts = expected_counts
@@ -110,6 +111,8 @@ class FakeExecutor:
         self.checkpoint_blocks = checkpoint_blocks or {}
         self.stop_code = stop_code
         self.inspect_errors = inspect_errors or set()
+        self.warmup_capacity_failures = warmup_capacity_failures or {}
+        self.warmup_attempts: dict[str, int] = {}
         self.leases: dict[str, dict[str, object]] = {}
         self.commands: list[list[str]] = []
         self.events: list[tuple[str, str]] = []
@@ -162,6 +165,18 @@ class FakeExecutor:
         if argv[:2] == ["crabbox", "warmup"]:
             slug = argv[argv.index("--slug") + 1]
             with self._lock:
+                attempt = self.warmup_attempts.get(slug, 0) + 1
+                self.warmup_attempts[slug] = attempt
+                if attempt <= self.warmup_capacity_failures.get(slug, 0):
+                    return _result(
+                        argv,
+                        1,
+                        stderr=(
+                            "coordinator POST /v1/leases: http 429: "
+                            '{"error":"cost_limit_exceeded",'
+                            '"message":"Active lease limit 11/10"}'
+                        ),
+                    )
                 self._next_lease += 1
                 lease_id = f"cbx_{self._next_lease}"
                 self.active_leases += 1
@@ -264,6 +279,8 @@ def _config(
     task_concurrency: int = 16,
     model_max_runs: dict[str, int] | None = None,
     model_task_concurrency: dict[str, int] | None = None,
+    warmup_capacity_attempts: int = 12,
+    warmup_capacity_backoff_seconds: float = 0,
 ) -> FleetConfig:
     runner_archive = tmp_path / "runner.tar.gz"
     task_archive = tmp_path / "tasks.tar.gz"
@@ -285,6 +302,8 @@ def _config(
         model_max_runs=model_max_runs or {},
         model_task_concurrency=model_task_concurrency or {},
         checkpoint_poll_seconds=1,
+        warmup_capacity_attempts=warmup_capacity_attempts,
+        warmup_capacity_backoff_seconds=warmup_capacity_backoff_seconds,
     )
 
 
@@ -315,6 +334,43 @@ def test_controller_runs_bounded_wave_and_stops_after_verified_export(
         stop_at = executor.events.index(("stop", lease_id))
         assert checkpoint_at < stop_at
     assert "TOPSECRET" not in "\n".join(" ".join(command) for command in executor.commands)
+
+
+def test_capacity_warmup_retries_same_run_without_recovery_churn(
+    tmp_path: Path,
+) -> None:
+    retry_label = "openclaw-gpt55-full-2-r1-20260727"
+    untouched_label = "openclaw-gpt55-full-2-r2-20260727"
+    retry_run = _planned(_run_spec(retry_label))
+    retry_run["requested_lease_slug"] = "capacity-retry"
+    untouched_run = _planned(_run_spec(untouched_label))
+    untouched_run["requested_lease_slug"] = "untouched"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [retry_run, untouched_run])
+    config = _config(
+        tmp_path,
+        run_index,
+        max_leases=1,
+        warmup_capacity_attempts=3,
+        warmup_capacity_backoff_seconds=0,
+    )
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={retry_label: 2, untouched_label: 2},
+        warmup_capacity_failures={"capacity-retry": 2},
+    )
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    runs = json.loads(run_index.read_text(encoding="utf-8"))["runs"]
+    assert [run["run_label"] for run in runs] == [retry_label, untouched_label]
+    assert [run["status"] for run in runs] == ["completed", "completed"]
+    assert all(run["rerun_of"] is None for run in runs)
+    assert executor.warmup_attempts == {
+        "capacity-retry": 3,
+        "untouched": 1,
+    }
+    assert executor.dispatches == [retry_label, untouched_label]
 
 
 def test_model_cap_counts_adopted_run_before_dispatching_same_model(
