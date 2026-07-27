@@ -29,7 +29,7 @@
 #   MLFLOW_TRACKING_URI            External MLflow URI (skips MLflow deploy if set)
 #   MLFLOW_EXPERIMENT_ID           MLflow experiment ID
 #   MLFLOW_EXPERIMENT_NAME         MLflow experiment name
-#   MLFLOW_IMAGE                   MLflow image (default: ghcr.io/mlflow/mlflow:v2.21.3)
+#   MLFLOW_IMAGE                   MLflow image (default: ghcr.io/mlflow/mlflow:v3.14.0)
 #   ANTHROPIC_API_KEY              Anthropic key (added to secret if set)
 #   OPENROUTER_API_KEY             OpenRouter key (added to secret if set)
 #   GEMINI_API_KEY                 Gemini key (added to secret if set)
@@ -40,7 +40,7 @@ NS="${CLAWBENCH_NAMESPACE:-}"
 MLFLOW_NS="${MLFLOW_NAMESPACE:-mlflow}"
 CLAWBENCH_IMG="${CLAWBENCH_IMAGE:-quay.io/sallyom/clawbench:latest}"
 OPENCLAW_IMG="${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}"
-MLFLOW_IMG="${MLFLOW_IMAGE:-ghcr.io/mlflow/mlflow:v2.21.3}"
+MLFLOW_IMG="${MLFLOW_IMAGE:-ghcr.io/mlflow/mlflow:v3.14.0}"
 
 # ---------------------------------------------------------------------------
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -80,7 +80,7 @@ Optional environment:
   MLFLOW_TRACKING_URI          External MLflow URI (skips MLflow deploy)
   MLFLOW_EXPERIMENT_ID         MLflow experiment ID
   MLFLOW_EXPERIMENT_NAME       MLflow experiment name
-  MLFLOW_IMAGE                 MLflow image (default: ghcr.io/mlflow/mlflow:v2.21.3)
+  MLFLOW_IMAGE                 MLflow image (default: ghcr.io/mlflow/mlflow:v3.14.0)
   ANTHROPIC_API_KEY            Anthropic key (added to secret if set)
   OPENROUTER_API_KEY           OpenRouter key (added to secret if set)
   GEMINI_API_KEY               Gemini key (added to secret if set)
@@ -254,7 +254,7 @@ deploy_mlflow() {
   kubectl apply -f "$SCRIPT_DIR/mlflow/pvc.yaml" -n "$MLFLOW_NS"
   kubectl apply -f "$SCRIPT_DIR/mlflow/service.yaml" -n "$MLFLOW_NS"
 
-  if [[ "$MLFLOW_IMG" != "ghcr.io/mlflow/mlflow:v2.21.3" ]]; then
+  if [[ "$MLFLOW_IMG" != "ghcr.io/mlflow/mlflow:v3.14.0" ]]; then
     kubectl apply -f "$SCRIPT_DIR/mlflow/deployment.yaml" -n "$MLFLOW_NS"
     kubectl set image "deploy/mlflow" "mlflow=$MLFLOW_IMG" -n "$MLFLOW_NS"
   else

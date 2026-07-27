@@ -39,7 +39,7 @@ def test_crabbox_workflow_hydrates_secrets_dotfiles_and_ready_marker():
     assert "crabbox_id:" in workflow
     assert "crabbox_runner_label:" in workflow
     assert 'runs-on: [self-hosted, "${{ inputs.crabbox_runner_label }}"]' in workflow
-    assert "actions/setup-python@v5" in workflow
+    assert "actions/setup-python@v7.0.0" in workflow
     assert "python -m pip install -e ." in workflow
     assert "scripts/ci-hydrate-testbox-env.sh" in workflow
     assert "HF_TOKEN" in workflow
