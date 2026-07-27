@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import hashlib
 import os
 import re
@@ -183,4 +182,3 @@ def _directory_checksum(path: Path) -> str:
                 digest.update(chunk)
         digest.update(b"\0")
     return digest.hexdigest()
-
