@@ -10,8 +10,9 @@ import subprocess
 import sys
 import tarfile
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
@@ -42,6 +43,8 @@ RESUMABLE_STATUSES = {
     "stop_pending",
 }
 RERUN_STATUSES = {"failed", "lease_lost"}
+ACTIVE_RUN_STATUSES = {"leasing", "bootstrapping", "ready", "running"}
+CLEANUP_STATUSES = {"exported", "stop_pending"}
 
 
 class CommandExecutor(Protocol):
@@ -138,6 +141,8 @@ class FleetConfig:
     max_leases: int = 10
     max_attempts: int = 2
     task_concurrency: int = 16
+    model_max_runs: dict[str, int] = field(default_factory=dict)
+    model_task_concurrency: dict[str, int] = field(default_factory=dict)
     crabbox_bin: str = "crabbox"
     python_bin: str = sys.executable
     machine_class: str = "beast"
@@ -233,6 +238,10 @@ class FleetController:
             raise ValueError("max_leases must be at least 1")
         if config.max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
+        if config.task_concurrency < 1:
+            raise ValueError("task_concurrency must be at least 1")
+        _validate_model_values(config.model_max_runs, "model_max_runs")
+        _validate_model_values(config.model_task_concurrency, "model_task_concurrency")
         self.config = config
         self.executor = executor or SubprocessExecutor()
         self.store: RunIndexStore | None = None
@@ -253,27 +262,33 @@ class FleetController:
             self._schedule_existing_reruns()
 
             attempted_labels: set[str] = set()
-            while True:
-                labels = [
-                    label
-                    for label in self.store.labels_with_status(RESUMABLE_STATUSES)
-                    if label not in attempted_labels
-                ]
-                if not labels:
-                    break
-                wave = labels[: self.config.max_leases]
-                attempted_labels.update(wave)
-                with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-                    futures = {pool.submit(self._execute_entry, label): label for label in wave}
-                    for future in as_completed(futures):
+            with ThreadPoolExecutor(max_workers=self.config.max_leases) as pool:
+                futures: dict[Future[bool], str] = {}
+                while True:
+                    while len(futures) < self.config.max_leases:
+                        label = self._next_schedulable_label(
+                            attempted_labels,
+                            set(futures.values()),
+                        )
+                        if label is None:
+                            break
+                        attempted_labels.add(label)
+                        futures[pool.submit(self._execute_entry, label)] = label
+
+                    if not futures:
+                        break
+
+                    completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        label = futures.pop(future)
                         try:
                             future.result()
                         except Exception as exc:
                             self._mark_recovery_required(
-                                futures[future],
+                                label,
                                 f"unexpected controller error: {exc}",
                             )
-                self._schedule_existing_reruns()
+                    self._schedule_existing_reruns()
 
             unfinished = self.store.labels_with_status(RESUMABLE_STATUSES | {"recovery_required"})
             return 1 if unfinished or not self._matrix_satisfied() else 0
@@ -377,6 +392,8 @@ class FleetController:
                 "region": self.config.region,
                 "max_leases": self.config.max_leases,
                 "task_concurrency": self.config.task_concurrency,
+                "model_max_runs": self.config.model_max_runs,
+                "model_task_concurrency": self.config.model_task_concurrency,
                 "crabbox_cli_version": self.crabbox_cli_version,
                 "controller_started_at_utc": utc_now(),
             }
@@ -737,7 +754,7 @@ printf '%s\n' "$pid"
             str(run.expected_task_count),
             str(self._store.data["public_tasks_commit"]),
             run.run_date,
-            str(self.config.task_concurrency),
+            str(self._task_concurrency(run.model_slug)),
         ]
         self._checked(
             self._ssh_command(
@@ -765,6 +782,60 @@ printf '%s\n' "$pid"
         self._store.update(
             run.run_label,
             dispatched_at_utc=utc_now(),
+            task_concurrency=self._task_concurrency(run.model_slug),
+        )
+
+    def _next_schedulable_label(
+        self,
+        attempted_labels: set[str],
+        in_flight_labels: set[str],
+    ) -> str | None:
+        entries = self._store.all_entries()
+        candidates = [
+            entry
+            for entry in entries
+            if entry.get("status") in RESUMABLE_STATUSES
+            and entry["run_label"] not in attempted_labels
+        ]
+        for statuses in (CLEANUP_STATUSES, ACTIVE_RUN_STATUSES):
+            for entry in candidates:
+                if entry.get("status") in statuses:
+                    return str(entry["run_label"])
+
+        active_entries = [
+            entry for entry in entries if entry.get("status") in ACTIVE_RUN_STATUSES
+        ]
+        cleanup_entries = [
+            entry for entry in entries if entry.get("status") in CLEANUP_STATUSES
+        ]
+        planned_reservations = [
+            entry
+            for entry in entries
+            if entry["run_label"] in in_flight_labels and entry.get("status") == "planned"
+        ]
+        occupied_slots = (
+            len(active_entries) + len(cleanup_entries) + len(planned_reservations)
+        )
+        if occupied_slots >= self.config.max_leases:
+            return None
+
+        active_models = Counter(
+            self._run_spec(entry).model_slug
+            for entry in [*active_entries, *planned_reservations]
+        )
+        for entry in candidates:
+            if entry.get("status") != "planned":
+                continue
+            model_slug = self._run_spec(entry).model_slug
+            model_limit = self.config.model_max_runs.get(model_slug)
+            if model_limit is None or active_models[model_slug] < model_limit:
+                return str(entry["run_label"])
+        return None
+
+    def _task_concurrency(self, model_slug: str) -> int:
+        return self.config.model_task_concurrency.get(
+            model_slug,
+            self.config.task_concurrency,
         )
 
     def _run_checkpoint_loop(
@@ -1062,6 +1133,36 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_model_values(values: dict[str, int], name: str) -> None:
+    for model_slug, value in values.items():
+        if not model_slug:
+            raise ValueError(f"{name} contains an empty model slug")
+        if not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name}[{model_slug!r}] must be a positive integer")
+
+
+def _parse_model_values(
+    parser: argparse.ArgumentParser,
+    values: list[str],
+    option: str,
+) -> dict[str, int]:
+    parsed: dict[str, int] = {}
+    for raw in values:
+        model_slug, separator, count_value = raw.partition("=")
+        if not separator or not model_slug or not count_value:
+            parser.error(f"{option} must use MODEL=COUNT: {raw!r}")
+        if model_slug in parsed:
+            parser.error(f"{option} repeats model {model_slug!r}")
+        try:
+            count = int(count_value)
+        except ValueError:
+            parser.error(f"{option} count must be an integer: {raw!r}")
+        if count < 1:
+            parser.error(f"{option} count must be positive: {raw!r}")
+        parsed[model_slug] = count
+    return parsed
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-index", type=Path, required=True)
@@ -1072,6 +1173,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-leases", type=int, default=10)
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--task-concurrency", type=int, default=16)
+    parser.add_argument("--model-max-runs", action="append", default=[], metavar="MODEL=COUNT")
+    parser.add_argument(
+        "--model-task-concurrency",
+        action="append",
+        default=[],
+        metavar="MODEL=COUNT",
+    )
     parser.add_argument("--crabbox-bin", default="crabbox")
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--machine-class", default="beast")
@@ -1087,7 +1195,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-poll-seconds", type=int, default=30)
     parser.add_argument("--runner-archive", type=Path)
     parser.add_argument("--runner-commit")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.model_max_runs = _parse_model_values(
+        parser,
+        args.model_max_runs,
+        "--model-max-runs",
+    )
+    args.model_task_concurrency = _parse_model_values(
+        parser,
+        args.model_task_concurrency,
+        "--model-task-concurrency",
+    )
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1101,6 +1220,8 @@ def main(argv: list[str] | None = None) -> int:
         max_leases=args.max_leases,
         max_attempts=args.max_attempts,
         task_concurrency=args.task_concurrency,
+        model_max_runs=args.model_max_runs,
+        model_task_concurrency=args.model_task_concurrency,
         crabbox_bin=args.crabbox_bin,
         python_bin=args.python_bin,
         machine_class=args.machine_class,

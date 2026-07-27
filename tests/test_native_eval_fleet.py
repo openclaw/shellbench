@@ -1,25 +1,33 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import tarfile
 import threading
 from pathlib import Path
 from typing import Sequence
 
-from scripts.native_eval.fleet import FleetConfig, FleetController
+import pytest
+
+from scripts.native_eval.fleet import FleetConfig, FleetController, parse_args
 from scripts.native_eval.models import RunSpec
 
 
-def _run_spec(label: str, *, expected_task_count: int = 2) -> RunSpec:
+def _run_spec(
+    label: str,
+    *,
+    expected_task_count: int = 2,
+    model_slug: str = "gpt55",
+) -> RunSpec:
     return RunSpec(
         run_label=label,
         harness="openclaw",
         harness_version="test",
-        model_slug="gpt55",
-        model_id="gpt-5.5",
-        provider="openai",
-        proxy_model_name="sb-gpt55",
+        model_slug=model_slug,
+        model_id=f"provider/{model_slug}",
+        provider="anthropic" if model_slug == "fable5" else "openai",
+        proxy_model_name=f"sb-{model_slug}",
         repetition=1,
         expected_task_count=expected_task_count,
         run_date="20260727",
@@ -90,6 +98,7 @@ class FakeExecutor:
         checkpoint_codes: dict[str, int] | None = None,
         omit_final: set[str] | None = None,
         running_labels: set[str] | None = None,
+        checkpoint_blocks: dict[str, threading.Event] | None = None,
         stop_code: int = 0,
         inspect_errors: set[str] | None = None,
     ) -> None:
@@ -98,14 +107,17 @@ class FakeExecutor:
         self.checkpoint_codes = checkpoint_codes or {}
         self.omit_final = omit_final or set()
         self.remote_states = {label: "running" for label in (running_labels or set())}
+        self.checkpoint_blocks = checkpoint_blocks or {}
         self.stop_code = stop_code
         self.inspect_errors = inspect_errors or set()
         self.leases: dict[str, dict[str, object]] = {}
         self.commands: list[list[str]] = []
         self.events: list[tuple[str, str]] = []
         self.dispatches: list[str] = []
+        self.dispatch_concurrency: dict[str, int] = {}
         self.stops: list[str] = []
         self._lock = threading.Lock()
+        self._dispatch_condition = threading.Condition(self._lock)
         self._next_lease = 0
         self.active_leases = 0
         self.max_active_leases = 0
@@ -179,6 +191,9 @@ class FakeExecutor:
             label = argv[argv.index("--run-label") + 1]
             with self._lock:
                 self.events.append(("checkpoint", label))
+            block = self.checkpoint_blocks.get(label)
+            if block is not None:
+                block.wait()
             if label not in self.omit_final:
                 _write_final(
                     self.local_root,
@@ -202,13 +217,23 @@ class FakeExecutor:
                 for candidate in sorted(self.expected_counts, key=len, reverse=True)
                 if candidate in joined
             )
-            with self._lock:
+            remote_command = shlex.split(argv[-1])
+            with self._dispatch_condition:
                 self.dispatches.append(label)
+                self.dispatch_concurrency[label] = int(remote_command[-1])
                 self.events.append(("dispatch", label))
                 self.remote_states[label] = "running"
+                self._dispatch_condition.notify_all()
             return _result(argv, 0, stdout="1234")
 
         return _result(argv, 0)
+
+    def wait_for_dispatch(self, run_label: str, timeout: float) -> bool:
+        with self._dispatch_condition:
+            return self._dispatch_condition.wait_for(
+                lambda: run_label in self.dispatches,
+                timeout=timeout,
+            )
 
 
 def _result(
@@ -232,6 +257,9 @@ def _config(
     *,
     max_leases: int = 1,
     max_attempts: int = 2,
+    task_concurrency: int = 16,
+    model_max_runs: dict[str, int] | None = None,
+    model_task_concurrency: dict[str, int] | None = None,
 ) -> FleetConfig:
     runner_archive = tmp_path / "runner.tar.gz"
     task_archive = tmp_path / "tasks.tar.gz"
@@ -249,6 +277,9 @@ def _config(
         env_file=env_file,
         max_leases=max_leases,
         max_attempts=max_attempts,
+        task_concurrency=task_concurrency,
+        model_max_runs=model_max_runs or {},
+        model_task_concurrency=model_task_concurrency or {},
         checkpoint_poll_seconds=1,
     )
 
@@ -280,6 +311,206 @@ def test_controller_runs_bounded_wave_and_stops_after_verified_export(
         stop_at = executor.events.index(("stop", lease_id))
         assert checkpoint_at < stop_at
     assert "TOPSECRET" not in "\n".join(" ".join(command) for command in executor.commands)
+
+
+def test_model_cap_counts_adopted_run_before_dispatching_same_model(
+    tmp_path: Path,
+) -> None:
+    adopted_label = "openclaw-fable5-full-2-r1-20260727"
+    pending_fable_label = "openclaw-fable5-full-2-r2-20260727"
+    pending_gpt_label = "openclaw-gpt55-full-2-r1-20260727"
+    adopted = _planned(_run_spec(adopted_label, model_slug="fable5"))
+    adopted["status"] = "running"
+    adopted["lease"] = {
+        "id": "cbx_existing",
+        "slug": "existing",
+        "provider": "aws",
+        "state": "active",
+    }
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(
+        run_index,
+        [
+            _planned(_run_spec(pending_fable_label, model_slug="fable5")),
+            _planned(_run_spec(pending_gpt_label)),
+            adopted,
+        ],
+    )
+    config = _config(
+        tmp_path,
+        run_index,
+        max_leases=2,
+        model_max_runs={"fable5": 1},
+    )
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={
+            adopted_label: 2,
+            pending_fable_label: 2,
+            pending_gpt_label: 2,
+        },
+        running_labels={adopted_label},
+    )
+    executor.leases["cbx_existing"] = {
+        "id": "cbx_existing",
+        "slug": "existing",
+        "state": "active",
+        "ready": True,
+        "serverType": "c7a.24xlarge",
+        "sshHost": "192.0.2.50",
+        "sshUser": "crabbox",
+        "sshPort": "22",
+        "sshKey": "/tmp/cbx_existing.key",
+    }
+    executor.active_leases = 1
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    assert executor.dispatches == [pending_gpt_label, pending_fable_label]
+    adopted_stop = executor.events.index(("stop", "cbx_existing"))
+    pending_fable_dispatch = executor.events.index(("dispatch", pending_fable_label))
+    assert adopted_stop < pending_fable_dispatch
+
+
+def test_model_task_concurrency_override_is_used_at_dispatch(tmp_path: Path) -> None:
+    fable_label = "openclaw-fable5-full-2-r1-20260727"
+    gpt_label = "openclaw-gpt55-full-2-r1-20260727"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(
+        run_index,
+        [
+            _planned(_run_spec(fable_label, model_slug="fable5")),
+            _planned(_run_spec(gpt_label)),
+        ],
+    )
+    config = _config(
+        tmp_path,
+        run_index,
+        max_leases=2,
+        task_concurrency=16,
+        model_task_concurrency={"fable5": 2},
+    )
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={fable_label: 2, gpt_label: 2},
+    )
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    assert executor.dispatch_concurrency == {
+        fable_label: 2,
+        gpt_label: 16,
+    }
+
+
+def test_slow_capped_model_does_not_block_refilling_eligible_slot(
+    tmp_path: Path,
+) -> None:
+    slow_fable = "openclaw-fable5-full-2-r1-20260727"
+    fast_gpt = "openclaw-gpt55-full-2-r1-20260727"
+    capped_fable = "openclaw-fable5-full-2-r2-20260727"
+    later_gpt = "openclaw-gpt55-full-2-r2-20260727"
+    labels = [slow_fable, fast_gpt, capped_fable, later_gpt]
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(
+        run_index,
+        [
+            _planned(_run_spec(slow_fable, model_slug="fable5")),
+            _planned(_run_spec(fast_gpt)),
+            _planned(_run_spec(capped_fable, model_slug="fable5")),
+            _planned(_run_spec(later_gpt)),
+        ],
+    )
+    config = _config(
+        tmp_path,
+        run_index,
+        max_leases=2,
+        model_max_runs={"fable5": 1},
+    )
+    release_slow = threading.Event()
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={label: 2 for label in labels},
+        checkpoint_blocks={slow_fable: release_slow},
+    )
+    result: list[int] = []
+    controller = threading.Thread(
+        target=lambda: result.append(FleetController(config, executor=executor).run())
+    )
+    controller.start()
+    try:
+        assert executor.wait_for_dispatch(later_gpt, timeout=2)
+        assert capped_fable not in executor.dispatches
+        assert not release_slow.is_set()
+    finally:
+        release_slow.set()
+        controller.join(timeout=5)
+
+    assert not controller.is_alive()
+    assert result == [0]
+    assert executor.dispatches.index(later_gpt) < executor.dispatches.index(capped_fable)
+    assert executor.max_active_leases == 2
+
+
+def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
+    args = parse_args(
+        [
+            "--run-index",
+            str(tmp_path / "index.json"),
+            "--local-root",
+            str(tmp_path / "runs"),
+            "--runner-root",
+            str(tmp_path / "runner"),
+            "--task-archive",
+            str(tmp_path / "tasks.tar.gz"),
+            "--env-file",
+            str(tmp_path / ".env"),
+            "--model-max-runs",
+            "fable5=1",
+            "--model-max-runs",
+            "opus48=2",
+            "--model-task-concurrency",
+            "fable5=2",
+        ]
+    )
+
+    assert args.model_max_runs == {"fable5": 1, "opus48": 2}
+    assert args.model_task_concurrency == {"fable5": 2}
+
+
+@pytest.mark.parametrize(
+    ("option", "values"),
+    [
+        ("--model-max-runs", ["fable5"]),
+        ("--model-max-runs", ["=1"]),
+        ("--model-max-runs", ["fable5=nope"]),
+        ("--model-max-runs", ["fable5=0"]),
+        ("--model-task-concurrency", ["fable5=-1"]),
+        ("--model-task-concurrency", ["fable5=1", "fable5=2"]),
+    ],
+)
+def test_parse_args_rejects_invalid_model_values(
+    tmp_path: Path,
+    option: str,
+    values: list[str],
+) -> None:
+    argv = [
+        "--run-index",
+        str(tmp_path / "index.json"),
+        "--local-root",
+        str(tmp_path / "runs"),
+        "--runner-root",
+        str(tmp_path / "runner"),
+        "--task-archive",
+        str(tmp_path / "tasks.tar.gz"),
+        "--env-file",
+        str(tmp_path / ".env"),
+    ]
+    for value in values:
+        argv.extend([option, value])
+
+    with pytest.raises(SystemExit):
+        parse_args(argv)
 
 
 def test_failed_run_is_preserved_and_suffixed_rerun_completes(
