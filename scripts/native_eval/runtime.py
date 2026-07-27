@@ -682,9 +682,9 @@ def collect_agent_metrics(harness: str, agent_dir: Path) -> dict[str, Any]:
     events = _load_json_events(path)
     for event in events:
         usage = _find_usage(event)
-        if not usage:
-            continue
-        _merge_usage(metrics, usage)
+        if usage:
+            _merge_usage(metrics, usage)
+        _merge_event_cost(metrics, event)
     return metrics
 
 
@@ -739,6 +739,7 @@ def _merge_usage(metrics: dict[str, Any], usage: dict[str, Any]) -> None:
         ),
         "n_cache_tokens": (
             "cache_read_input_tokens",
+            "cached_input_tokens",
             "cacheRead",
             "cached_tokens",
             "total_cached_tokens",
@@ -757,6 +758,14 @@ def _merge_usage(metrics: dict[str, Any], usage: dict[str, Any]) -> None:
             if isinstance(value, (int, float)):
                 metrics[target] = value
                 break
+
+
+def _merge_event_cost(metrics: dict[str, Any], event: dict[str, Any]) -> None:
+    for key in ("total_cost_usd", "cost_usd", "total_cost"):
+        value = event.get(key)
+        if isinstance(value, (int, float)):
+            metrics["cost_usd"] = value
+            return
 
 
 def write_minimal_trajectory(task: TaskSpec, run: RunSpec, agent_dir: Path) -> None:

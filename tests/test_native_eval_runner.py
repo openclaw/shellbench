@@ -16,7 +16,7 @@ from scripts.native_eval.models import (
     build_matrix_plan,
 )
 from scripts.native_eval.proxy import write_proxy_config
-from scripts.native_eval.runtime import read_reward
+from scripts.native_eval.runtime import collect_agent_metrics, read_reward
 from scripts.native_eval.tasks import TaskSpec, validate_suite
 
 
@@ -195,6 +195,57 @@ def test_claude_code_selects_proxy_alias_explicitly() -> None:
 
     assert "--model sb-gpt55" in command.run_command
     assert command.env["ANTHROPIC_MODEL"] == "sb-gpt55"
+
+
+def test_codex_metrics_include_cached_input_tokens(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 212_605,
+                    "cached_input_tokens": 186_240,
+                    "output_tokens": 4_605,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    metrics = collect_agent_metrics("codex", agent_dir)
+
+    assert metrics["n_input_tokens"] == 212_605
+    assert metrics["n_cache_tokens"] == 186_240
+    assert metrics["n_output_tokens"] == 4_605
+
+
+def test_claude_metrics_include_top_level_cost(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "claude-code.txt").write_text(
+        json.dumps(
+            {
+                "type": "result",
+                "total_cost_usd": 2.23827,
+                "usage": {
+                    "input_tokens": 377_989,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 13_933,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    metrics = collect_agent_metrics("claude-code", agent_dir)
+
+    assert metrics["n_input_tokens"] == 377_989
+    assert metrics["n_output_tokens"] == 13_933
+    assert metrics["cost_usd"] == 2.23827
 
 
 def test_reward_json_takes_precedence_over_text(tmp_path: Path) -> None:
