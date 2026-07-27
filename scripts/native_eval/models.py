@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from datetime import date
+from typing import Iterable
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    slug: str
+    friendly_name: str
+    provider: str
+    provider_model_id: str
+    proxy_model_name: str
+
+
+@dataclass(frozen=True)
+class HarnessSpec:
+    name: str
+    version: str
+
+
+@dataclass(frozen=True)
+class RunSpec:
+    run_label: str
+    harness: str
+    harness_version: str
+    model_slug: str
+    model_id: str
+    provider: str
+    proxy_model_name: str
+    repetition: int
+    expected_task_count: int
+    run_date: str
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+MODELS: tuple[ModelSpec, ...] = (
+    ModelSpec("gpt55", "gpt-5.5", "openai", "gpt-5.5", "sb-gpt55"),
+    ModelSpec(
+        "gpt56-sol",
+        "gpt-5.6-sol",
+        "openai",
+        "gpt-5.6-sol",
+        "sb-gpt56-sol",
+    ),
+    ModelSpec(
+        "fable5",
+        "fable-5",
+        "anthropic",
+        "claude-fable-5",
+        "sb-fable5",
+    ),
+    ModelSpec(
+        "opus47",
+        "opus-4.7",
+        "anthropic",
+        "claude-opus-4-7",
+        "sb-opus47",
+    ),
+    ModelSpec(
+        "opus48",
+        "opus-4.8",
+        "anthropic",
+        "claude-opus-4-8",
+        "sb-opus48",
+    ),
+    ModelSpec(
+        "opus5",
+        "opus-5",
+        "anthropic",
+        "claude-opus-5",
+        "sb-opus5",
+    ),
+)
+
+HARNESSES: tuple[HarnessSpec, ...] = (
+    HarnessSpec("openclaw", "2026.7.1-2"),
+    HarnessSpec("hermes", "cb06017b1d6e1b9ae0cb35f99a48ffa6bcbaa828"),
+    HarnessSpec("codex", "0.145.0"),
+    HarnessSpec("claude-code", "2.1.220"),
+)
+
+NODE_VERSION = "22.23.1"
+LITELLM_VERSION = "1.93.0"
+
+
+def model_by_slug(slug: str) -> ModelSpec:
+    for model in MODELS:
+        if model.slug == slug:
+            return model
+    raise KeyError(f"Unknown model slug: {slug}")
+
+
+def harness_by_name(name: str) -> HarnessSpec:
+    for harness in HARNESSES:
+        if harness.name == name:
+            return harness
+    raise KeyError(f"Unknown harness: {name}")
+
+
+def build_matrix_plan(
+    expected_task_count: int,
+    *,
+    run_date: str | None = None,
+    harnesses: Iterable[HarnessSpec] = HARNESSES,
+    models: Iterable[ModelSpec] = MODELS,
+    repetitions: Iterable[int] = (1, 2, 3),
+) -> list[RunSpec]:
+    stamp = run_date or date.today().strftime("%Y%m%d")
+    plan: list[RunSpec] = []
+    for harness in harnesses:
+        for model in models:
+            for repetition in repetitions:
+                label = (
+                    f"{harness.name}-{model.slug}-full-"
+                    f"{expected_task_count}-r{repetition}-{stamp}"
+                )
+                plan.append(
+                    RunSpec(
+                        run_label=label,
+                        harness=harness.name,
+                        harness_version=harness.version,
+                        model_slug=model.slug,
+                        model_id=model.provider_model_id,
+                        provider=model.provider,
+                        proxy_model_name=model.proxy_model_name,
+                        repetition=repetition,
+                        expected_task_count=expected_task_count,
+                        run_date=stamp,
+                    )
+                )
+    return plan
+
