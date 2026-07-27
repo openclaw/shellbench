@@ -193,8 +193,10 @@ def pull_checkpoint(
 def pull_final(
     *,
     client: SSHClient,
+    remote_root: str,
     run_label: str,
     raw_dir: Path,
+    logs_dir: Path,
     log_path: Path,
 ) -> int:
     archive_name = f"{run_label}-final-artifacts.tar.gz"
@@ -209,6 +211,14 @@ def pull_final(
         archive_name=archive_name,
         result_count=result_count,
     )
+    for suffix in ("stdout", "stderr"):
+        local_log = logs_dir / f"{run_label}.{suffix}.log"
+        if local_log.exists():
+            raise FileExistsError(f"refusing to overwrite run log: {local_log}")
+        client.copy_from(
+            f"{remote_root}/run-logs/{run_label}.{suffix}.log",
+            local_log,
+        )
     return result_count
 
 
@@ -306,8 +316,10 @@ def run_loop(args: argparse.Namespace) -> int:
                 )
             final_count = pull_final(
                 client=client,
+                remote_root=args.remote_root,
                 run_label=args.run_label,
                 raw_dir=raw_dir,
+                logs_dir=logs_dir,
                 log_path=log_path,
             )
             return state.exit_status or (0 if final_count else 1)

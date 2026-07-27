@@ -42,6 +42,15 @@ if [[ -d "$PROXY_DIR" ]]; then
   rsync -a --exclude '*.tmp' "$PROXY_DIR/" \
     "$SNAPSHOT_DIR/proxy/$RUN_LABEL/"
 fi
+if [[ -d "$ROOT/run-logs" ]]; then
+  mkdir -p "$SNAPSHOT_DIR/run-logs"
+  for suffix in stdout stderr; do
+    source_log="$ROOT/run-logs/$RUN_LABEL.$suffix.log"
+    if [[ -f "$source_log" ]]; then
+      cp "$source_log" "$SNAPSHOT_DIR/run-logs/"
+    fi
+  done
+fi
 
 META_DIR="$SNAPSHOT_DIR/shellbench_meta-$RUN_LABEL"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$META_DIR/exported_at_utc.txt"

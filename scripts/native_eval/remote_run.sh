@@ -130,9 +130,16 @@ cp "$TOOLCHAIN_ROOT/manifest.json" \
 sha256sum "$ROOT/results/jobs/$RUN_LABEL/run_manifest.json" \
   > "$META_DIR/run_manifest.sha256" 2>/dev/null || true
 
-tar -czf "/tmp/$RUN_LABEL-final-artifacts.tar.gz" \
-  -C "$ROOT" "results/jobs/$RUN_LABEL" \
-  -C "$ROOT" "proxy/$RUN_LABEL" \
-  -C /tmp "shellbench_meta-$RUN_LABEL"
+ARCHIVE_ITEMS=(
+  -C "$ROOT" "results/jobs/$RUN_LABEL"
+  -C "$ROOT" "proxy/$RUN_LABEL"
+)
+for suffix in stdout stderr; do
+  if [[ -f "$ROOT/run-logs/$RUN_LABEL.$suffix.log" ]]; then
+    ARCHIVE_ITEMS+=(-C "$ROOT" "run-logs/$RUN_LABEL.$suffix.log")
+  fi
+done
+ARCHIVE_ITEMS+=(-C /tmp "shellbench_meta-$RUN_LABEL")
+tar -czf "/tmp/$RUN_LABEL-final-artifacts.tar.gz" "${ARCHIVE_ITEMS[@]}"
 
 exit "$RUN_STATUS"
