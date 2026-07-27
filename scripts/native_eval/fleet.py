@@ -800,32 +800,44 @@ printf '%s\n' "$pid"
         ]
         for statuses in (CLEANUP_STATUSES, ACTIVE_RUN_STATUSES):
             for entry in candidates:
-                if entry.get("status") in statuses:
+                if entry.get("lease") and entry.get("status") in statuses:
                     return str(entry["run_label"])
 
         active_entries = [
-            entry for entry in entries if entry.get("status") in ACTIVE_RUN_STATUSES
-        ]
-        cleanup_entries = [
-            entry for entry in entries if entry.get("status") in CLEANUP_STATUSES
-        ]
-        planned_reservations = [
             entry
             for entry in entries
-            if entry["run_label"] in in_flight_labels and entry.get("status") == "planned"
+            if entry.get("lease") and entry.get("status") in ACTIVE_RUN_STATUSES
+        ]
+        cleanup_entries = [
+            entry
+            for entry in entries
+            if entry.get("lease") and entry.get("status") in CLEANUP_STATUSES
+        ]
+        pending_reservations = [
+            entry
+            for entry in entries
+            if entry["run_label"] in in_flight_labels
+            and not entry.get("lease")
+            and (
+                entry.get("status") == "planned"
+                or entry.get("status") in ACTIVE_RUN_STATUSES
+            )
         ]
         occupied_slots = (
-            len(active_entries) + len(cleanup_entries) + len(planned_reservations)
+            len(active_entries) + len(cleanup_entries) + len(pending_reservations)
         )
         if occupied_slots >= self.config.max_leases:
             return None
 
         active_models = Counter(
             self._run_spec(entry).model_slug
-            for entry in [*active_entries, *planned_reservations]
+            for entry in [*active_entries, *pending_reservations]
         )
         for entry in candidates:
-            if entry.get("status") != "planned":
+            pending = entry.get("status") == "planned" or (
+                not entry.get("lease") and entry.get("status") in ACTIVE_RUN_STATUSES
+            )
+            if not pending:
                 continue
             model_slug = self._run_spec(entry).model_slug
             model_limit = self.config.model_max_runs.get(model_slug)
@@ -984,7 +996,7 @@ printf '%s\n' "$pid"
             elif entry.get("requested_lease_slug"):
                 self._store.update(
                     entry["run_label"],
-                    status="leasing",
+                    status="planned",
                     last_error=None,
                 )
             else:

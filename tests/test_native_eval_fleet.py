@@ -456,6 +456,90 @@ def test_slow_capped_model_does_not_block_refilling_eligible_slot(
     assert executor.max_active_leases == 2
 
 
+def test_recovery_pending_entries_respect_capacity_behind_owned_runs(
+    tmp_path: Path,
+) -> None:
+    owned_labels = [f"openclaw-gpt55-full-2-r{index}-20260727" for index in range(1, 10)]
+    pending_labels = [
+        f"openclaw-fable5-full-2-r{index}-20260727" for index in range(10, 15)
+    ]
+    owned_runs: list[dict[str, object]] = []
+    for index, label in enumerate(owned_labels, start=1):
+        run = _planned(_run_spec(label))
+        run["status"] = "running"
+        run["lease"] = {
+            "id": f"cbx_owned_{index}",
+            "slug": f"owned-{index}",
+            "provider": "aws",
+            "state": "active",
+        }
+        owned_runs.append(run)
+    pending_runs: list[dict[str, object]] = []
+    for index, label in enumerate(pending_labels, start=1):
+        run = _planned(_run_spec(label, model_slug="fable5"))
+        run["status"] = "leasing" if index == 1 else "recovery_required"
+        run["requested_lease_slug"] = f"requested-{index}"
+        pending_runs.append(run)
+
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [*pending_runs, *owned_runs])
+    config = _config(
+        tmp_path,
+        run_index,
+        max_leases=10,
+        model_max_runs={"fable5": 1},
+    )
+    release_runs = threading.Event()
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={label: 2 for label in [*owned_labels, *pending_labels]},
+        running_labels=set(owned_labels),
+        checkpoint_blocks={
+            label: release_runs for label in [*owned_labels, pending_labels[0]]
+        },
+    )
+    for index, label in enumerate(owned_labels, start=1):
+        executor.leases[f"cbx_owned_{index}"] = {
+            "id": f"cbx_owned_{index}",
+            "slug": f"owned-{index}",
+            "state": "active",
+            "ready": True,
+            "serverType": "c7a.24xlarge",
+            "sshHost": f"192.0.2.{index}",
+            "sshUser": "crabbox",
+            "sshPort": "22",
+            "sshKey": f"/tmp/cbx_owned_{index}.key",
+        }
+    executor.active_leases = len(owned_labels)
+    executor.max_active_leases = len(owned_labels)
+
+    result: list[int] = []
+    controller = threading.Thread(
+        target=lambda: result.append(FleetController(config, executor=executor).run())
+    )
+    controller.start()
+    try:
+        assert executor.wait_for_dispatch(pending_labels[0], timeout=2)
+        assert executor.dispatches == [pending_labels[0]]
+        index = json.loads(run_index.read_text(encoding="utf-8"))
+        pending_statuses = {
+            run["run_label"]: run["status"]
+            for run in index["runs"]
+            if run["run_label"] in pending_labels[1:]
+        }
+        assert set(pending_statuses.values()) == {"planned"}
+        assert executor.active_leases == 10
+    finally:
+        release_runs.set()
+        controller.join(timeout=10)
+
+    assert not controller.is_alive()
+    assert result == [0]
+    assert not set(owned_labels) & set(executor.dispatches)
+    assert all(("checkpoint", label) in executor.events for label in owned_labels)
+    assert executor.max_active_leases == 10
+
+
 def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
     args = parse_args(
         [
