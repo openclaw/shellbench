@@ -9,13 +9,16 @@ from scripts.native_eval.models import LITELLM_VERSION, MODELS
 def write_proxy_config(path: Path) -> None:
     model_list = []
     for model in MODELS:
+        litellm_params = {
+            "model": f"{model.provider}/{model.provider_model_id}",
+            "api_key": f"os.environ/{model.provider.upper()}_API_KEY",
+        }
+        if model.slug == "gpt55":
+            litellm_params["additional_drop_params"] = ["temperature"]
         model_list.append(
             {
                 "model_name": model.proxy_model_name,
-                "litellm_params": {
-                    "model": f"{model.provider}/{model.provider_model_id}",
-                    "api_key": f"os.environ/{model.provider.upper()}_API_KEY",
-                },
+                "litellm_params": litellm_params,
                 "model_info": {
                     "friendly_name": model.friendly_name,
                     "provider": model.provider,
@@ -54,4 +57,3 @@ def write_proxy_config(path: Path) -> None:
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-

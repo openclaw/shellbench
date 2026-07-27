@@ -42,6 +42,7 @@ INFRA_EXCEPTION_TYPES = {
     "InvalidManifestError",
     "InvalidResultError",
     "MissingResultError",
+    "VerifierJudgeInfraError",
     "VerifierTimeoutError",
 }
 
@@ -261,6 +262,28 @@ def _classify(result: dict[str, Any], reward: int | float | None) -> str:
     return "pass"
 
 
+def _scorecard_infra_error(trial_dir: Path) -> tuple[str, str] | None:
+    scorecard_path = trial_dir / "verifier" / "scorecard.json"
+    if not scorecard_path.is_file():
+        return None
+    scorecard, error = _read_json(scorecard_path)
+    if scorecard is None or scorecard.get("status") != "infra_error":
+        return None
+
+    reasons = scorecard.get("judge_reasons")
+    if isinstance(reasons, list):
+        message = "; ".join(str(reason) for reason in reasons if reason)
+    else:
+        message = ""
+    if not message:
+        message = str(
+            scorecard.get("reason")
+            or error
+            or "verifier scorecard reported infrastructure failure"
+        )
+    return "VerifierJudgeInfraError", message[:2000]
+
+
 def _manifest_value(manifest: dict[str, Any], *keys: str) -> Any:
     for key in keys:
         value = manifest.get(key)
@@ -389,6 +412,9 @@ def _normalize_result(
     task_name, task_path, trial_name = _task_identity(result, result_path.parent)
     reward = _reward(result)
     exception_type, exception_message, exception_occurred_at = _exception_fields(result)
+    scorecard_infra = _scorecard_infra_error(result_path.parent)
+    if scorecard_infra is not None:
+        exception_type, exception_message = scorecard_infra
     agent_result = result.get("agent_result")
     agent_result = agent_result if isinstance(agent_result, dict) else {}
     row: dict[str, Any] = {
@@ -399,7 +425,9 @@ def _normalize_result(
         "task_path": task_path,
         "trial_name": trial_name,
         "result_path": str(result_path),
-        "classification": _classify(result, reward),
+        "classification": (
+            "infra" if scorecard_infra is not None else _classify(result, reward)
+        ),
         "reward": reward,
         "exception_type": exception_type,
         "exception_message": exception_message,

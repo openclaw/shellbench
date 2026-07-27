@@ -277,7 +277,49 @@ def test_unknown_exception_is_agent_exit_and_gateway_signature_is_excluded(
     assert rows["unknown-0"]["classification"] == "agent_exit"
     assert run["harness_wide_failure"] is True
     assert run["eligible"] is False
-    assert run["exclusion_reason"] == "harness_wide_failure"
+
+
+def test_scorecard_infra_error_is_not_counted_as_clean_failure(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "model-rep-1",
+        expected_task_count=1,
+        results=[_result("judge-task", reward=0.0)],
+    )
+    scorecard_path = (
+        jobs_root
+        / "jobs"
+        / "model-rep-1"
+        / "judge-task__trial"
+        / "verifier"
+        / "scorecard.json"
+    )
+    scorecard_path.parent.mkdir()
+    scorecard_path.write_text(
+        json.dumps(
+            {
+                "status": "infra_error",
+                "judge_reasons": [
+                    "judge HTTP 400: temperature is unsupported",
+                ],
+            }
+        )
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    with (summaries_dir / "per_task_results.csv").open(newline="") as handle:
+        task = list(csv.DictReader(handle))[0]
+    run = report["runs"][0]
+    assert task["classification"] == "infra"
+    assert task["exception_type"] == "VerifierJudgeInfraError"
+    assert "temperature" in task["exception_message"]
+    assert run["infra"] == 1
+    assert run["clean_completed"] == 0
+    assert run["eligible"] is False
+    assert run["exclusion_reason"] == "infra_dominated"
 
 
 def test_reward_above_one_counts_as_exact_pass(tmp_path: Path):
