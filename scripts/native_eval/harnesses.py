@@ -76,7 +76,12 @@ def _openclaw(
                     "baseUrl": f"{proxy_url.rstrip('/')}/v1",
                     "api": "openai-responses",
                     "apiKey": proxy_key,
-                    "models": [{"id": model, "name": model}],
+                    "models": [
+                        {
+                            "id": run.proxy_model_name,
+                            "name": run.proxy_model_name,
+                        }
+                    ],
                 }
             }
         },
