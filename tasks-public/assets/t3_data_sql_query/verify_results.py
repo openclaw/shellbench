@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import sys
 from pathlib import Path
 
@@ -32,8 +34,6 @@ def iter_workspace_text_files(root: Path = Path(".")):
 def workspace_blob() -> str:
     return "\n".join(text for _, text in iter_workspace_text_files())
 
-
-import re, csv, io
 
 def main() -> int:
     # Find a CSV-shaped file with the EU 2026 active signups data

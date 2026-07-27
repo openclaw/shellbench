@@ -62,7 +62,7 @@ Set these **before** running `deploy.sh`.
 | `MLFLOW_TRACKING_URI` | *(deployed by script)* | External MLflow URI — skips MLflow deploy if set |
 | `MLFLOW_EXPERIMENT_ID` | | MLflow experiment ID |
 | `MLFLOW_EXPERIMENT_NAME` | `clawbench` | MLflow experiment name |
-| `MLFLOW_IMAGE` | `ghcr.io/mlflow/mlflow:v2.21.3` | MLflow server image |
+| `MLFLOW_IMAGE` | `ghcr.io/mlflow/mlflow:v3.14.0` | MLflow server image |
 | `ANTHROPIC_API_KEY` | | Added to K8s secret if set |
 | `OPENROUTER_API_KEY` | | Added to K8s secret if set |
 | `GEMINI_API_KEY` | | Added to K8s secret if set |

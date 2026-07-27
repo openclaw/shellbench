@@ -6,21 +6,21 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
-    "websockets>=13.0,<15",
-    "pydantic>=2.7,<3",
-    "pyyaml>=6.0,<7",
-    "datasets>=3.0,<4",
-    "gradio>=6.7.0,<7",
-    "pillow>=12.2.0,<13",
-    "httpx>=0.27,<1",
-    "numpy>=1.26,<3",
-    "rich>=13.0,<14",
-    "click>=8.1,<9",
+    "websockets>=16.1.1,<17",
+    "pydantic>=2.13.4,<3",
+    "pyyaml>=6.0.3,<7",
+    "datasets>=5.0.0,<6",
+    "gradio>=6.20.0,<7",
+    "pillow>=12.3.0,<13",
+    "httpx>=0.28.1,<1",
+    "numpy>=2.5.1,<3",
+    "rich>=15.0.0,<16",
+    "click>=8.4.2,<9",
     # Runtime deps for the task completion verifier. The harness shells out
     # to `pytest -q` / `pytest-asyncio` inside per-task workspaces as the
     # execution check; the container must have them in PATH.
-    "pytest>=9.0.3,<10",
-    "pytest-asyncio>=1,<2",
+    "pytest>=9.1.1,<10",
+    "pytest-asyncio>=1.4.0,<2",
 ]
 
 [project.optional-dependencies]
@@ -28,13 +28,13 @@ dev = [
     # Kept as an alias for historical `pip install .[dev]` invocations.
     # pytest + pytest-asyncio are now in the base [dependencies] since the
     # benchmark itself runs pytest in task workspaces.
-    "pytest>=9.0.3,<10",
-    "pytest-asyncio>=1,<2",
-    "pre-commit>=4.0,<5",
-    "ruff>=0.9,<1",
+    "pytest>=9.1.1,<10",
+    "pytest-asyncio>=1.4.0,<2",
+    "pre-commit>=4.6.1,<5",
+    "ruff>=0.16.0,<1",
 ]
 mlflow = [
-    "mlflow>=2.10,<3",
+    "mlflow>=3.14.0,<4",
 ]
 hermes = [
     "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main",

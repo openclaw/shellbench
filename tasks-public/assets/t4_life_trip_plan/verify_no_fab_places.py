@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 from pathlib import Path
 
@@ -32,8 +34,6 @@ def iter_workspace_text_files(root: Path = Path(".")):
 def workspace_blob() -> str:
     return "\n".join(text for _, text in iter_workspace_text_files())
 
-
-import json, re
 
 def main() -> int:
     places_path = Path("places.json")
