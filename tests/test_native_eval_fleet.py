@@ -121,6 +121,12 @@ class FakeExecutor:
         with self._lock:
             self.commands.append(argv)
 
+        if argv == ["crabbox", "--version"]:
+            return _result(argv, 0, stdout="crabbox version 0.36.0\n")
+
+        if argv[:2] == ["env", "CRABBOX_CAPACITY_MARKET=on-demand"]:
+            argv = argv[2:]
+
         if argv[:2] == ["crabbox", "inspect"]:
             identifier = argv[argv.index("--id") + 1]
             if identifier in self.inspect_errors:
@@ -265,6 +271,9 @@ def test_controller_runs_bounded_wave_and_stops_after_verified_export(
     assert [run["status"] for run in index["runs"]] == ["completed", "completed"]
     assert executor.dispatches == labels
     assert executor.max_active_leases == 1
+    warmup = next(command for command in executor.commands if "warmup" in command)
+    assert warmup[:2] == ["env", "CRABBOX_CAPACITY_MARKET=on-demand"]
+    assert "--market" not in warmup
     for label in labels:
         checkpoint_at = executor.events.index(("checkpoint", label))
         lease_id = index["runs"][labels.index(label)]["lease"]["id"]

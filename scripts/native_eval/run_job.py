@@ -219,6 +219,9 @@ def _run_manifest(
 
 
 def _git_commit() -> str:
+    configured = os.environ.get("SHELLBENCH_RUNNER_COMMIT", "").strip()
+    if configured:
+        return configured
     return subprocess.check_output(
         ["git", "rev-parse", "HEAD"],
         text=True,

@@ -16,6 +16,7 @@ from scripts.native_eval.models import (
     build_matrix_plan,
 )
 from scripts.native_eval.proxy import write_proxy_config
+from scripts.native_eval.run_job import _git_commit
 from scripts.native_eval.runtime import collect_agent_metrics, read_reward
 from scripts.native_eval.tasks import TaskSpec, validate_suite
 
@@ -246,6 +247,12 @@ def test_claude_metrics_include_top_level_cost(tmp_path: Path) -> None:
     assert metrics["n_input_tokens"] == 377_989
     assert metrics["n_output_tokens"] == 13_933
     assert metrics["cost_usd"] == 2.23827
+
+
+def test_runner_commit_can_be_supplied_without_git(monkeypatch) -> None:
+    monkeypatch.setenv("SHELLBENCH_RUNNER_COMMIT", "runner-commit")
+
+    assert _git_commit() == "runner-commit"
 
 
 def test_reward_json_takes_precedence_over_text(tmp_path: Path) -> None:

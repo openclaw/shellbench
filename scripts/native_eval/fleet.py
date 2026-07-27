@@ -240,6 +240,7 @@ class FleetController:
         self.runner_commit = ""
         self.runner_archive_sha256 = ""
         self.task_archive_sha256 = ""
+        self.crabbox_cli_version = ""
 
     def run(self) -> int:
         self._prepare_local_layout()
@@ -354,6 +355,12 @@ class FleetController:
                 raise FleetError(f"invalid archive: {archive}") from exc
         self.runner_archive_sha256 = _sha256(self.runner_archive)
         self.task_archive_sha256 = _sha256(self.config.task_archive)
+        version = self._checked(
+            [self.config.crabbox_bin, "--version"],
+            capture_output=True,
+            description="resolve Crabbox CLI version",
+        )
+        self.crabbox_cli_version = version.stdout.strip()
 
     def _record_fleet_metadata(self) -> None:
         assert self.runner_archive is not None
@@ -370,6 +377,7 @@ class FleetController:
                 "region": self.config.region,
                 "max_leases": self.config.max_leases,
                 "task_concurrency": self.config.task_concurrency,
+                "crabbox_cli_version": self.crabbox_cli_version,
                 "controller_started_at_utc": utc_now(),
             }
         )
@@ -456,7 +464,11 @@ class FleetController:
         lease_value = entry.get("lease")
         if lease_value:
             identifier = str(lease_value["id"])
-            return self._inspect_lease(identifier, required=True)
+            return self._inspect_lease(
+                identifier,
+                required=True,
+                region_hint=str(lease_value.get("region") or ""),
+            )
 
         slug = str(entry.get("requested_lease_slug") or self._lease_slug(entry["run_label"]))
         self._store.update(
@@ -467,6 +479,8 @@ class FleetController:
         existing = self._inspect_lease(slug, required=False)
         if existing is None:
             command = [
+                "env",
+                f"CRABBOX_CAPACITY_MARKET={self.config.market}",
                 self.config.crabbox_bin,
                 "warmup",
                 "--provider",
@@ -475,8 +489,6 @@ class FleetController:
                 self.config.machine_class,
                 "--slug",
                 slug,
-                "--market",
-                self.config.market,
                 "--ttl",
                 self.config.ttl,
                 "--idle-timeout",
@@ -497,7 +509,13 @@ class FleetController:
         )
         return existing
 
-    def _inspect_lease(self, identifier: str, *, required: bool) -> Lease | None:
+    def _inspect_lease(
+        self,
+        identifier: str,
+        *,
+        required: bool,
+        region_hint: str = "",
+    ) -> Lease | None:
         result = self.executor.run(
             [
                 self.config.crabbox_bin,
@@ -527,7 +545,45 @@ class FleetController:
             value = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise FleetError(f"invalid Crabbox inspect JSON for {identifier}") from exc
-        return Lease.from_inspect(value, region=self.config.region)
+        lease = Lease.from_inspect(
+            value,
+            region=region_hint or self.config.region,
+        )
+        return self._detect_region(lease)
+
+    def _detect_region(self, lease: Lease) -> Lease:
+        script = """
+set -eu
+token=$(curl -fsS --max-time 3 -X PUT \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+  http://169.254.169.254/latest/api/token 2>/dev/null || true)
+[ -n "$token" ] || exit 0
+curl -fsS --max-time 3 \
+  -H "X-aws-ec2-metadata-token: $token" \
+  http://169.254.169.254/latest/dynamic/instance-identity/document \
+  2>/dev/null \
+  | sed -n 's/.*"region"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p'
+"""
+        result = self.executor.run(
+            self._ssh_command(
+                lease,
+                ["bash", "-c", script, "fleet-region"],
+            ),
+            capture_output=True,
+        )
+        region = result.stdout.strip() if result.returncode == 0 else ""
+        if not region:
+            return lease
+        return Lease(
+            lease_id=lease.lease_id,
+            slug=lease.slug,
+            host=lease.host,
+            user=lease.user,
+            port=lease.port,
+            identity_file=lease.identity_file,
+            instance_type=lease.instance_type,
+            region=region,
+        )
 
     def _hydrate_lease(self, lease: Lease) -> None:
         assert self.runner_archive is not None
@@ -644,11 +700,26 @@ fi
 set -euo pipefail
 root=$1
 label=$2
-shift 2
+crabbox_cli_version=$3
+crabbox_slug=$4
+crabbox_lease_id=$5
+crabbox_instance_type=$6
+crabbox_ip=$7
+crabbox_region=$8
+runner_commit=$9
+shift 9
 mkdir -p "$root/run-logs"
 stdout="$root/run-logs/$label.stdout.log"
 stderr="$root/run-logs/$label.stderr.log"
-nohup "$root/runner/scripts/native_eval/remote_run.sh" "$@" \
+nohup env \
+  "CRABBOX_CLI_VERSION=$crabbox_cli_version" \
+  "CRABBOX_SLUG=$crabbox_slug" \
+  "CRABBOX_LEASE_ID=$crabbox_lease_id" \
+  "CRABBOX_INSTANCE_TYPE=$crabbox_instance_type" \
+  "CRABBOX_IP=$crabbox_ip" \
+  "CRABBOX_REGION=$crabbox_region" \
+  "SHELLBENCH_RUNNER_COMMIT=$runner_commit" \
+  "$root/runner/scripts/native_eval/remote_run.sh" "$@" \
   >"$stdout" 2>"$stderr" </dev/null &
 pid=$!
 sleep 1
@@ -678,6 +749,13 @@ printf '%s\n' "$pid"
                     "fleet-dispatch",
                     self.config.remote_root,
                     run.run_label,
+                    self.crabbox_cli_version,
+                    lease.slug,
+                    lease.lease_id,
+                    lease.instance_type,
+                    lease.host,
+                    lease.region,
+                    self.runner_commit,
                     *args,
                 ],
             ),
