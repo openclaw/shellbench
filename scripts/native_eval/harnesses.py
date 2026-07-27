@@ -102,7 +102,8 @@ def _openclaw(
         "openclaw agent --local --json --agent main --thinking off "
         f"--model {shlex.quote(model)} "
         "--message \"$(cat /tmp/shellbench-instruction.md)\" "
-        "2>&1 </dev/null | tee /logs/agent/openclaw.txt"
+        ">/logs/agent/openclaw.txt 2>&1 </dev/null; status=$?; "
+        "cat /logs/agent/openclaw.txt; exit \"$status\""
     )
     cleanup = (
         "python3 - <<'PY'\n"
@@ -233,7 +234,8 @@ def _codex(
         f"--model {shlex.quote(run.proxy_model_name)} "
         "--json --enable unified_exec -- "
         "\"$(cat /tmp/shellbench-instruction.md)\" "
-        "2>&1 </dev/null | tee /logs/agent/codex.txt"
+        ">/logs/agent/codex.txt 2>&1 </dev/null; status=$?; "
+        "cat /logs/agent/codex.txt; exit \"$status\""
     )
     cleanup = (
         "rm -rf /logs/agent/sessions; "
@@ -279,10 +281,12 @@ def _claude_code(
     )
     run_command = (
         f"export PATH={_base_path()}; export CLAUDE_CONFIG_DIR={home}; "
-        "cat /tmp/shellbench-instruction.md | "
         "claude --verbose --output-format=stream-json "
         "--permission-mode=bypassPermissions --print "
-        "2>&1 | tee /logs/agent/claude-code.txt"
+        f"--model {shlex.quote(run.proxy_model_name)} "
+        "\"$(cat /tmp/shellbench-instruction.md)\" "
+        ">/logs/agent/claude-code.txt 2>&1 </dev/null; status=$?; "
+        "cat /logs/agent/claude-code.txt; exit \"$status\""
     )
     return HarnessCommand(
         setup_command=setup,

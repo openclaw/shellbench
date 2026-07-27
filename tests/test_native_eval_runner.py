@@ -140,6 +140,7 @@ def test_harness_commands_use_proxy_alias_not_upstream_id() -> None:
         )
         assert "claude-opus-5" not in command.run_command
         assert "OPENROUTER_API_KEY" not in command.env
+        assert 'exit "$status"' in command.run_command
 
 
 def test_hermes_uses_named_local_proxy_provider() -> None:
@@ -169,6 +170,31 @@ def test_hermes_uses_named_local_proxy_provider() -> None:
     assert command.env == {"SHELLBENCH_PROXY_KEY": "local-proxy-key"}
     assert "custom:shellbench" in command.setup_command
     assert "http://host.docker.internal:4000/v1" in command.setup_command
+
+
+def test_claude_code_selects_proxy_alias_explicitly() -> None:
+    run = RunSpec(
+        run_label="claude-code-test",
+        harness="claude-code",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=116,
+        run_date="20260727",
+    )
+
+    command = build_harness_command(
+        run,
+        proxy_url="http://host.docker.internal:4000",
+        proxy_key="local-proxy-key",
+        mcp_servers=(),
+    )
+
+    assert "--model sb-gpt55" in command.run_command
+    assert command.env["ANTHROPIC_MODEL"] == "sb-gpt55"
 
 
 def test_reward_json_takes_precedence_over_text(tmp_path: Path) -> None:
