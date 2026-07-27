@@ -761,10 +761,7 @@ def _pair_summaries(runs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
                 "pass_rate": (
                     sum(exact_passes) / total_expected if total_expected else None
                 ),
-                "clean_complete_repetitions": sum(
-                    run["clean_completed"] == run["expected_task_count"]
-                    for run in eligible
-                ),
+                "clean_complete_repetitions": len(eligible),
                 "mean_coverage": _mean([float(run["coverage"]) for run in eligible]),
                 "mean_clean_completed": _mean(
                     [int(run["clean_completed"]) for run in eligible]

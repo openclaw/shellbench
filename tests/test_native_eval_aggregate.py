@@ -156,7 +156,10 @@ def test_pair_aggregates_exclude_incomplete_and_infra_dominated_runs(tmp_path: P
         jobs_root,
         "model-rep-1",
         expected_task_count=2,
-        results=[_result("a", reward=1.0), _result("b", reward=0.0)],
+        results=[
+            _result("a", reward=1.0),
+            _result("b", reward=0.0, exception_type="AgentTimeoutError"),
+        ],
         pair_label=pair,
         repetition=1,
     )
