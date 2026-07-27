@@ -37,6 +37,10 @@ def count_result_json(archive: Path) -> int:
         for member in handle.getmembers():
             if not member.isfile():
                 continue
+            extracted = handle.extractfile(member)
+            if extracted is not None:
+                while extracted.read(1024 * 1024):
+                    pass
             parts = PurePosixPath(member.name).parts
             for index, part in enumerate(parts):
                 if part != "jobs":
@@ -159,6 +163,29 @@ def append_checkpoint_log(
         )
 
 
+def partial_path(final_path: Path) -> Path:
+    return final_path.with_name(f"{final_path.name}.partial")
+
+
+def download_partial(
+    client: SSHClient,
+    remote_path: str,
+    final_path: Path,
+) -> Path:
+    if final_path.exists():
+        raise FileExistsError(f"refusing to overwrite local artifact: {final_path}")
+    staged_path = partial_path(final_path)
+    staged_path.unlink(missing_ok=True)
+    client.copy_from(remote_path, staged_path)
+    return staged_path
+
+
+def publish_partial(staged_path: Path, final_path: Path) -> None:
+    if final_path.exists():
+        raise FileExistsError(f"refusing to overwrite local artifact: {final_path}")
+    staged_path.replace(final_path)
+
+
 def pull_checkpoint(
     *,
     client: SSHClient,
@@ -179,8 +206,9 @@ def pull_checkpoint(
     local_path = raw_dir / archive_name
     if local_path.exists():
         raise FileExistsError(f"refusing to overwrite checkpoint: {local_path}")
-    client.copy_from(remote_path, local_path)
-    result_count = count_result_json(local_path)
+    staged_path = download_partial(client, remote_path, local_path)
+    result_count = count_result_json(staged_path)
+    publish_partial(staged_path, local_path)
     append_checkpoint_log(
         log_path,
         event="checkpoint",
@@ -200,25 +228,33 @@ def pull_final(
     log_path: Path,
 ) -> int:
     archive_name = f"{run_label}-final-artifacts.tar.gz"
-    local_path = raw_dir / archive_name
-    if local_path.exists():
-        raise FileExistsError(f"refusing to overwrite final archive: {local_path}")
-    client.copy_from(f"/tmp/{archive_name}", local_path)
-    result_count = count_result_json(local_path)
+    destinations = [
+        (f"/tmp/{archive_name}", raw_dir / archive_name),
+        *[
+            (
+                f"{remote_root}/run-logs/{run_label}.{suffix}.log",
+                logs_dir / f"{run_label}.{suffix}.log",
+            )
+            for suffix in ("stdout", "stderr")
+        ],
+    ]
+    for _, final_path in destinations:
+        if final_path.exists():
+            raise FileExistsError(f"refusing to overwrite local artifact: {final_path}")
+
+    staged = [
+        (download_partial(client, remote_path, final_path), final_path)
+        for remote_path, final_path in destinations
+    ]
+    result_count = count_result_json(staged[0][0])
+    for staged_path, final_path in staged:
+        publish_partial(staged_path, final_path)
     append_checkpoint_log(
         log_path,
         event="final",
         archive_name=archive_name,
         result_count=result_count,
     )
-    for suffix in ("stdout", "stderr"):
-        local_log = logs_dir / f"{run_label}.{suffix}.log"
-        if local_log.exists():
-            raise FileExistsError(f"refusing to overwrite run log: {local_log}")
-        client.copy_from(
-            f"{remote_root}/run-logs/{run_label}.{suffix}.log",
-            local_log,
-        )
     return result_count
 
 
@@ -305,23 +341,42 @@ def run_loop(args: argparse.Namespace) -> int:
                 state.result_file_count != last_archive_count
                 and state.result_file_count
             ):
-                last_archive_count = pull_checkpoint(
+                try:
+                    last_archive_count = pull_checkpoint(
+                        client=client,
+                        runner_root=args.runner_root,
+                        remote_root=args.remote_root,
+                        run_label=args.run_label,
+                        raw_dir=raw_dir,
+                        log_path=log_path,
+                        sequence=sequence,
+                    )
+                except (OSError, subprocess.SubprocessError, tarfile.TarError) as exc:
+                    append_checkpoint_log(
+                        log_path,
+                        event="checkpoint_error",
+                        archive_name="",
+                        result_count=last_archive_count,
+                        detail=str(exc).replace("\n", " ")[:500],
+                    )
+            try:
+                final_count = pull_final(
                     client=client,
-                    runner_root=args.runner_root,
                     remote_root=args.remote_root,
                     run_label=args.run_label,
                     raw_dir=raw_dir,
+                    logs_dir=logs_dir,
                     log_path=log_path,
-                    sequence=sequence,
                 )
-            final_count = pull_final(
-                client=client,
-                remote_root=args.remote_root,
-                run_label=args.run_label,
-                raw_dir=raw_dir,
-                logs_dir=logs_dir,
-                log_path=log_path,
-            )
+            except (OSError, subprocess.SubprocessError, tarfile.TarError) as exc:
+                append_checkpoint_log(
+                    log_path,
+                    event="final_error",
+                    archive_name="",
+                    result_count=last_archive_count,
+                    detail=str(exc).replace("\n", " ")[:500],
+                )
+                return 75
             return state.exit_status or (0 if final_count else 1)
 
         time.sleep(args.poll_seconds)

@@ -76,13 +76,23 @@ def _write_archive(path: Path) -> None:
         handle.add(source, arcname=".")
 
 
-def _write_final(local_root: Path, run_label: str, result_count: int) -> None:
+def _write_final(
+    local_root: Path,
+    run_label: str,
+    result_count: int,
+    *,
+    exit_status: int | None = None,
+) -> None:
     source = local_root / f".archive-{run_label}"
     job = source / "results" / "jobs" / run_label
     for index in range(result_count):
         trial = job / f"task-{index}__trial"
         trial.mkdir(parents=True, exist_ok=True)
         (trial / "result.json").write_text("{}", encoding="utf-8")
+    if exit_status is not None:
+        meta = source / f"shellbench_meta-{run_label}"
+        meta.mkdir(parents=True, exist_ok=True)
+        (meta / "exit_status").write_text(f"{exit_status}\n", encoding="utf-8")
     archive = local_root / "raw" / f"{run_label}-final-artifacts.tar.gz"
     archive.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "w:gz") as handle:
@@ -118,6 +128,7 @@ class FakeExecutor:
         self.events: list[tuple[str, str]] = []
         self.dispatches: list[str] = []
         self.dispatch_concurrency: dict[str, int] = {}
+        self.dispatch_arguments: dict[str, list[str]] = {}
         self.stops: list[str] = []
         self._lock = threading.Lock()
         self._dispatch_condition = threading.Condition(self._lock)
@@ -237,9 +248,12 @@ class FakeExecutor:
                 if candidate in joined
             )
             remote_command = shlex.split(argv[-1])
+            dispatch_marker = remote_command.index("fleet-dispatch")
+            remote_run_args = remote_command[dispatch_marker + 13 :]
             with self._dispatch_condition:
                 self.dispatches.append(label)
-                self.dispatch_concurrency[label] = int(remote_command[-1])
+                self.dispatch_concurrency[label] = int(remote_run_args[10])
+                self.dispatch_arguments[label] = remote_run_args
                 self.events.append(("dispatch", label))
                 self.remote_states[label] = "running"
                 self._dispatch_condition.notify_all()
@@ -327,6 +341,13 @@ def test_controller_runs_bounded_wave_and_stops_after_verified_export(
     assert [run["status"] for run in index["runs"]] == ["completed", "completed"]
     assert executor.dispatches == labels
     assert executor.max_active_leases == 1
+    for label in labels:
+        assert executor.dispatch_arguments[label][11:15] == [
+            "test",
+            "provider/gpt55",
+            "openai",
+            "sb-gpt55",
+        ]
     warmup = next(command for command in executor.commands if "warmup" in command)
     assert warmup[:2] == ["env", "CRABBOX_CAPACITY_MARKET=on-demand"]
     assert "--market" not in warmup
@@ -855,6 +876,77 @@ def test_recovery_required_resumes_existing_remote_run(tmp_path: Path) -> None:
     assert executor.dispatches == []
     final = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
     assert final["status"] == "completed"
+
+
+def test_recovery_infers_success_from_verified_full_archive_and_done_log(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = _planned(_run_spec(label))
+    run["status"] = "recovery_required"
+    run["lease"] = {
+        "id": "cbx_existing",
+        "slug": "existing",
+        "provider": "aws",
+        "state": "active",
+    }
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+    _write_final(config.local_root, label, 2)
+    checkpoint_log = config.local_root / "logs" / f"{label}.checkpoints.log"
+    checkpoint_log.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_log.write_text(
+        f"2026-07-27T00:00:00Z\tfinal\t{label}-final-artifacts.tar.gz\t2\t\n",
+        encoding="utf-8",
+    )
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+    executor.leases["cbx_existing"] = {
+        "id": "cbx_existing",
+        "slug": "existing",
+        "state": "active",
+        "ready": True,
+        "serverType": "c7a.24xlarge",
+        "sshHost": "192.0.2.50",
+        "sshUser": "crabbox",
+        "sshPort": "22",
+        "sshKey": "/tmp/cbx_existing.key",
+    }
+    executor.active_leases = 1
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    recovered = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
+    assert recovered["status"] == "completed"
+    assert recovered["run_exit_code"] == 0
+    assert recovered["run_exit_code_source"] == "recovered_full_coverage_remote_done"
+    assert "inferred zero" in recovered["run_exit_code_inference"]
+
+
+def test_recovery_preserves_archived_nonzero_exit_status(tmp_path: Path) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = _planned(_run_spec(label))
+    run["status"] = "recovery_required"
+    run["lease"] = {
+        "id": "cbx_existing",
+        "slug": "existing",
+        "provider": "aws",
+        "state": "active",
+    }
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index, max_attempts=1)
+    _write_final(config.local_root, label, 2, exit_status=7)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+    executor.active_leases = 1
+
+    assert FleetController(config, executor=executor).run() == 1
+
+    recovered = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
+    assert recovered["status"] == "failed"
+    assert recovered["run_exit_code"] == 7
+    assert recovered["run_exit_code_source"] == "archived_exit_status"
+    assert recovered["last_error"] == "run exit 7; result coverage 2/2"
 
 
 def test_stop_failure_is_left_pending_without_tight_retry(tmp_path: Path) -> None:

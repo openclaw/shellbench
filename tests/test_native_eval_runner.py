@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tarfile
+from argparse import Namespace
 from pathlib import Path
 
 from scripts.native_eval.checkpoint_loop import (
@@ -16,7 +17,7 @@ from scripts.native_eval.models import (
     build_matrix_plan,
 )
 from scripts.native_eval.proxy import write_proxy_config
-from scripts.native_eval.run_job import _git_commit, _run_manifest
+from scripts.native_eval.run_job import _git_commit, _run_manifest, build_run_spec
 from scripts.native_eval.runtime import (
     collect_agent_metrics,
     read_reward,
@@ -151,6 +152,31 @@ def test_run_manifest_records_native_audit_metadata(
     assert manifest["execution_mode"] == "native"
     assert manifest["harbor_reference_commit"] == "harbor-commit"
     assert manifest["judge_model_id"] == "gpt-5.5"
+    assert manifest["trajectory_mode"] == "unsupported"
+    assert manifest["canonical_model_identity"] is None
+    assert manifest["provider_model_id"] == "gpt-5.5"
+
+
+def test_run_spec_preserves_explicit_planned_identity() -> None:
+    run = build_run_spec(
+        Namespace(
+            run_label="codex-planned",
+            harness="codex",
+            harness_version="planned-version",
+            model_slug="gpt55",
+            model_id="planned-model-id",
+            model_provider="planned-provider",
+            proxy_model_name="planned-proxy-name",
+            repetition=1,
+            expected_task_count=20,
+            run_date="20260727",
+        )
+    )
+
+    assert run.harness_version == "planned-version"
+    assert run.model_id == "planned-model-id"
+    assert run.provider == "planned-provider"
+    assert run.proxy_model_name == "planned-proxy-name"
 
 
 def test_harness_commands_preserve_canonical_model_identity() -> None:
@@ -262,6 +288,23 @@ def test_codex_trajectory_uses_real_stream_events(tmp_path: Path) -> None:
             "item": {"id": "message-1", "type": "agent_message", "text": "done"},
         },
         {
+            "type": "item.started",
+            "item": {
+                "id": "todo-1",
+                "type": "todo_list",
+                "items": [{"text": "inspect", "completed": True}],
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "file-1",
+                "type": "file_change",
+                "changes": [{"path": "/app/output/result.txt", "kind": "add"}],
+                "status": "completed",
+            },
+        },
+        {
             "type": "turn.completed",
             "usage": {
                 "input_tokens": 100,
@@ -272,6 +315,18 @@ def test_codex_trajectory_uses_real_stream_events(tmp_path: Path) -> None:
     ]
     (agent_dir / "codex.txt").write_text(
         "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    session_dir = agent_dir / "sessions"
+    session_dir.mkdir()
+    (session_dir / "rollout.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.5"},
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     run = RunSpec(
@@ -311,11 +366,130 @@ def test_codex_trajectory_uses_real_stream_events(tmp_path: Path) -> None:
     trajectory = json.loads((agent_dir / "trajectory.json").read_text())
 
     assert metadata["trajectory_status"] == "real"
+    assert metadata["runtime_model_name"] == "gpt-5.5"
+    assert metadata["canonical_model_identity"] is True
     assert trajectory["session_id"] == "thread-123"
-    assert len(trajectory["steps"]) == 4
+    assert len(trajectory["steps"]) == 6
     assert trajectory["steps"][2]["tool_calls"][0]["function_name"] == "shell"
     assert trajectory["steps"][2]["observation"]["results"][0]["content"] == "total 4"
+    assert trajectory["steps"][4]["tool_calls"][0]["function_name"] == "todo_list"
+    assert trajectory["steps"][5]["tool_calls"][0]["function_name"] == "file_change"
     assert trajectory["final_metrics"]["total_prompt_tokens"] == 100
+
+
+def test_codex_trajectory_rejects_truncated_or_mismatched_stream(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    session_dir = agent_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    (agent_dir / "codex.txt").write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-123"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "message-1",
+                            "type": "agent_message",
+                            "text": "unfinished",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (session_dir / "rollout.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.6-sol"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="codex-gpt55-calibration",
+        harness="codex",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260727",
+    )
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    task = TaskSpec(
+        name="task",
+        title="task",
+        path=task_dir,
+        instruction="do the task",
+        raw_config={},
+        checksum="abc",
+        dockerfile=task_dir / "Dockerfile",
+        build_context=task_dir,
+        compose_file=None,
+        verifier_command="bash /tests/test.sh",
+        agent_timeout_sec=900,
+        verifier_timeout_sec=300,
+        build_timeout_sec=1800,
+        mcp_servers=(),
+        environment_env={},
+        verifier_env={},
+    )
+
+    metadata = write_agent_trajectory(task, run, agent_dir)
+
+    assert metadata["trajectory_status"] == "unavailable"
+    assert metadata["runtime_model_name"] == "gpt-5.6-sol"
+    assert metadata["canonical_model_identity"] is False
+    assert metadata["trajectory_validation"]["terminal_event_seen"] is False
+
+
+def test_non_codex_trajectory_is_explicitly_unranked(tmp_path: Path) -> None:
+    run = RunSpec(
+        run_label="openclaw-gpt55",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260727",
+    )
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    task = TaskSpec(
+        name="task",
+        title="task",
+        path=task_dir,
+        instruction="do the task",
+        raw_config={},
+        checksum="abc",
+        dockerfile=task_dir / "Dockerfile",
+        build_context=task_dir,
+        compose_file=None,
+        verifier_command="bash /tests/test.sh",
+        agent_timeout_sec=900,
+        verifier_timeout_sec=300,
+        build_timeout_sec=1800,
+        mcp_servers=(),
+        environment_env={},
+        verifier_env={},
+    )
+
+    metadata = write_agent_trajectory(task, run, tmp_path / "agent")
+
+    assert metadata["trajectory_status"] == "unsupported"
+    assert metadata["runtime_model_name"] is None
+    assert metadata["canonical_model_identity"] is False
 
 
 def test_codex_metrics_include_cached_input_tokens(tmp_path: Path) -> None:

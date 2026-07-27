@@ -458,6 +458,7 @@ def _normalize_result(
         "_has_result_file": True,
         "_valid_result": True,
         "_completed_result": bool(result.get("finished_at")),
+        "_scorable": True,
     }
     for field in TIMING_FIELDS:
         timing = result.get(field)
@@ -482,6 +483,7 @@ def _infra_row(
     exception_type: str,
     exception_message: str,
     has_result_file: bool,
+    scorable: bool = True,
 ) -> dict[str, Any]:
     row = {field: "" for field in PER_TASK_FIELDS}
     row.update(
@@ -500,9 +502,27 @@ def _infra_row(
             "_has_result_file": has_result_file,
             "_valid_result": False,
             "_completed_result": False,
+            "_scorable": scorable,
         }
     )
     return row
+
+
+def _exclude_row(
+    row: dict[str, Any],
+    *,
+    exception_type: str,
+    exception_message: str,
+) -> None:
+    row.update(
+        {
+            "classification": "infra",
+            "reward": None,
+            "exception_type": exception_type,
+            "exception_message": exception_message,
+            "_scorable": False,
+        }
+    )
 
 
 def _matches_expected(row: dict[str, Any], task_name: str, task_path: str) -> bool:
@@ -571,28 +591,53 @@ def _load_run(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         )
 
     expected_tasks = _expected_tasks(manifest)
-    for task_name, task_path in expected_tasks:
-        if any(_matches_expected(row, task_name, task_path) for row in rows):
-            continue
-        trial_name = task_name or Path(task_path).name
-        rows.append(
-            _infra_row(
-                run_label=run_label,
-                pair_label=pair_label,
-                repetition=repetition,
-                task_name=task_name or trial_name,
-                task_path=task_path,
-                trial_name=trial_name,
-                result_path=run_dir / trial_name / "result.json",
-                exception_type="MissingResultError",
-                exception_message="expected task produced no result.json",
-                has_result_file=False,
+    if expected_tasks:
+        available = set(range(len(rows)))
+        for task_name, task_path in expected_tasks:
+            matches = [
+                index
+                for index in sorted(available)
+                if _matches_expected(rows[index], task_name, task_path)
+            ]
+            if not matches:
+                trial_name = task_name or Path(task_path).name
+                rows.append(
+                    _infra_row(
+                        run_label=run_label,
+                        pair_label=pair_label,
+                        repetition=repetition,
+                        task_name=task_name or trial_name,
+                        task_path=task_path,
+                        trial_name=trial_name,
+                        result_path=run_dir / trial_name / "result.json",
+                        exception_type="MissingResultError",
+                        exception_message="expected task produced no result.json",
+                        has_result_file=False,
+                    )
+                )
+                continue
+            selected = matches[0]
+            available.remove(selected)
+            rows[selected]["_scorable"] = True
+            for duplicate in matches[1:]:
+                available.remove(duplicate)
+                _exclude_row(
+                    rows[duplicate],
+                    exception_type="DuplicateTaskResultError",
+                    exception_message=(
+                        f"multiple result.json files matched expected task {task_name}"
+                    ),
+                )
+        for index in sorted(available):
+            _exclude_row(
+                rows[index],
+                exception_type="UnexpectedTaskResultError",
+                exception_message="result.json does not match any expected task",
             )
-        )
 
     expected_count = _expected_task_count(manifest, expected_tasks, len(rows))
-    while len(rows) < expected_count:
-        missing_index = len(rows) + 1
+    while sum(bool(row.get("_scorable")) for row in rows) < expected_count:
+        missing_index = sum(bool(row.get("_scorable")) for row in rows) + 1
         rows.append(
             _infra_row(
                 run_label=run_label,
@@ -621,6 +666,7 @@ def _load_run(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 exception_type="InvalidManifestError",
                 exception_message=manifest_error,
                 has_result_file=False,
+                scorable=False,
             )
         )
 
@@ -678,8 +724,10 @@ def _summarize_run(
     rows: Sequence[dict[str, Any]],
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
-    classifications = [str(row["classification"]) for row in rows]
-    rewards = [_number(row.get("reward")) for row in rows]
+    scored_rows = [row for row in rows if row.get("_scorable")]
+    classifications = [str(row["classification"]) for row in scored_rows]
+    rewards = [_number(row.get("reward")) for row in scored_rows]
+    all_classifications = [str(row["classification"]) for row in rows]
     result_file_count = sum(bool(row.get("_has_result_file")) for row in rows)
     valid_result_count = sum(bool(row.get("_valid_result")) for row in rows)
     completed_result_count = sum(bool(row.get("_completed_result")) for row in rows)
@@ -688,7 +736,7 @@ def _summarize_run(
         for classification, reward in zip(classifications, rewards)
     )
     partials = classifications.count("partial")
-    infra = classifications.count("infra")
+    infra = all_classifications.count("infra")
     agent_exits = classifications.count("agent_exit")
     missing_reward = classifications.count("verifier_missing_reward")
     clean_completed = sum(
@@ -704,9 +752,10 @@ def _summarize_run(
     clean_coverage = clean_completed / expected_count if expected_count else 0.0
     incomplete = (
         expected_count <= 0
-        or result_file_count < expected_count
-        or valid_result_count < expected_count
-        or completed_result_count < expected_count
+        or len(scored_rows) != expected_count
+        or result_file_count != expected_count
+        or valid_result_count != expected_count
+        or completed_result_count != expected_count
     )
     infra_dominated = expected_count > 0 and infra > expected_count / 2
     harness_wide_failure, harness_wide_failure_signature = _harness_wide_failure(
@@ -721,7 +770,7 @@ def _summarize_run(
         manifest.get("canonical_model_identity") is True
         and all(
             row.get("canonical_model_identity") is True
-            for row in rows
+            for row in scored_rows
             if row.get("_valid_result")
         )
     )
@@ -729,7 +778,7 @@ def _summarize_run(
         manifest.get("trajectory_mode") == "real_harness_events"
         and all(
             row.get("trajectory_status") == "real"
-            for row in rows
+            for row in scored_rows
             if row.get("_valid_result")
         )
     )
@@ -784,10 +833,10 @@ def _summarize_run(
         "parity_validated": parity_validated,
         "eligible": eligible,
         "exclusion_reason": exclusion_reason,
-        "n_input_tokens": _sum_present(rows, "n_input_tokens"),
-        "n_cache_tokens": _sum_present(rows, "n_cache_tokens"),
-        "n_output_tokens": _sum_present(rows, "n_output_tokens"),
-        "cost_usd": _sum_present(rows, "cost_usd"),
+        "n_input_tokens": _sum_present(scored_rows, "n_input_tokens"),
+        "n_cache_tokens": _sum_present(scored_rows, "n_cache_tokens"),
+        "n_output_tokens": _sum_present(scored_rows, "n_output_tokens"),
+        "cost_usd": _sum_present(scored_rows, "cost_usd"),
     }
 
 

@@ -85,6 +85,7 @@ HARNESSES: tuple[HarnessSpec, ...] = (
 
 NODE_VERSION = "22.23.1"
 LITELLM_VERSION = "1.93.0"
+REAL_TRAJECTORY_HARNESSES = frozenset({"codex"})
 
 
 def model_by_slug(slug: str) -> ModelSpec:
@@ -99,6 +100,12 @@ def harness_by_name(name: str) -> HarnessSpec:
         if harness.name == name:
             return harness
     raise KeyError(f"Unknown harness: {name}")
+
+
+def trajectory_mode_for_harness(name: str) -> str:
+    if name in REAL_TRAJECTORY_HARNESSES:
+        return "real_harness_events"
+    return "unsupported"
 
 
 def build_matrix_plan(

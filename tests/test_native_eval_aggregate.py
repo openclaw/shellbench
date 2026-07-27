@@ -377,3 +377,59 @@ def test_reward_above_one_counts_as_exact_pass(tmp_path: Path):
     report = aggregate(jobs_root, summaries_dir)
 
     assert report["runs"][0]["exact_passes"] == 1
+
+
+def test_extra_or_duplicate_task_results_cannot_inflate_score(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "model-rep-1",
+        expected_task_count=2,
+        tasks=["a", "b"],
+        results=[
+            _result("a", reward=1.0, trial_name="a__first"),
+            _result("a", reward=1.0, trial_name="a__duplicate"),
+            _result("b", reward=1.0, trial_name="b__only"),
+        ],
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+    run = report["runs"][0]
+
+    assert run["score"] == 1.0
+    assert run["result_file_count"] == 3
+    assert run["infra"] == 1
+    assert run["eligible"] is False
+    assert run["exclusion_reason"] == "incomplete"
+    with (summaries_dir / "per_task_results.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    duplicate = next(
+        row
+        for row in rows
+        if row["exception_type"] == "DuplicateTaskResultError"
+    )
+    assert duplicate["classification"] == "infra"
+
+
+def test_unexpected_task_result_is_excluded_from_reward_sum(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "model-rep-1",
+        expected_task_count=2,
+        tasks=["a", "b"],
+        results=[
+            _result("a", reward=1.0),
+            _result("b", reward=0.0),
+            _result("c", reward=100.0),
+        ],
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+    run = report["runs"][0]
+
+    assert run["score"] == 0.5
+    assert run["eligible"] is False
+    assert run["infra"] == 1

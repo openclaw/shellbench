@@ -10,7 +10,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from scripts.native_eval.models import RunSpec, harness_by_name, model_by_slug
+from scripts.native_eval.models import (
+    RunSpec,
+    harness_by_name,
+    model_by_slug,
+    trajectory_mode_for_harness,
+)
 from scripts.native_eval.runtime import atomic_write_json, run_trial, utc_now
 from scripts.native_eval.tasks import TaskSpec, validate_suite
 
@@ -123,6 +128,24 @@ async def run_job(
     atomic_write_json(job_dir / "result.json", state)
     manifest["finished_at_utc"] = state["finished_at"]
     manifest["result_json_count"] = len(results)
+    agent_results = [
+        result.get("agent_result")
+        for result in results
+        if isinstance(result.get("agent_result"), dict)
+    ]
+    manifest["canonical_model_identity"] = bool(agent_results) and all(
+        result.get("canonical_model_identity") is True for result in agent_results
+    )
+    manifest["observed_model_ids"] = sorted(
+        {
+            str(result.get("runtime_model_name"))
+            for result in agent_results
+            if result.get("runtime_model_name")
+        }
+    )
+    manifest["trajectory_complete"] = bool(agent_results) and all(
+        result.get("trajectory_status") == "real" for result in agent_results
+    )
     atomic_write_json(job_dir / "run_manifest.json", manifest)
     return state
 
@@ -185,6 +208,7 @@ def _run_manifest(
         "harness_version": run.harness_version,
         "model_slug": run.model_slug,
         "model_id": run.model_id,
+        "provider_model_id": run.model_id,
         "model_provider": run.provider,
         "proxy_model_name": run.proxy_model_name,
         "repetition": run.repetition,
@@ -204,8 +228,15 @@ def _run_manifest(
         "provider": "aws",
         "runner": "shellbench-native",
         "execution_mode": os.environ.get("SHELLBENCH_EXECUTION_MODE", "native"),
-        "canonical_model_identity": run.proxy_model_name == run.model_id,
-        "trajectory_mode": "real_harness_events",
+        "canonical_model_identity": None,
+        "intended_model_identity": {
+            "provider": run.provider,
+            "provider_model_id": run.model_id,
+            "proxy_model_name": run.proxy_model_name,
+        },
+        "observed_model_ids": [],
+        "trajectory_mode": trajectory_mode_for_harness(run.harness),
+        "trajectory_complete": False,
         "parity_validated": (
             os.environ.get("SHELLBENCH_PARITY_VALIDATED", "").lower() == "true"
         ),
@@ -258,11 +289,11 @@ def build_run_spec(args: argparse.Namespace) -> RunSpec:
     return RunSpec(
         run_label=args.run_label,
         harness=harness.name,
-        harness_version=harness.version,
+        harness_version=args.harness_version or harness.version,
         model_slug=model.slug,
-        model_id=model.provider_model_id,
-        provider=model.provider,
-        proxy_model_name=model.proxy_model_name,
+        model_id=args.model_id or model.provider_model_id,
+        provider=args.model_provider or model.provider,
+        proxy_model_name=args.proxy_model_name or model.proxy_model_name,
         repetition=args.repetition,
         expected_task_count=args.expected_task_count,
         run_date=args.run_date,
@@ -275,7 +306,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jobs-dir", type=Path, required=True)
     parser.add_argument("--run-label", required=True)
     parser.add_argument("--harness", required=True)
+    parser.add_argument("--harness-version")
     parser.add_argument("--model-slug", required=True)
+    parser.add_argument("--model-id")
+    parser.add_argument("--model-provider")
+    parser.add_argument("--proxy-model-name")
     parser.add_argument("--repetition", type=int, choices=(1, 2, 3), required=True)
     parser.add_argument("--expected-task-count", type=int, required=True)
     parser.add_argument("--public-tasks-commit", required=True)

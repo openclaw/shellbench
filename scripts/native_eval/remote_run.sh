@@ -2,11 +2,11 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: remote_run.sh ROOT TASKS_ROOT ENV_FILE RUN_LABEL HARNESS MODEL_SLUG REP EXPECTED_COUNT PUBLIC_TASKS_COMMIT RUN_DATE CONCURRENCY [TASK_NAME ...]" >&2
+  echo "usage: remote_run.sh ROOT TASKS_ROOT ENV_FILE RUN_LABEL HARNESS MODEL_SLUG REP EXPECTED_COUNT PUBLIC_TASKS_COMMIT RUN_DATE CONCURRENCY HARNESS_VERSION MODEL_ID MODEL_PROVIDER PROXY_MODEL_NAME [TASK_NAME ...]" >&2
   exit 2
 }
 
-[[ $# -ge 11 ]] || usage
+[[ $# -ge 15 ]] || usage
 
 ROOT="$1"
 TASKS_ROOT="$2"
@@ -19,7 +19,11 @@ EXPECTED_TASK_COUNT="$8"
 PUBLIC_TASKS_COMMIT="$9"
 RUN_DATE="${10}"
 CONCURRENCY="${11}"
-shift 11
+HARNESS_VERSION="${12}"
+MODEL_ID="${13}"
+MODEL_PROVIDER="${14}"
+PROXY_MODEL_NAME="${15}"
+shift 15
 TASK_NAMES=("$@")
 TASK_SUITE_PATH="combined tasks/tasks"
 TOOLCHAIN_ROOT="${TOOLCHAIN_ROOT:-/opt/shellbench-native}"
@@ -109,7 +113,11 @@ RUN_COMMAND=(
   --jobs-dir "$ROOT/results/jobs"
   --run-label "$RUN_LABEL"
   --harness "$HARNESS"
+  --harness-version "$HARNESS_VERSION"
   --model-slug "$MODEL_SLUG"
+  --model-id "$MODEL_ID"
+  --model-provider "$MODEL_PROVIDER"
+  --proxy-model-name "$PROXY_MODEL_NAME"
   --repetition "$REPETITION"
   --expected-task-count "$EXPECTED_TASK_COUNT"
   --public-tasks-commit "$PUBLIC_TASKS_COMMIT"

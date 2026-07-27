@@ -15,6 +15,7 @@ from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Protocol, Sequence
 
 from scripts.native_eval.checkpoint_loop import count_result_json
@@ -797,6 +798,10 @@ printf '%s\n' "$pid"
             str(self._store.data["public_tasks_commit"]),
             run.run_date,
             str(self._task_concurrency(run.model_slug)),
+            run.harness_version,
+            run.model_id,
+            run.provider,
+            run.proxy_model_name,
         ]
         self._checked(
             self._ssh_command(
@@ -954,6 +959,48 @@ printf '%s\n' "$pid"
             return False, 0, self._local_artifacts(run_label)
         return True, result_count, self._local_artifacts(run_label)
 
+    def _archived_exit_status(self, run_label: str) -> int | None:
+        archive = self.config.local_root / "raw" / f"{run_label}-final-artifacts.tar.gz"
+        candidates: list[int] = []
+        with tarfile.open(archive, "r:gz") as handle:
+            for member in handle.getmembers():
+                if not member.isfile():
+                    continue
+                parts = PurePosixPath(member.name).parts
+                if not parts or parts[-1] != "exit_status":
+                    continue
+                if (
+                    f"shellbench_meta-{run_label}" not in parts
+                    and not (
+                        len(parts) >= 3
+                        and parts[-3:] == ("shellbench-runs", run_label, "exit_status")
+                    )
+                ):
+                    continue
+                extracted = handle.extractfile(member)
+                if extracted is None:
+                    continue
+                raw_status = extracted.read().decode("utf-8").strip()
+                try:
+                    candidates.append(int(raw_status))
+                except ValueError as exc:
+                    raise FleetError(
+                        f"invalid archived exit_status for {run_label}: {raw_status!r}"
+                    ) from exc
+        if len(set(candidates)) > 1:
+            raise FleetError(f"conflicting archived exit_status values for {run_label}")
+        return candidates[0] if candidates else None
+
+    def _checkpoint_log_has_final(self, run_label: str) -> bool:
+        log_path = self.config.local_root / "logs" / f"{run_label}.checkpoints.log"
+        if not log_path.is_file():
+            return False
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            fields = line.split("\t", 4)
+            if len(fields) >= 2 and fields[1] == "final":
+                return True
+        return False
+
     def _finish_exported(self, entry: dict[str, Any], run: RunSpec) -> bool:
         verified, result_count, artifacts = self._verify_final(run.run_label)
         if not verified:
@@ -969,6 +1016,30 @@ printf '%s\n' "$pid"
                 "verified export has no lease metadata for cleanup",
             )
             return False
+        raw_exit_code = entry.get("run_exit_code")
+        run_exit_code = int(raw_exit_code) if raw_exit_code is not None else None
+        exit_code_changes: dict[str, Any] = {}
+        if run_exit_code is None:
+            archived_exit_status = self._archived_exit_status(run.run_label)
+            if archived_exit_status is not None:
+                run_exit_code = archived_exit_status
+                exit_code_changes = {
+                    "run_exit_code": run_exit_code,
+                    "run_exit_code_source": "archived_exit_status",
+                }
+            elif (
+                result_count == run.expected_task_count
+                and self._checkpoint_log_has_final(run.run_label)
+            ):
+                run_exit_code = 0
+                exit_code_changes = {
+                    "run_exit_code": 0,
+                    "run_exit_code_source": "recovered_full_coverage_remote_done",
+                    "run_exit_code_inference": (
+                        "inferred zero from verified full-coverage archive and "
+                        "checkpoint final event after remote done"
+                    ),
+                }
         stop = self.executor.run(
             [
                 self.config.crabbox_bin,
@@ -988,13 +1059,12 @@ printf '%s\n' "$pid"
                 final_result_count=result_count,
                 artifacts=artifacts,
                 last_error=f"Crabbox stop failed with exit {stop.returncode}",
+                **exit_code_changes,
             )
             return False
 
         lease_value = dict(lease_value)
         lease_value.update({"state": "stopped", "stopped_at_utc": utc_now()})
-        raw_exit_code = entry.get("run_exit_code")
-        run_exit_code = int(raw_exit_code) if raw_exit_code is not None else None
         completed = run_exit_code == 0 and result_count == run.expected_task_count
         status = "completed" if completed else "failed"
         self._store.update(
@@ -1013,6 +1083,7 @@ printf '%s\n' "$pid"
                     f"result coverage {result_count}/{run.expected_task_count}"
                 )
             ),
+            **exit_code_changes,
         )
         if not completed:
             self._schedule_rerun(self._store.get(run.run_label))

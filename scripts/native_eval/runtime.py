@@ -713,6 +713,63 @@ def _load_json_events(path: Path) -> list[dict[str, Any]]:
     return events
 
 
+def _load_codex_stream(path: Path) -> tuple[list[dict[str, Any]], int, int]:
+    events: list[dict[str, Any]] = []
+    preamble_lines = 0
+    malformed_event_lines = 0
+    stream_started = False
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            if stream_started:
+                malformed_event_lines += 1
+            else:
+                preamble_lines += 1
+            continue
+        stream_started = True
+        if isinstance(item, dict):
+            events.append(item)
+        else:
+            malformed_event_lines += 1
+    return events, preamble_lines, malformed_event_lines
+
+
+def _observed_codex_models(agent_dir: Path) -> set[str]:
+    models: set[str] = set()
+    sessions_dir = agent_dir / "sessions"
+    if not sessions_dir.is_dir():
+        return models
+    for path in sorted(sessions_dir.rglob("*.jsonl")):
+        for event in _load_json_events(path):
+            if event.get("type") == "turn_context":
+                payload = event.get("payload")
+                if isinstance(payload, dict) and payload.get("model"):
+                    models.add(str(payload["model"]))
+            message = event.get("message")
+            if isinstance(message, dict) and message.get("model"):
+                models.add(str(message["model"]))
+    return models
+
+
+def _completed_codex_items(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    order: list[str] = []
+    latest: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if event.get("type") not in {"item.started", "item.updated", "item.completed"}:
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or f"anonymous-{len(order)}")
+        if item_id not in latest:
+            order.append(item_id)
+        latest[item_id] = item
+    return [latest[item_id] for item_id in order]
+
+
 def _find_usage(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):
         for key in ("usage", "token_usage", "final_metrics"):
@@ -780,12 +837,21 @@ def write_agent_trajectory(
             "trajectory_status": "unsupported",
             "trajectory_source": None,
             "trajectory_event_count": 0,
-            "runtime_model_name": run.model_id,
-            "canonical_model_identity": True,
+            "runtime_model_name": None,
+            "canonical_model_identity": False,
         }
 
     source_path = agent_dir / "codex.txt"
-    events = _load_json_events(source_path) if source_path.is_file() else []
+    if source_path.is_file():
+        events, preamble_lines, malformed_event_lines = _load_codex_stream(source_path)
+    else:
+        events, preamble_lines, malformed_event_lines = [], 0, 0
+    observed_models = _observed_codex_models(agent_dir)
+    runtime_model_name = (
+        next(iter(observed_models)) if len(observed_models) == 1 else None
+    )
+    canonical_model_identity = observed_models == {run.model_id}
+    terminal_event_seen = any(event.get("type") == "turn.completed" for event in events)
     steps = [
         {
             "step_id": 1,
@@ -797,25 +863,31 @@ def write_agent_trajectory(
     for event in events:
         if event.get("type") == "thread.started" and event.get("thread_id"):
             session_id = str(event["thread_id"])
-            continue
-        if event.get("type") != "item.completed":
-            continue
-        item = event.get("item")
-        if not isinstance(item, dict):
-            continue
+    for item in _completed_codex_items(events):
         step = _codex_item_step(item)
         if step is None:
             continue
         step["step_id"] = len(steps) + 1
         steps.append(step)
 
-    if len(steps) == 1:
+    if (
+        len(steps) == 1
+        or malformed_event_lines
+        or not terminal_event_seen
+        or runtime_model_name is None
+    ):
         return {
             "trajectory_status": "unavailable",
             "trajectory_source": str(source_path),
             "trajectory_event_count": len(events),
-            "runtime_model_name": run.model_id,
-            "canonical_model_identity": True,
+            "runtime_model_name": runtime_model_name,
+            "canonical_model_identity": canonical_model_identity,
+            "trajectory_validation": {
+                "terminal_event_seen": terminal_event_seen,
+                "preamble_lines": preamble_lines,
+                "malformed_event_lines": malformed_event_lines,
+                "observed_models": sorted(observed_models),
+            },
         }
 
     metrics = collect_agent_metrics(run.harness, agent_dir)
@@ -837,13 +909,17 @@ def write_agent_trajectory(
         "agent": {
             "name": run.harness,
             "version": run.harness_version,
-            "model_name": f"{run.provider}/{run.model_id}",
+            "model_name": f"{run.provider}/{runtime_model_name}",
         },
         "steps": steps,
         "final_metrics": final_metrics,
         "extra": {
             "native_raw_trace_file": source_path.name,
             "native_raw_event_count": len(events),
+            "native_raw_preamble_lines": preamble_lines,
+            "native_raw_malformed_event_lines": malformed_event_lines,
+            "observed_models": sorted(observed_models),
+            "terminal_event_seen": terminal_event_seen,
         },
     }
     atomic_write_json(agent_dir / "trajectory.json", trajectory)
@@ -851,8 +927,14 @@ def write_agent_trajectory(
         "trajectory_status": "real",
         "trajectory_source": str(source_path),
         "trajectory_event_count": len(events),
-        "runtime_model_name": run.model_id,
-        "canonical_model_identity": True,
+        "runtime_model_name": runtime_model_name,
+        "canonical_model_identity": canonical_model_identity,
+        "trajectory_validation": {
+            "terminal_event_seen": terminal_event_seen,
+            "preamble_lines": preamble_lines,
+            "malformed_event_lines": malformed_event_lines,
+            "observed_models": sorted(observed_models),
+        },
     }
 
 
@@ -878,7 +960,13 @@ def _codex_item_step(item: dict[str, Any]) -> dict[str, Any] | None:
             "llm_call_count": 0,
             "extra": {"item_type": "error"},
         }
-    if item_type not in {"command_execution", "mcp_tool_call"}:
+    if item_type not in {
+        "command_execution",
+        "file_change",
+        "mcp_tool_call",
+        "todo_list",
+        "web_search",
+    }:
         return None
 
     call_id = str(item.get("id") or uuid.uuid4())
@@ -886,6 +974,14 @@ def _codex_item_step(item: dict[str, Any]) -> dict[str, Any] | None:
         function_name = "shell"
         arguments = {"command": str(item.get("command") or "")}
         output = str(item.get("aggregated_output") or "")
+    elif item_type in {"file_change", "todo_list", "web_search"}:
+        function_name = item_type
+        arguments = {
+            key: value
+            for key, value in item.items()
+            if key not in {"id", "type", "aggregated_output", "result"}
+        }
+        output = str(item.get("aggregated_output") or item.get("result") or "")
     else:
         server = str(item.get("server") or "mcp")
         tool = str(item.get("tool") or "unknown")
