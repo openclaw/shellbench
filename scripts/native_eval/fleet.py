@@ -548,7 +548,8 @@ class FleetController:
         if result.returncode:
             detail = (result.stderr or result.stdout or "").strip()
             missing = any(
-                marker in detail.lower() for marker in ("not found", "no claim", "unknown lease")
+                marker in detail.lower()
+                for marker in ("not found", "not_found", "http 404", "no claim", "unknown lease")
             )
             if not missing:
                 raise FleetError(

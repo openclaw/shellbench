@@ -152,7 +152,11 @@ class FakeExecutor:
                 None,
             )
             if lease is None:
-                return _result(argv, 1, stderr="not found")
+                return _result(
+                    argv,
+                    1,
+                    stderr='coordinator GET /v1/leases/example: http 404: {"error":"not_found"}',
+                )
             return _result(argv, 0, stdout=json.dumps(lease))
 
         if argv[:2] == ["crabbox", "warmup"]:
