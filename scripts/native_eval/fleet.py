@@ -159,6 +159,9 @@ class FleetConfig:
     warmup_capacity_backoff_seconds: float = 5.0
     runner_archive: Path | None = None
     runner_commit: str | None = None
+    harbor_reference_commit: str = ""
+    judge_model_id: str = ""
+    execution_mode: str = "native"
 
 
 class RunIndexStore:
@@ -394,6 +397,9 @@ class FleetController:
                 "runner_commit": self.runner_commit,
                 "runner_archive_sha256": self.runner_archive_sha256,
                 "task_archive_sha256": self.task_archive_sha256,
+                "harbor_reference_commit": self.config.harbor_reference_commit,
+                "judge_model_id": self.config.judge_model_id,
+                "execution_mode": self.config.execution_mode,
                 "provider": "aws",
                 "machine_class": self.config.machine_class,
                 "instance_type": self.config.instance_type,
@@ -754,6 +760,10 @@ crabbox_ip=$7
 crabbox_region=$8
 runner_commit=$9
 shift 9
+harbor_reference_commit=$1
+judge_model_id=$2
+execution_mode=$3
+shift 3
 mkdir -p "$root/run-logs"
 stdout="$root/run-logs/$label.stdout.log"
 stderr="$root/run-logs/$label.stderr.log"
@@ -765,6 +775,9 @@ nohup env \
   "CRABBOX_IP=$crabbox_ip" \
   "CRABBOX_REGION=$crabbox_region" \
   "SHELLBENCH_RUNNER_COMMIT=$runner_commit" \
+  "SHELLBENCH_HARBOR_REFERENCE_COMMIT=$harbor_reference_commit" \
+  "SHELLBENCH_JUDGE_MODEL_ID=$judge_model_id" \
+  "SHELLBENCH_EXECUTION_MODE=$execution_mode" \
   "$root/runner/scripts/native_eval/remote_run.sh" "$@" \
   >"$stdout" 2>"$stderr" </dev/null &
 pid=$!
@@ -802,6 +815,9 @@ printf '%s\n' "$pid"
                     lease.host,
                     lease.region,
                     self.runner_commit,
+                    self.config.harbor_reference_commit,
+                    self.config.judge_model_id,
+                    self.config.execution_mode,
                     *args,
                 ],
             ),
@@ -1257,6 +1273,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-capacity-backoff-seconds", type=float, default=5.0)
     parser.add_argument("--runner-archive", type=Path)
     parser.add_argument("--runner-commit")
+    parser.add_argument("--harbor-reference-commit", default="")
+    parser.add_argument("--judge-model-id", default="")
+    parser.add_argument("--execution-mode", default="native")
     args = parser.parse_args(argv)
     args.model_max_runs = _parse_model_values(
         parser,
@@ -1304,6 +1323,9 @@ def main(argv: list[str] | None = None) -> int:
         warmup_capacity_backoff_seconds=args.warmup_capacity_backoff_seconds,
         runner_archive=args.runner_archive,
         runner_commit=args.runner_commit,
+        harbor_reference_commit=args.harbor_reference_commit,
+        judge_model_id=args.judge_model_id,
+        execution_mode=args.execution_mode,
     )
     try:
         return FleetController(config).run()

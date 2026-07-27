@@ -676,6 +676,12 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
             "opus48=2",
             "--provider-max-runs",
             "anthropic=2",
+            "--harbor-reference-commit",
+            "harbor-commit",
+            "--judge-model-id",
+            "gpt-5.5",
+            "--execution-mode",
+            "native",
             "--model-task-concurrency",
             "fable5=2",
         ]
@@ -683,6 +689,9 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
 
     assert args.model_max_runs == {"fable5": 1, "opus48": 2}
     assert args.provider_max_runs == {"anthropic": 2}
+    assert args.harbor_reference_commit == "harbor-commit"
+    assert args.judge_model_id == "gpt-5.5"
+    assert args.execution_mode == "native"
     assert args.model_task_concurrency == {"fable5": 2}
 
 

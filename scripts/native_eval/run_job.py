@@ -203,6 +203,11 @@ def _run_manifest(
         "agent_concurrency": concurrency,
         "provider": "aws",
         "runner": "shellbench-native",
+        "execution_mode": os.environ.get("SHELLBENCH_EXECUTION_MODE", "native"),
+        "harbor_reference_commit": os.environ.get(
+            "SHELLBENCH_HARBOR_REFERENCE_COMMIT"
+        ),
+        "judge_model_id": os.environ.get("SHELLBENCH_JUDGE_MODEL_ID"),
         "runner_commit": _git_commit(),
         "runner_patch_hash": _runner_patch_hash(),
         "public_tasks_commit": public_tasks_commit,

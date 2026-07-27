@@ -16,7 +16,7 @@ from scripts.native_eval.models import (
     build_matrix_plan,
 )
 from scripts.native_eval.proxy import write_proxy_config
-from scripts.native_eval.run_job import _git_commit
+from scripts.native_eval.run_job import _git_commit, _run_manifest
 from scripts.native_eval.runtime import collect_agent_metrics, read_reward
 from scripts.native_eval.tasks import TaskSpec, validate_suite
 
@@ -112,6 +112,41 @@ def test_proxy_config_pins_only_requested_upstreams(tmp_path: Path) -> None:
     assert "OPENAI_API_KEY" in serialized
     assert "ANTHROPIC_API_KEY" in serialized
     assert "sk-" not in serialized
+
+
+def test_run_manifest_records_native_audit_metadata(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SHELLBENCH_EXECUTION_MODE", "native")
+    monkeypatch.setenv("SHELLBENCH_HARBOR_REFERENCE_COMMIT", "harbor-commit")
+    monkeypatch.setenv("SHELLBENCH_JUDGE_MODEL_ID", "gpt-5.5")
+    run = RunSpec(
+        run_label="openclaw-gpt55-full-2-r1-20260727",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=2,
+        run_date="20260727",
+    )
+
+    manifest = _run_manifest(
+        run,
+        public_tasks_commit="tasks-commit",
+        task_suite_path="combined tasks/tasks",
+        concurrency=16,
+        started_at="2026-07-27T00:00:00Z",
+        tasks_root=tmp_path,
+        tasks=[],
+    )
+
+    assert manifest["execution_mode"] == "native"
+    assert manifest["harbor_reference_commit"] == "harbor-commit"
+    assert manifest["judge_model_id"] == "gpt-5.5"
 
 
 def test_harness_commands_use_proxy_alias_not_upstream_id() -> None:
