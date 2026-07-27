@@ -142,6 +142,35 @@ def test_harness_commands_use_proxy_alias_not_upstream_id() -> None:
         assert "OPENROUTER_API_KEY" not in command.env
 
 
+def test_hermes_uses_named_local_proxy_provider() -> None:
+    run = RunSpec(
+        run_label="hermes-test",
+        harness="hermes",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=116,
+        run_date="20260727",
+    )
+
+    command = build_harness_command(
+        run,
+        proxy_url="http://host.docker.internal:4000",
+        proxy_key="local-proxy-key",
+        mcp_servers=(),
+    )
+
+    assert "--provider custom:shellbench" in command.run_command
+    assert "--provider openai" not in command.run_command
+    assert "Unknown provider" in command.run_command
+    assert command.env == {"SHELLBENCH_PROXY_KEY": "local-proxy-key"}
+    assert "custom:shellbench" in command.setup_command
+    assert "http://host.docker.internal:4000/v1" in command.setup_command
+
+
 def test_reward_json_takes_precedence_over_text(tmp_path: Path) -> None:
     (tmp_path / "reward.txt").write_text("0\n", encoding="utf-8")
     (tmp_path / "reward.json").write_text(

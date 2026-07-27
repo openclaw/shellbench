@@ -135,9 +135,22 @@ def _hermes(
     mcp_servers: tuple[McpServer, ...],
 ) -> HarnessCommand:
     home = "/tmp/shellbench-hermes"
+    provider_name = "custom:shellbench"
     config: dict[str, object] = {
-        "model": run.proxy_model_name,
-        "provider": "openai",
+        "model": {
+            "default": run.proxy_model_name,
+            "provider": provider_name,
+        },
+        "providers": {
+            "shellbench": {
+                "name": "shellbench",
+                "api": f"{proxy_url.rstrip('/')}/v1",
+                "key_env": "SHELLBENCH_PROXY_KEY",
+                "transport": "chat_completions",
+                "default_model": run.proxy_model_name,
+                "models": {run.proxy_model_name: {}},
+            }
+        },
         "toolsets": ["hermes-cli"],
         "agent": {"max_turns": 90},
         "memory": {"memory_enabled": False, "user_profile_enabled": False},
@@ -165,8 +178,13 @@ def _hermes(
         f"export PATH={_base_path()}; export HERMES_HOME={home}; "
         "export TERMINAL_ENV=local; export TERMINAL_CWD=\"$PWD\"; "
         "hermes --yolo chat -q \"$(cat /tmp/shellbench-instruction.md)\" -Q "
-        f"--model {shlex.quote(run.proxy_model_name)} --provider openai "
-        "2>&1 | tee /logs/agent/hermes.txt"
+        f"--model {shlex.quote(run.proxy_model_name)} "
+        f"--provider {shlex.quote(provider_name)} "
+        ">/logs/agent/hermes.txt 2>&1; status=$?; "
+        "cat /logs/agent/hermes.txt; "
+        "if grep -Eq \"Unknown provider|No LLM provider configured\" "
+        "/logs/agent/hermes.txt; then exit 64; fi; "
+        "exit \"$status\""
     )
     cleanup = (
         f"export PATH={_base_path()}; export HERMES_HOME={home}; "
@@ -178,8 +196,7 @@ def _hermes(
         run_command=run_command,
         cleanup_command=cleanup,
         env={
-            "OPENAI_API_KEY": proxy_key,
-            "OPENAI_BASE_URL": f"{proxy_url.rstrip('/')}/v1",
+            "SHELLBENCH_PROXY_KEY": proxy_key,
         },
     )
 
