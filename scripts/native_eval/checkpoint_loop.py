@@ -13,7 +13,8 @@ from pathlib import PurePosixPath
 
 @dataclass(frozen=True)
 class RemoteState:
-    result_count: int
+    result_file_count: int
+    completed_count: int
     done: bool
     exit_status: int | None
 
@@ -111,14 +112,18 @@ set -eu
 job_dir=$1
 state_dir=$2
 count=0
+completed=0
 if [ -d "$job_dir" ]; then
   count=$(find "$job_dir" -mindepth 2 -maxdepth 2 -name result.json | wc -l | tr -d ' ')
+  completed=$(find "$job_dir" -mindepth 2 -maxdepth 2 -name result.json -exec \
+    jq -r 'select(.finished_at != null and .finished_at != "") | 1' {} \\; \
+    | wc -l | tr -d ' ')
 fi
 done_flag=0
 [ -f "$state_dir/done" ] && done_flag=1
 status=-
 [ -f "$state_dir/exit_status" ] && status=$(cat "$state_dir/exit_status")
-printf '%s\\t%s\\t%s\\n' "$count" "$done_flag" "$status"
+printf '%s\\t%s\\t%s\\t%s\\n' "$count" "$completed" "$done_flag" "$status"
 """
     output = client.run(
         [
@@ -130,9 +135,10 @@ printf '%s\\t%s\\t%s\\n' "$count" "$done_flag" "$status"
             f"/tmp/shellbench-runs/{run_label}",
         ]
     )
-    count, done, status = output.split("\t")
+    result_files, completed, done, status = output.split("\t")
     return RemoteState(
-        result_count=int(count),
+        result_file_count=int(result_files),
+        completed_count=int(completed),
         done=done == "1",
         exit_status=None if status == "-" else int(status),
     )
@@ -222,7 +228,8 @@ def run_loop(args: argparse.Namespace) -> int:
     )
 
     sequence = next_checkpoint_sequence(raw_dir, args.run_label)
-    last_count = 0
+    last_archive_count = 0
+    last_completed_count = 0
     last_checkpoint_at = 0.0
     failures = 0
 
@@ -236,7 +243,7 @@ def run_loop(args: argparse.Namespace) -> int:
                 log_path,
                 event="ssh_error",
                 archive_name="",
-                result_count=last_count,
+                result_count=last_archive_count,
                 detail=str(exc).replace("\n", " ")[:500],
             )
             if failures >= args.max_ssh_failures:
@@ -244,7 +251,7 @@ def run_loop(args: argparse.Namespace) -> int:
                     log_path,
                     event="lease_lost",
                     archive_name="",
-                    result_count=last_count,
+                    result_count=last_archive_count,
                 )
                 return 75
             time.sleep(args.poll_seconds)
@@ -252,16 +259,17 @@ def run_loop(args: argparse.Namespace) -> int:
 
         now = time.monotonic()
         checkpoint_due = (
-            state.result_count >= 1
+            state.completed_count >= 1
             and (
                 last_checkpoint_at == 0
-                or state.result_count - last_count >= args.trial_increment
+                or state.completed_count - last_completed_count
+                >= args.trial_increment
                 or now - last_checkpoint_at >= args.interval_seconds
             )
         )
         if checkpoint_due:
             try:
-                last_count = pull_checkpoint(
+                last_archive_count = pull_checkpoint(
                     client=client,
                     runner_root=args.runner_root,
                     remote_root=args.remote_root,
@@ -270,6 +278,7 @@ def run_loop(args: argparse.Namespace) -> int:
                     log_path=log_path,
                     sequence=sequence,
                 )
+                last_completed_count = state.completed_count
                 sequence += 1
                 last_checkpoint_at = time.monotonic()
             except (OSError, subprocess.SubprocessError, tarfile.TarError) as exc:
@@ -277,13 +286,16 @@ def run_loop(args: argparse.Namespace) -> int:
                     log_path,
                     event="checkpoint_error",
                     archive_name="",
-                    result_count=last_count,
+                    result_count=last_archive_count,
                     detail=str(exc).replace("\n", " ")[:500],
                 )
 
         if state.done:
-            if state.result_count != last_count and state.result_count:
-                last_count = pull_checkpoint(
+            if (
+                state.result_file_count != last_archive_count
+                and state.result_file_count
+            ):
+                last_archive_count = pull_checkpoint(
                     client=client,
                     runner_root=args.runner_root,
                     remote_root=args.remote_root,
