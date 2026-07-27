@@ -491,7 +491,9 @@ async def run_trial(
             result["agent_result"] = collect_agent_metrics(
                 run.harness, trial_dir / "agent"
             )
-            write_minimal_trajectory(task, run, trial_dir / "agent")
+            result["agent_result"].update(
+                write_agent_trajectory(task, run, trial_dir / "agent")
+            )
             await environment.collect_artifacts()
             atomic_write_json(trial_dir / "result.json", result)
 
@@ -502,10 +504,10 @@ async def run_trial(
             "AGENT_JUDGE_API_URL": (
                 f"{proxy_url.rstrip('/')}/v1/chat/completions"
             ),
-            "AGENT_JUDGE_MODEL": "sb-gpt55",
+            "AGENT_JUDGE_MODEL": "gpt-5.5",
             "AGENT_JUDGE_API_KEY": proxy_key,
             "LLM_JUDGE_API_URL": f"{proxy_url.rstrip('/')}/v1",
-            "LLM_JUDGE_MODEL": "sb-gpt55",
+            "LLM_JUDGE_MODEL": "gpt-5.5",
             "LLM_JUDGE_API_KEY": proxy_key,
             "OPENAI_BASE_URL": f"{proxy_url.rstrip('/')}/v1",
             "OPENROUTER_API_KEY": proxy_key,
@@ -768,36 +770,159 @@ def _merge_event_cost(metrics: dict[str, Any], event: dict[str, Any]) -> None:
             return
 
 
-def write_minimal_trajectory(task: TaskSpec, run: RunSpec, agent_dir: Path) -> None:
-    raw_files = sorted(
-        path.name
-        for path in agent_dir.iterdir()
-        if path.is_file() and path.name != "trajectory.json"
-    )
+def write_agent_trajectory(
+    task: TaskSpec,
+    run: RunSpec,
+    agent_dir: Path,
+) -> dict[str, Any]:
+    if run.harness != "codex":
+        return {
+            "trajectory_status": "unsupported",
+            "trajectory_source": None,
+            "trajectory_event_count": 0,
+            "runtime_model_name": run.model_id,
+            "canonical_model_identity": True,
+        }
+
+    source_path = agent_dir / "codex.txt"
+    events = _load_json_events(source_path) if source_path.is_file() else []
+    steps = [
+        {
+            "step_id": 1,
+            "source": "user",
+            "message": task.instruction,
+        }
+    ]
+    session_id = str(uuid.uuid4())
+    for event in events:
+        if event.get("type") == "thread.started" and event.get("thread_id"):
+            session_id = str(event["thread_id"])
+            continue
+        if event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict):
+            continue
+        step = _codex_item_step(item)
+        if step is None:
+            continue
+        step["step_id"] = len(steps) + 1
+        steps.append(step)
+
+    if len(steps) == 1:
+        return {
+            "trajectory_status": "unavailable",
+            "trajectory_source": str(source_path),
+            "trajectory_event_count": len(events),
+            "runtime_model_name": run.model_id,
+            "canonical_model_identity": True,
+        }
+
+    metrics = collect_agent_metrics(run.harness, agent_dir)
+    final_metrics: dict[str, Any] = {"total_steps": len(steps)}
+    metric_names = {
+        "n_input_tokens": "total_prompt_tokens",
+        "n_cache_tokens": "total_cached_tokens",
+        "n_output_tokens": "total_completion_tokens",
+        "cost_usd": "total_cost_usd",
+    }
+    for source_name, target_name in metric_names.items():
+        value = metrics.get(source_name)
+        if isinstance(value, (int, float)):
+            final_metrics[target_name] = value
+
     trajectory = {
         "schema_version": "ATIF-v1.7",
-        "session_id": str(uuid.uuid4()),
+        "session_id": session_id,
         "agent": {
             "name": run.harness,
             "version": run.harness_version,
             "model_name": f"{run.provider}/{run.model_id}",
         },
-        "steps": [
-            {
-                "step_id": 1,
-                "timestamp": utc_now(),
-                "source": "user",
-                "message": task.instruction,
-                "tool_calls": [],
-                "observation": None,
-            }
-        ],
-        "final_metrics": {
-            "total_steps": 1,
-            "native_raw_trace_files": raw_files,
+        "steps": steps,
+        "final_metrics": final_metrics,
+        "extra": {
+            "native_raw_trace_file": source_path.name,
+            "native_raw_event_count": len(events),
         },
     }
     atomic_write_json(agent_dir / "trajectory.json", trajectory)
+    return {
+        "trajectory_status": "real",
+        "trajectory_source": str(source_path),
+        "trajectory_event_count": len(events),
+        "runtime_model_name": run.model_id,
+        "canonical_model_identity": True,
+    }
+
+
+def _codex_item_step(item: dict[str, Any]) -> dict[str, Any] | None:
+    item_type = str(item.get("type") or "")
+    if item_type == "agent_message":
+        return {
+            "source": "agent",
+            "message": str(item.get("text") or ""),
+            "llm_call_count": 1,
+        }
+    if item_type == "reasoning":
+        return {
+            "source": "agent",
+            "message": "",
+            "reasoning_content": str(item.get("text") or ""),
+            "llm_call_count": 1,
+        }
+    if item_type == "error":
+        return {
+            "source": "agent",
+            "message": str(item.get("message") or ""),
+            "llm_call_count": 0,
+            "extra": {"item_type": "error"},
+        }
+    if item_type not in {"command_execution", "mcp_tool_call"}:
+        return None
+
+    call_id = str(item.get("id") or uuid.uuid4())
+    if item_type == "command_execution":
+        function_name = "shell"
+        arguments = {"command": str(item.get("command") or "")}
+        output = str(item.get("aggregated_output") or "")
+    else:
+        server = str(item.get("server") or "mcp")
+        tool = str(item.get("tool") or "unknown")
+        function_name = f"mcp__{server}__{tool}"
+        arguments = item.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {"value": arguments}
+        result = item.get("result")
+        output = (
+            result
+            if isinstance(result, str)
+            else json.dumps(result, ensure_ascii=True, default=str)
+        )
+    observation_extra = {
+        key: item[key]
+        for key in ("exit_code", "status", "error")
+        if item.get(key) is not None
+    }
+    observation_result: dict[str, Any] = {
+        "source_call_id": call_id,
+        "content": output,
+    }
+    if observation_extra:
+        observation_result["extra"] = observation_extra
+    return {
+        "source": "agent",
+        "message": "",
+        "tool_calls": [
+            {
+                "tool_call_id": call_id,
+                "function_name": function_name,
+                "arguments": arguments,
+            }
+        ],
+        "observation": {"results": [observation_result]},
+        "llm_call_count": 1,
+    }
 
 
 def exception_info(exc: BaseException) -> dict[str, str]:

@@ -18,6 +18,8 @@ def _write_run(
     tasks: list[str] | None = None,
     harness: str = "openclaw",
     model_slug: str = "model",
+    native: bool = False,
+    parity_validated: bool = False,
 ) -> None:
     run_dir = jobs_root / "jobs" / run_label
     run_dir.mkdir(parents=True)
@@ -28,6 +30,15 @@ def _write_run(
         "repetition": repetition,
         "expected_task_count": expected_task_count,
     }
+    if native:
+        manifest.update(
+            {
+                "runner": "shellbench-native",
+                "canonical_model_identity": True,
+                "trajectory_mode": "real_harness_events",
+                "parity_validated": parity_validated,
+            }
+        )
     if pair_label is not None:
         manifest["pair_label"] = pair_label
     if tasks is not None:
@@ -83,6 +94,18 @@ def _result(
             "exception_traceback": "traceback",
             "occurred_at": "2026-07-27T10:00:55+00:00",
         }
+    return result
+
+
+def _native_result(task: str, *, reward: float = 1.0) -> dict:
+    result = _result(task, reward=reward, source="shellbench-native")
+    result["agent_result"].update(
+        {
+            "trajectory_status": "real",
+            "runtime_model_name": "gpt-5.5",
+            "canonical_model_identity": True,
+        }
+    )
     return result
 
 
@@ -243,6 +266,25 @@ def test_pair_label_uses_manifest_harness_and_model(tmp_path: Path):
     assert main([str(jobs_root / "jobs"), str(adjacent_summaries)]) == 0
     rerun = aggregate(jobs_root / "jobs", adjacent_summaries)
     assert len(rerun["runs"]) == 2
+
+
+def test_native_run_requires_parity_validation_for_leaderboard(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "codex-gpt55-calibration",
+        expected_task_count=1,
+        results=[_native_result("a")],
+        harness="codex",
+        model_slug="gpt55",
+        native=True,
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    assert report["runs"][0]["eligible"] is False
+    assert report["runs"][0]["exclusion_reason"] == "parity_not_validated"
 
 
 def test_unknown_exception_is_agent_exit_and_gateway_signature_is_excluded(

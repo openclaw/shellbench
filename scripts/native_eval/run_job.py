@@ -204,6 +204,11 @@ def _run_manifest(
         "provider": "aws",
         "runner": "shellbench-native",
         "execution_mode": os.environ.get("SHELLBENCH_EXECUTION_MODE", "native"),
+        "canonical_model_identity": run.proxy_model_name == run.model_id,
+        "trajectory_mode": "real_harness_events",
+        "parity_validated": (
+            os.environ.get("SHELLBENCH_PARITY_VALIDATED", "").lower() == "true"
+        ),
         "harbor_reference_commit": os.environ.get(
             "SHELLBENCH_HARBOR_REFERENCE_COMMIT"
         ),

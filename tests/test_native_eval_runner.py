@@ -17,7 +17,11 @@ from scripts.native_eval.models import (
 )
 from scripts.native_eval.proxy import write_proxy_config
 from scripts.native_eval.run_job import _git_commit, _run_manifest
-from scripts.native_eval.runtime import collect_agent_metrics, read_reward
+from scripts.native_eval.runtime import (
+    collect_agent_metrics,
+    read_reward,
+    write_agent_trajectory,
+)
 from scripts.native_eval.tasks import TaskSpec, validate_suite
 
 
@@ -103,7 +107,7 @@ def test_proxy_config_pins_only_requested_upstreams(tmp_path: Path) -> None:
     config = json.loads(path.read_text(encoding="utf-8"))
 
     assert [item["model_name"] for item in config["model_list"]] == [
-        model.proxy_model_name for model in MODELS
+        model.provider_model_id for model in MODELS
     ]
     assert [item["litellm_params"]["model"] for item in config["model_list"]] == [
         f"{model.provider}/{model.provider_model_id}" for model in MODELS
@@ -149,7 +153,7 @@ def test_run_manifest_records_native_audit_metadata(
     assert manifest["judge_model_id"] == "gpt-5.5"
 
 
-def test_harness_commands_use_proxy_alias_not_upstream_id() -> None:
+def test_harness_commands_preserve_canonical_model_identity() -> None:
     for harness in HARNESSES:
         run = RunSpec(
             run_label=f"{harness.name}-test",
@@ -170,11 +174,11 @@ def test_harness_commands_use_proxy_alias_not_upstream_id() -> None:
             mcp_servers=(),
         )
 
-        assert "sb-opus5" in command.run_command or (
+        assert "claude-opus-5" in command.run_command or (
             harness.name == "claude-code"
-            and command.env["ANTHROPIC_MODEL"] == "sb-opus5"
+            and command.env["ANTHROPIC_MODEL"] == "claude-opus-5"
         )
-        assert "claude-opus-5" not in command.run_command
+        assert "sb-opus5" not in command.run_command
         assert "OPENROUTER_API_KEY" not in command.env
         assert 'exit "$status"' in command.run_command
 
@@ -208,7 +212,7 @@ def test_hermes_uses_named_local_proxy_provider() -> None:
     assert "http://host.docker.internal:4000/v1" in command.setup_command
 
 
-def test_claude_code_selects_proxy_alias_explicitly() -> None:
+def test_claude_code_selects_canonical_model_explicitly() -> None:
     run = RunSpec(
         run_label="claude-code-test",
         harness="claude-code",
@@ -229,8 +233,89 @@ def test_claude_code_selects_proxy_alias_explicitly() -> None:
         mcp_servers=(),
     )
 
-    assert "--model sb-gpt55" in command.run_command
-    assert command.env["ANTHROPIC_MODEL"] == "sb-gpt55"
+    assert "--model gpt-5.5" in command.run_command
+    assert command.env["ANTHROPIC_MODEL"] == "gpt-5.5"
+
+
+def test_codex_trajectory_uses_real_stream_events(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    events = [
+        {"type": "thread.started", "thread_id": "thread-123"},
+        {
+            "type": "item.completed",
+            "item": {"id": "reason-1", "type": "reasoning", "text": "inspect files"},
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "call-1",
+                "type": "command_execution",
+                "command": "ls -la",
+                "aggregated_output": "total 4",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {"id": "message-1", "type": "agent_message", "text": "done"},
+        },
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 100,
+                "cached_input_tokens": 20,
+                "output_tokens": 30,
+            },
+        },
+    ]
+    (agent_dir / "codex.txt").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="codex-gpt55-calibration",
+        harness="codex",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260727",
+    )
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    task = TaskSpec(
+        name="task",
+        title="task",
+        path=task_dir,
+        instruction="do the task",
+        raw_config={},
+        checksum="abc",
+        dockerfile=task_dir / "Dockerfile",
+        build_context=task_dir,
+        compose_file=None,
+        verifier_command="bash /tests/test.sh",
+        agent_timeout_sec=900,
+        verifier_timeout_sec=300,
+        build_timeout_sec=1800,
+        mcp_servers=(),
+        environment_env={},
+        verifier_env={},
+    )
+
+    metadata = write_agent_trajectory(task, run, agent_dir)
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert metadata["trajectory_status"] == "real"
+    assert trajectory["session_id"] == "thread-123"
+    assert len(trajectory["steps"]) == 4
+    assert trajectory["steps"][2]["tool_calls"][0]["function_name"] == "shell"
+    assert trajectory["steps"][2]["observation"]["results"][0]["content"] == "total 4"
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 100
 
 
 def test_codex_metrics_include_cached_input_tokens(tmp_path: Path) -> None:

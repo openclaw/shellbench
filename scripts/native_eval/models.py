@@ -38,41 +38,41 @@ class RunSpec:
 
 
 MODELS: tuple[ModelSpec, ...] = (
-    ModelSpec("gpt55", "gpt-5.5", "openai", "gpt-5.5", "sb-gpt55"),
+    ModelSpec("gpt55", "gpt-5.5", "openai", "gpt-5.5", "gpt-5.5"),
     ModelSpec(
         "gpt56-sol",
         "gpt-5.6-sol",
         "openai",
         "gpt-5.6-sol",
-        "sb-gpt56-sol",
+        "gpt-5.6-sol",
     ),
     ModelSpec(
         "fable5",
         "fable-5",
         "anthropic",
         "claude-fable-5",
-        "sb-fable5",
+        "claude-fable-5",
     ),
     ModelSpec(
         "opus47",
         "opus-4.7",
         "anthropic",
         "claude-opus-4-7",
-        "sb-opus47",
+        "claude-opus-4-7",
     ),
     ModelSpec(
         "opus48",
         "opus-4.8",
         "anthropic",
         "claude-opus-4-8",
-        "sb-opus48",
+        "claude-opus-4-8",
     ),
     ModelSpec(
         "opus5",
         "opus-5",
         "anthropic",
         "claude-opus-5",
-        "sb-opus5",
+        "claude-opus-5",
     ),
 )
 
@@ -133,4 +133,3 @@ def build_matrix_plan(
                     )
                 )
     return plan
-

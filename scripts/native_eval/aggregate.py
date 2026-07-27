@@ -107,6 +107,10 @@ PER_TASK_FIELDS = (
     "n_cache_tokens",
     "n_output_tokens",
     "cost_usd",
+    "source",
+    "trajectory_status",
+    "runtime_model_name",
+    "canonical_model_identity",
 )
 
 RUN_FIELDS = (
@@ -131,6 +135,9 @@ RUN_FIELDS = (
     "infra_dominated",
     "harness_wide_failure",
     "harness_wide_failure_signature",
+    "canonical_model_identity",
+    "trajectory_complete",
+    "parity_validated",
     "eligible",
     "exclusion_reason",
     "n_input_tokens",
@@ -444,6 +451,10 @@ def _normalize_result(
             "estimated_cost_usd",
             "total_cost_usd",
         ),
+        "source": str(result.get("source") or ""),
+        "trajectory_status": str(agent_result.get("trajectory_status") or ""),
+        "runtime_model_name": str(agent_result.get("runtime_model_name") or ""),
+        "canonical_model_identity": agent_result.get("canonical_model_identity"),
         "_has_result_file": True,
         "_valid_result": True,
         "_completed_result": bool(result.get("finished_at")),
@@ -620,6 +631,7 @@ def _load_run(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         repetition=repetition,
         expected_count=expected_count,
         rows=rows,
+        manifest=manifest,
     )
     return summary, rows
 
@@ -664,6 +676,7 @@ def _summarize_run(
     repetition: int | None,
     expected_count: int,
     rows: Sequence[dict[str, Any]],
+    manifest: dict[str, Any],
 ) -> dict[str, Any]:
     classifications = [str(row["classification"]) for row in rows]
     rewards = [_number(row.get("reward")) for row in rows]
@@ -700,13 +713,47 @@ def _summarize_run(
         rows,
         expected_count,
     )
-    eligible = not incomplete and not infra_dominated and not harness_wide_failure
+    native_run = (
+        manifest.get("runner") == "shellbench-native"
+        or any(row.get("source") == "shellbench-native" for row in rows)
+    )
+    canonical_model_identity = not native_run or (
+        manifest.get("canonical_model_identity") is True
+        and all(
+            row.get("canonical_model_identity") is True
+            for row in rows
+            if row.get("_valid_result")
+        )
+    )
+    trajectory_complete = not native_run or (
+        manifest.get("trajectory_mode") == "real_harness_events"
+        and all(
+            row.get("trajectory_status") == "real"
+            for row in rows
+            if row.get("_valid_result")
+        )
+    )
+    parity_validated = not native_run or manifest.get("parity_validated") is True
+    eligible = (
+        not incomplete
+        and not infra_dominated
+        and not harness_wide_failure
+        and canonical_model_identity
+        and trajectory_complete
+        and parity_validated
+    )
     if incomplete:
         exclusion_reason = "incomplete"
     elif infra_dominated:
         exclusion_reason = "infra_dominated"
     elif harness_wide_failure:
         exclusion_reason = "harness_wide_failure"
+    elif not canonical_model_identity:
+        exclusion_reason = "canonical_model_identity_not_preserved"
+    elif not trajectory_complete:
+        exclusion_reason = "trajectory_unavailable"
+    elif not parity_validated:
+        exclusion_reason = "parity_not_validated"
     else:
         exclusion_reason = ""
 
@@ -732,6 +779,9 @@ def _summarize_run(
         "infra_dominated": infra_dominated,
         "harness_wide_failure": harness_wide_failure,
         "harness_wide_failure_signature": harness_wide_failure_signature,
+        "canonical_model_identity": canonical_model_identity,
+        "trajectory_complete": trajectory_complete,
+        "parity_validated": parity_validated,
         "eligible": eligible,
         "exclusion_reason": exclusion_reason,
         "n_input_tokens": _sum_present(rows, "n_input_tokens"),

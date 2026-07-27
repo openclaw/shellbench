@@ -54,7 +54,7 @@ def _openclaw(
     mcp_servers: tuple[McpServer, ...],
 ) -> HarnessCommand:
     provider = "openai"
-    model = f"{provider}/{run.proxy_model_name}"
+    model = f"{provider}/{run.model_id}"
     servers: dict[str, dict[str, object]] = {}
     for server in mcp_servers:
         if server.transport == "stdio":
@@ -78,8 +78,8 @@ def _openclaw(
                     "apiKey": proxy_key,
                     "models": [
                         {
-                            "id": run.proxy_model_name,
-                            "name": run.proxy_model_name,
+                            "id": run.model_id,
+                            "name": run.model_id,
                         }
                     ],
                 }
@@ -139,7 +139,7 @@ def _hermes(
     provider_name = "custom:shellbench"
     config: dict[str, object] = {
         "model": {
-            "default": run.proxy_model_name,
+            "default": run.model_id,
             "provider": provider_name,
         },
         "providers": {
@@ -148,8 +148,8 @@ def _hermes(
                 "api": f"{proxy_url.rstrip('/')}/v1",
                 "key_env": "SHELLBENCH_PROXY_KEY",
                 "transport": "chat_completions",
-                "default_model": run.proxy_model_name,
-                "models": {run.proxy_model_name: {}},
+                "default_model": run.model_id,
+                "models": {run.model_id: {}},
             }
         },
         "toolsets": ["hermes-cli"],
@@ -179,7 +179,7 @@ def _hermes(
         f"export PATH={_base_path()}; export HERMES_HOME={home}; "
         "export TERMINAL_ENV=local; export TERMINAL_CWD=\"$PWD\"; "
         "hermes --yolo chat -q \"$(cat /tmp/shellbench-instruction.md)\" -Q "
-        f"--model {shlex.quote(run.proxy_model_name)} "
+        f"--model {shlex.quote(run.model_id)} "
         f"--provider {shlex.quote(provider_name)} "
         ">/logs/agent/hermes.txt 2>&1; status=$?; "
         "cat /logs/agent/hermes.txt; "
@@ -231,7 +231,7 @@ def _codex(
         f"export PATH={_base_path()}; export CODEX_HOME={home}; "
         "codex exec --dangerously-bypass-approvals-and-sandbox "
         "--skip-git-repo-check "
-        f"--model {shlex.quote(run.proxy_model_name)} "
+        f"--model {shlex.quote(run.model_id)} "
         "--json --enable unified_exec -- "
         "\"$(cat /tmp/shellbench-instruction.md)\" "
         ">/logs/agent/codex.txt 2>&1 </dev/null; status=$?; "
@@ -283,7 +283,7 @@ def _claude_code(
         f"export PATH={_base_path()}; export CLAUDE_CONFIG_DIR={home}; "
         "claude --verbose --output-format=stream-json "
         "--permission-mode=bypassPermissions --print "
-        f"--model {shlex.quote(run.proxy_model_name)} "
+        f"--model {shlex.quote(run.model_id)} "
         "\"$(cat /tmp/shellbench-instruction.md)\" "
         ">/logs/agent/claude-code.txt 2>&1 </dev/null; status=$?; "
         "cat /logs/agent/claude-code.txt; exit \"$status\""
@@ -296,11 +296,11 @@ def _claude_code(
             "ANTHROPIC_API_KEY": proxy_key,
             "ANTHROPIC_AUTH_TOKEN": proxy_key,
             "ANTHROPIC_BASE_URL": proxy_url.rstrip("/"),
-            "ANTHROPIC_MODEL": run.proxy_model_name,
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": run.proxy_model_name,
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": run.proxy_model_name,
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": run.proxy_model_name,
-            "CLAUDE_CODE_SUBAGENT_MODEL": run.proxy_model_name,
+            "ANTHROPIC_MODEL": run.model_id,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": run.model_id,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": run.model_id,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": run.model_id,
+            "CLAUDE_CODE_SUBAGENT_MODEL": run.model_id,
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             "IS_SANDBOX": "1",
         },
