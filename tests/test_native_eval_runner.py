@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import tarfile
 from argparse import Namespace
 from pathlib import Path
@@ -10,7 +12,10 @@ from scripts.native_eval.checkpoint_loop import (
     count_result_json,
     next_checkpoint_sequence,
 )
-from scripts.native_eval.harnesses import build_harness_command
+from scripts.native_eval.harnesses import (
+    _OPENCLAW_COMPLETION_PROBE,
+    build_harness_command,
+)
 from scripts.native_eval.models import (
     HARNESSES,
     MODELS,
@@ -258,6 +263,7 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
         assert 'exit "$status"' in command.run_command
         if harness.name == "openclaw":
             assert "ended with stopReason=" in command.run_command
+            assert "python3 -c" in command.run_command
             assert "--thinking off" in command.run_command
             assert "setup --baseline --skip-bootstrap" in command.setup_command
             assert "rm -f BOOTSTRAP.md" in command.setup_command
@@ -269,6 +275,44 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
         if harness.name == "codex":
             assert "2>/logs/agent/codex-stderr.txt" in command.run_command
             assert "cat /logs/agent/codex-stderr.txt >&2" in command.run_command
+
+
+def test_openclaw_completion_probe_accepts_markerless_final_envelope(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "openclaw.txt"
+    log_path.write_text(
+        "debug preamble\n"
+        + json.dumps(
+            {
+                "payloads": [{"text": "done"}],
+                "meta": {"aborted": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _OPENCLAW_COMPLETION_PROBE, str(log_path)],
+        check=False,
+    )
+
+    assert completed.returncode == 0
+
+
+def test_openclaw_completion_probe_rejects_partial_log(tmp_path: Path) -> None:
+    log_path = tmp_path / "openclaw.txt"
+    log_path.write_text(
+        'debug preamble\n{"payloads":[{"text":"still writing"}]',
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _OPENCLAW_COMPLETION_PROBE, str(log_path)],
+        check=False,
+    )
+
+    assert completed.returncode == 1
 
 
 def test_hermes_uses_named_local_proxy_provider() -> None:

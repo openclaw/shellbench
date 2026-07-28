@@ -14,6 +14,36 @@ NODE_BIN = TOOLCHAIN_ROOT / "node" / "bin"
 NPM_BIN = TOOLCHAIN_ROOT / "npm-packages" / "node_modules" / ".bin"
 HERMES_BIN = TOOLCHAIN_ROOT / "home" / ".local" / "bin"
 
+_OPENCLAW_COMPLETION_PROBE = """\
+import json
+import pathlib
+import sys
+
+try:
+    text = pathlib.Path(sys.argv[1]).read_text(
+        encoding="utf-8",
+        errors="replace",
+    ).strip()
+except OSError:
+    sys.exit(1)
+
+decoder = json.JSONDecoder()
+for start in range(len(text) - 1, -1, -1):
+    if text[start] != "{":
+        continue
+    try:
+        value, _ = decoder.raw_decode(text[start:])
+    except (json.JSONDecodeError, ValueError):
+        continue
+    if (
+        isinstance(value, dict)
+        and isinstance(value.get("payloads"), list)
+        and isinstance(value.get("meta"), dict)
+    ):
+        sys.exit(0)
+sys.exit(1)
+"""
+
 
 @dataclass(frozen=True)
 class HarnessCommand:
@@ -95,6 +125,7 @@ def _openclaw(
     if servers:
         config["mcp"] = {"servers": servers}
     config_json = shlex.quote(json.dumps(config, separators=(",", ":")))
+    completion_probe = shlex.quote(_OPENCLAW_COMPLETION_PROBE)
     home = "/tmp/shellbench-openclaw"
     setup = (
         f"export PATH={_base_path()}; export HOME={home}; "
@@ -113,7 +144,8 @@ def _openclaw(
         ">\"$log\" 2>&1 </dev/null & pid=$!; "
         "while kill -0 \"$pid\" 2>/dev/null; do "
         "if grep -Eq \"\\[agents/agent-command\\] \\[agent\\] run .* "
-        "ended with stopReason=\" \"$log\"; then "
+        f"ended with stopReason=\" \"$log\" || python3 -c {completion_probe} "
+        "\"$log\"; then "
         "sleep 2; kill \"$pid\" 2>/dev/null || true; sleep 1; "
         "kill -KILL \"$pid\" 2>/dev/null || true; "
         "for f in /proc/[0-9]*/comm; do "
