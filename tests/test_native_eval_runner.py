@@ -187,7 +187,7 @@ def test_run_manifest_records_native_audit_metadata(
     assert manifest["execution_mode"] == "native"
     assert manifest["harbor_reference_commit"] == "harbor-commit"
     assert manifest["judge_model_id"] == "gpt-5.5"
-    assert manifest["trajectory_mode"] == "unsupported"
+    assert manifest["trajectory_mode"] == "real_harness_events"
     assert manifest["canonical_model_identity"] is None
     assert manifest["provider_model_id"] == "gpt-5.5"
     assert manifest["reasoning_effort"] == "high"
@@ -277,6 +277,7 @@ def test_hermes_uses_named_local_proxy_provider() -> None:
     assert "custom:shellbench" in command.setup_command
     assert "http://host.docker.internal:4000/v1" in command.setup_command
     assert '--session-id "$session_id" --yes --redact' in command.cleanup_command
+    assert "else hermes sessions export" in command.cleanup_command
 
 
 def test_workdir_falls_back_to_existing_container_directory(
@@ -521,10 +522,10 @@ def test_codex_trajectory_rejects_truncated_or_mismatched_stream(tmp_path: Path)
     assert metadata["trajectory_validation"]["terminal_event_seen"] is False
 
 
-def test_non_codex_trajectory_is_explicitly_unranked(tmp_path: Path) -> None:
+def test_unsupported_trajectory_is_explicitly_unranked(tmp_path: Path) -> None:
     run = RunSpec(
-        run_label="openclaw-gpt55",
-        harness="openclaw",
+        run_label="claude-code-gpt55",
+        harness="claude-code",
         harness_version="test",
         model_slug="gpt55",
         model_id="gpt-5.5",
@@ -560,6 +561,263 @@ def test_non_codex_trajectory_is_explicitly_unranked(tmp_path: Path) -> None:
     assert metadata["trajectory_status"] == "unsupported"
     assert metadata["runtime_model_name"] is None
     assert metadata["canonical_model_identity"] is False
+
+
+def test_openclaw_mixed_log_converts_harbor_envelope_to_atif(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    envelope = {
+        "payloads": [{"text": "done", "mediaUrl": None}],
+        "meta": {
+            "agentMeta": {
+                "sessionId": "session-123",
+                "model": "gpt-5.6-luna",
+                "usage": {
+                    "input": 10,
+                    "output": 20,
+                    "cacheRead": 30,
+                    "cacheWrite": 4,
+                },
+            },
+            "executionTrace": {
+                "winnerProvider": "openai",
+                "winnerModel": "gpt-5.6-luna",
+            },
+            "completion": {"stopReason": "stop"},
+            "aborted": False,
+        },
+    }
+    (agent_dir / "openclaw.txt").write_text(
+        "debug preamble\n"
+        + json.dumps(envelope, indent=2)
+        + "\n[agents/agent-command] ended with stopReason=stop\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="openclaw-gpt56-luna",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-luna",
+        model_id="gpt-5.6-luna",
+        provider="openai",
+        proxy_model_name="gpt-5.6-luna",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260728",
+    )
+    task = _trajectory_task(tmp_path, "do the task")
+
+    metadata = write_agent_trajectory(task, run, agent_dir)
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+    metrics = collect_agent_metrics("openclaw", agent_dir)
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["canonical_model_identity"] is True
+    assert metadata["trajectory_validation"]["trace_fidelity"] == "envelope"
+    assert trajectory["schema_version"] == "ATIF-v1.7"
+    assert trajectory["session_id"] == "session-123"
+    assert trajectory["agent"]["model_name"] == "openai/gpt-5.6-luna"
+    assert trajectory["steps"][1]["message"] == "done"
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 40
+    assert metrics["n_input_tokens"] == 10
+    assert metrics["n_cache_tokens"] == 30
+    assert metrics["n_output_tokens"] == 20
+
+
+def test_openclaw_session_without_envelope_converts_to_atif(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    records = [
+        {
+            "type": "session",
+            "id": "session-only-123",
+            "timestamp": "2026-07-28T00:00:00Z",
+            "cwd": "/app",
+        },
+        {
+            "type": "model_change",
+            "id": "model-1",
+            "parentId": None,
+            "timestamp": "2026-07-28T00:00:01Z",
+            "provider": "openai",
+            "modelId": "gpt-5.6-terra",
+        },
+        {
+            "type": "message",
+            "id": "user-1",
+            "parentId": "model-1",
+            "timestamp": "2026-07-28T00:00:02Z",
+            "message": {"role": "user", "content": "do the task"},
+        },
+        {
+            "type": "message",
+            "id": "assistant-1",
+            "parentId": "user-1",
+            "timestamp": "2026-07-28T00:00:03Z",
+            "message": {
+                "role": "assistant",
+                "provider": "openai",
+                "model": "gpt-5.6-terra",
+                "content": [{"type": "text", "text": "done"}],
+                "usage": {
+                    "input": 12,
+                    "output": 7,
+                    "cacheRead": 30,
+                    "cacheWrite": 2,
+                },
+                "stopReason": "stop",
+            },
+        },
+    ]
+    (agent_dir / "openclaw.session.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    (agent_dir / "openclaw.txt").write_text(
+        "[provider-transport-fetch] [model-fetch] response "
+        "provider=openai api=openai-responses model=gpt-5.6-terra status=200\n"
+        "run ended before JSON envelope\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="openclaw-gpt56-terra",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-terra",
+        model_id="gpt-5.6-terra",
+        provider="openai",
+        proxy_model_name="gpt-5.6-terra",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260728",
+    )
+    task = _trajectory_task(tmp_path, "do the task")
+
+    metadata = write_agent_trajectory(task, run, agent_dir)
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["canonical_model_identity"] is True
+    assert metadata["trajectory_validation"]["trace_fidelity"] == "session"
+    assert metadata["trajectory_validation"]["log_models"] == ["gpt-5.6-terra"]
+    assert trajectory["session_id"] == "session-only-123"
+    assert trajectory["agent"]["model_name"] == "openai/gpt-5.6-terra"
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 42
+    assert trajectory["final_metrics"]["total_completion_tokens"] == 7
+    assert trajectory["final_metrics"]["total_cached_tokens"] == 30
+
+
+def test_hermes_session_converts_parallel_tools_to_atif(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    session = {
+        "id": "hermes-session-123",
+        "model": "gpt-5.6-sol",
+        "message_count": 4,
+        "tool_call_count": 1,
+        "input_tokens": 100,
+        "output_tokens": 25,
+        "cache_read_tokens": 75,
+        "reasoning_tokens": 8,
+        "api_call_count": 2,
+        "messages": [
+            {
+                "id": 1,
+                "role": "user",
+                "content": "do the task",
+                "timestamp": 1.0,
+            },
+            {
+                "id": 2,
+                "role": "assistant",
+                "content": "",
+                "timestamp": 2.0,
+                "finish_reason": "tool_calls",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"/app/input.txt"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "id": 3,
+                "role": "tool",
+                "content": "input",
+                "tool_call_id": "call-1",
+                "tool_name": "read_file",
+                "timestamp": 3.0,
+            },
+            {
+                "id": 4,
+                "role": "assistant",
+                "content": "done",
+                "timestamp": 4.0,
+                "finish_reason": "stop",
+            },
+        ],
+    }
+    (agent_dir / "hermes-session.jsonl").write_text(
+        json.dumps(session) + "\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="hermes-gpt56-sol",
+        harness="hermes",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260728",
+    )
+    task = _trajectory_task(tmp_path, "do the task")
+
+    metadata = write_agent_trajectory(task, run, agent_dir)
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["canonical_model_identity"] is True
+    assert metadata["trajectory_validation"]["terminal_event_seen"] is True
+    assert metadata["trajectory_validation"]["instruction_matches"] is True
+    assert len(trajectory["steps"]) == 3
+    assert trajectory["steps"][1]["tool_calls"][0]["function_name"] == "read_file"
+    assert trajectory["steps"][1]["observation"]["results"][0]["content"] == "input"
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 100
+    assert trajectory["final_metrics"]["total_cached_tokens"] == 75
+    assert trajectory["final_metrics"]["total_completion_tokens"] == 25
+
+
+def _trajectory_task(tmp_path: Path, instruction: str) -> TaskSpec:
+    task_dir = tmp_path / "task"
+    task_dir.mkdir(exist_ok=True)
+    return TaskSpec(
+        name="task",
+        title="task",
+        path=task_dir,
+        instruction=instruction,
+        raw_config={},
+        checksum="abc",
+        dockerfile=task_dir / "Dockerfile",
+        build_context=task_dir,
+        compose_file=None,
+        verifier_command="bash /tests/test.sh",
+        agent_timeout_sec=900,
+        verifier_timeout_sec=300,
+        build_timeout_sec=1800,
+        mcp_servers=(),
+        environment_env={},
+        verifier_env={},
+    )
 
 
 def test_codex_metrics_include_cached_input_tokens(tmp_path: Path) -> None:
