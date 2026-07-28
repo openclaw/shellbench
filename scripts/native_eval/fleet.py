@@ -613,12 +613,14 @@ class FleetController:
                     required=True,
                     region_hint=str(lease_value.get("region") or ""),
                 )
-            except LeaseNotReadyError:
+            except LeaseNotReadyError as exc:
                 if stored is None:
                     stored = Lease.from_manifest(lease_value)
                 if self._ssh_reachable(stored):
                     return self._detect_region(stored)
-                raise
+                raise LeaseUnavailableError(
+                    f"stored lease {identifier} lost readiness and SSH access"
+                ) from exc
 
         slug = str(entry.get("requested_lease_slug") or self._lease_slug(entry["run_label"]))
         self._store.update(
