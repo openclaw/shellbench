@@ -125,6 +125,33 @@ def test_wait_for_lease_ready_retries_provisioning_state(
     assert attempts == 3
 
 
+def test_stored_lease_losing_readiness_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = object.__new__(FleetController)
+    entry = {
+        "lease": {
+            "id": "cbx_degraded",
+            "slug": "sb-native-degraded",
+            "host": "192.0.2.20",
+            "ssh_user": "crabbox",
+            "ssh_port": 22,
+            "identity_file": "/tmp/cbx_degraded.key",
+            "instance_type": "c7a.24xlarge",
+            "region": "eu-west-1",
+        }
+    }
+    monkeypatch.setattr(controller, "_ssh_reachable", lambda _lease: False)
+
+    def inspect(*_args: object, **_kwargs: object) -> Lease:
+        raise LeaseNotReadyError("lease is active but not ready")
+
+    monkeypatch.setattr(controller, "_inspect_lease", inspect)
+
+    with pytest.raises(LeaseUnavailableError, match="lost readiness"):
+        controller._ensure_lease(entry)
+
+
 def test_subprocess_timeout_output_is_normalized_to_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
