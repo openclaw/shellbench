@@ -54,6 +54,7 @@ REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
 CRABBOX_STOP_TIMEOUT_SECONDS = 6 * 60
 CRABBOX_READY_ATTEMPTS = 30
 CRABBOX_READY_BACKOFF_SECONDS = 10
+CRABBOX_INSPECT_ATTEMPTS = 4
 
 
 class CommandExecutor(Protocol):
@@ -695,18 +696,36 @@ class FleetController:
         required: bool,
         region_hint: str = "",
     ) -> Lease | None:
-        result = self.executor.run(
-            [
-                self.config.crabbox_bin,
-                "inspect",
-                "--provider",
-                "aws",
-                "--id",
-                identifier,
-                "--json",
-            ],
-            capture_output=True,
-        )
+        command = [
+            self.config.crabbox_bin,
+            "inspect",
+            "--provider",
+            "aws",
+            "--id",
+            identifier,
+            "--json",
+        ]
+        for attempt in range(1, CRABBOX_INSPECT_ATTEMPTS + 1):
+            result = self.executor.run(command, capture_output=True)
+            if result.returncode == 0:
+                break
+            detail = (result.stderr or result.stdout or "").strip()
+            transient = any(
+                marker in detail.lower()
+                for marker in (
+                    "http 500",
+                    "http 502",
+                    "http 503",
+                    "http 504",
+                    "error code: 1101",
+                    "context deadline exceeded",
+                    "connection timed out",
+                    "connection reset",
+                )
+            )
+            if not transient or attempt == CRABBOX_INSPECT_ATTEMPTS:
+                break
+            time.sleep(attempt * 5)
         if result.returncode:
             detail = (result.stderr or result.stdout or "").strip()
             missing = any(
