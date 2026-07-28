@@ -361,6 +361,23 @@ def test_controller_runs_bounded_wave_and_stops_after_verified_export(
     assert "TOPSECRET" not in "\n".join(" ".join(command) for command in executor.commands)
 
 
+def test_controller_accepts_xhigh_reasoning_effort(tmp_path: Path) -> None:
+    label = "openclaw-gpt56-sol-xhigh-full-2-r1-20260728"
+    run = _planned(_run_spec(label, model_slug="gpt56-sol"))
+    run["reasoning_effort"] = "xhigh"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    completed = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
+    assert completed["status"] == "completed"
+    assert completed["reasoning_effort"] == "xhigh"
+    assert completed["judge_reasoning_effort"] == "high"
+
+
 def test_capacity_warmup_retries_same_run_without_recovery_churn(
     tmp_path: Path,
 ) -> None:

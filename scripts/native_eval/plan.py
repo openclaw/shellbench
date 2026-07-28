@@ -55,12 +55,12 @@ def main() -> None:
     parser.add_argument("--run-date", required=True)
     parser.add_argument(
         "--reasoning-effort",
-        choices=("low", "medium", "high"),
+        choices=("low", "medium", "high", "xhigh"),
         required=True,
     )
     parser.add_argument(
         "--judge-reasoning-effort",
-        choices=("low", "medium", "high"),
+        choices=("low", "medium", "high", "xhigh"),
     )
     args = parser.parse_args()
     entries = write_run_index(

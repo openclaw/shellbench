@@ -9,9 +9,9 @@ from scripts.native_eval.models import LITELLM_VERSION, MODELS
 
 def write_proxy_config(path: Path) -> None:
     reasoning_effort = os.environ.get("SHELLBENCH_REASONING_EFFORT", "").strip()
-    if reasoning_effort not in {"low", "medium", "high"}:
+    if reasoning_effort not in {"low", "medium", "high", "xhigh"}:
         raise ValueError(
-            "SHELLBENCH_REASONING_EFFORT must be low, medium, or high"
+            "SHELLBENCH_REASONING_EFFORT must be low, medium, high, or xhigh"
         )
     model_list = []
     for model in MODELS:
