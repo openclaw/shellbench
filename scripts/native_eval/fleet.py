@@ -48,6 +48,7 @@ RERUN_STATUSES = {"failed", "lease_lost"}
 ACTIVE_RUN_STATUSES = {"leasing", "bootstrapping", "ready", "running"}
 CLEANUP_STATUSES = {"exported", "stop_pending"}
 REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+CRABBOX_STOP_TIMEOUT_SECONDS = 15
 
 
 class CommandExecutor(Protocol):
@@ -1217,12 +1218,31 @@ printf '%s\n' "$pid"
                     stop = self.executor.run_with_timeout(
                         stop_command,
                         capture_output=True,
-                        timeout=45,
+                        timeout=CRABBOX_STOP_TIMEOUT_SECONDS,
                     )
                 else:
                     stop = self.executor.run(stop_command, capture_output=True)
         else:
             stop = subprocess.CompletedProcess(stop_command, 0, stdout="", stderr="")
+        if stop.returncode:
+            try:
+                stopped_after_error = (
+                    self._inspect_lease(
+                        str(lease_value["id"]),
+                        required=False,
+                        region_hint=str(lease_value.get("region") or ""),
+                    )
+                    is None
+                )
+            except FleetError:
+                stopped_after_error = False
+            if stopped_after_error:
+                stop = subprocess.CompletedProcess(
+                    stop_command,
+                    0,
+                    stdout=stop.stdout,
+                    stderr=stop.stderr,
+                )
         stop_detail = (stop.stderr or stop.stdout or "").strip().lower()
         already_stopped = any(
             marker in stop_detail

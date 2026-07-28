@@ -158,6 +158,7 @@ class FakeExecutor:
         running_labels: set[str] | None = None,
         checkpoint_blocks: dict[str, threading.Event] | None = None,
         stop_code: int = 0,
+        stop_removes_lease_on_error: bool = False,
         inspect_errors: set[str] | None = None,
         warmup_capacity_failures: dict[str, int] | None = None,
         dispatch_failures: dict[str, int] | None = None,
@@ -169,6 +170,7 @@ class FakeExecutor:
         self.remote_states = {label: "running" for label in (running_labels or set())}
         self.checkpoint_blocks = checkpoint_blocks or {}
         self.stop_code = stop_code
+        self.stop_removes_lease_on_error = stop_removes_lease_on_error
         self.inspect_errors = inspect_errors or set()
         self.warmup_capacity_failures = warmup_capacity_failures or {}
         self.dispatch_failures = dispatch_failures or {}
@@ -264,8 +266,9 @@ class FakeExecutor:
             with self._lock:
                 self.stops.append(lease_id)
                 self.events.append(("stop", lease_id))
-                if not self.stop_code:
+                if not self.stop_code or self.stop_removes_lease_on_error:
                     self.active_leases -= 1
+                    self.leases.pop(lease_id, None)
             return _result(argv, self.stop_code)
 
         if "-m" in argv and "scripts.native_eval.checkpoint_loop" in argv:
@@ -1150,6 +1153,26 @@ def test_stop_failure_is_left_pending_without_tight_retry(tmp_path: Path) -> Non
 
     run = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
     assert run["status"] == "stop_pending"
+    assert run["verified_final_export"] is True
+    assert len(executor.stops) == 1
+
+
+def test_stop_failure_is_reconciled_when_lease_disappeared(tmp_path: Path) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [_planned(_run_spec(label))])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={label: 2},
+        stop_code=124,
+        stop_removes_lease_on_error=True,
+    )
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    run = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
+    assert run["status"] == "completed"
     assert run["verified_final_export"] is True
     assert len(executor.stops) == 1
 
