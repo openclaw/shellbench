@@ -324,6 +324,87 @@ def test_native_identity_checks_ignore_pre_agent_infra_failures(tmp_path: Path):
     assert run["eligible"] is True
 
 
+def test_native_identity_checks_ignore_unavailable_agent_exit_trajectory(
+    tmp_path: Path,
+):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    timed_out = _result(
+        "agent-timeout",
+        source="shellbench-native",
+        exception_type="NonZeroAgentExitCodeError",
+        exception_message="Agent timed out after 900.0s",
+    )
+    timed_out["agent_result"].update(
+        {
+            "trajectory_status": "unavailable",
+            "runtime_model_name": None,
+            "canonical_model_identity": False,
+        }
+    )
+    _write_run(
+        jobs_root,
+        "hermes-gpt56-sol-timeout",
+        expected_task_count=2,
+        results=[_native_result("a"), timed_out],
+        harness="hermes",
+        model_slug="gpt56-sol",
+        native=True,
+        parity_validated=True,
+    )
+    manifest_path = (
+        jobs_root
+        / "jobs"
+        / "hermes-gpt56-sol-timeout"
+        / "run_manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text())
+    manifest["canonical_model_identity"] = False
+    manifest_path.write_text(json.dumps(manifest))
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    run = report["runs"][0]
+    assert run["agent_exits"] == 1
+    assert run["canonical_model_identity"] is True
+    assert run["trajectory_complete"] is True
+    assert run["eligible"] is True
+
+
+def test_native_identity_checks_real_agent_exit_trajectory(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    wrong_model = _result(
+        "agent-exit",
+        source="shellbench-native",
+        exception_type="NonZeroAgentExitCodeError",
+    )
+    wrong_model["agent_result"].update(
+        {
+            "trajectory_status": "real",
+            "runtime_model_name": "wrong-model",
+            "canonical_model_identity": False,
+        }
+    )
+    _write_run(
+        jobs_root,
+        "hermes-gpt56-sol-wrong-model",
+        expected_task_count=2,
+        results=[_native_result("a"), wrong_model],
+        harness="hermes",
+        model_slug="gpt56-sol",
+        native=True,
+        parity_validated=True,
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    run = report["runs"][0]
+    assert run["canonical_model_identity"] is False
+    assert run["eligible"] is False
+    assert run["exclusion_reason"] == "canonical_model_identity_not_preserved"
+
+
 def test_manifest_can_explicitly_exclude_complete_run(tmp_path: Path):
     jobs_root = tmp_path / "native"
     summaries_dir = tmp_path / "summaries"
