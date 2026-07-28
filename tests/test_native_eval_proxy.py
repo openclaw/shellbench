@@ -23,4 +23,6 @@ def test_openai_proxy_models_enforce_reasoning_effort(
     ]
     assert models["gpt-5.5"]["litellm_params"]["reasoning_effort"] == "high"
     assert models["gpt-5.6-sol"]["litellm_params"]["reasoning_effort"] == "high"
+    assert models["gpt-5.6-luna"]["litellm_params"]["reasoning_effort"] == "high"
+    assert models["gpt-5.6-terra"]["litellm_params"]["reasoning_effort"] == "high"
     assert config["shellbench_native"]["reasoning_effort"] == "high"

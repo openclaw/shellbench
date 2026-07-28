@@ -47,6 +47,20 @@ MODELS: tuple[ModelSpec, ...] = (
         "gpt-5.6-sol",
     ),
     ModelSpec(
+        "gpt56-luna",
+        "gpt-5.6-luna",
+        "openai",
+        "gpt-5.6-luna",
+        "gpt-5.6-luna",
+    ),
+    ModelSpec(
+        "gpt56-terra",
+        "gpt-5.6-terra",
+        "openai",
+        "gpt-5.6-terra",
+        "gpt-5.6-terra",
+    ),
+    ModelSpec(
         "fable5",
         "fable-5",
         "anthropic",
