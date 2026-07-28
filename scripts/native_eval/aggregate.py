@@ -772,18 +772,31 @@ def _summarize_run(
         for row in scored_rows
         if row.get("_valid_result") and row.get("classification") != "infra"
     ]
+    # Forced agent exits can retain raw logs without producing a final
+    # structured trajectory. They remain scored failures, not run invalidators.
+    trajectory_required_rows = [
+        row
+        for row in agent_attempt_rows
+        if row.get("classification") != "agent_exit"
+    ]
+    identity_rows = [
+        row
+        for row in agent_attempt_rows
+        if row.get("classification") != "agent_exit"
+        or row.get("trajectory_status") == "real"
+    ]
     canonical_model_identity = not native_run or (
-        manifest.get("canonical_model_identity") is True
+        bool(identity_rows)
         and all(
             row.get("canonical_model_identity") is True
-            for row in agent_attempt_rows
+            for row in identity_rows
         )
     )
     trajectory_complete = not native_run or (
         manifest.get("trajectory_mode") == "real_harness_events"
         and all(
             row.get("trajectory_status") == "real"
-            for row in agent_attempt_rows
+            for row in trajectory_required_rows
         )
     )
     parity_validated = not native_run or manifest.get("parity_validated") is True
