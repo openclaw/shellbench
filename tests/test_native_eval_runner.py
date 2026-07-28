@@ -251,6 +251,9 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
                 command.cleanup_command
             )
             assert "destination.chmod(0o644)" in command.cleanup_command
+        if harness.name == "codex":
+            assert "2>/logs/agent/codex-stderr.txt" in command.run_command
+            assert "cat /logs/agent/codex-stderr.txt >&2" in command.run_command
 
 
 def test_hermes_uses_named_local_proxy_provider() -> None:
@@ -389,7 +392,17 @@ def test_codex_trajectory_uses_real_stream_events(tmp_path: Path) -> None:
         },
     ]
     (agent_dir / "codex.txt").write_text(
-        "\n".join(json.dumps(event) for event in events) + "\n",
+        "\n".join(
+            [
+                json.dumps(events[0]),
+                (
+                    "2026-07-28T07:10:46.280064Z ERROR "
+                    "codex_core::tools::router: apply_patch verification failed"
+                ),
+                *(json.dumps(event) for event in events[1:]),
+            ]
+        )
+        + "\n",
         encoding="utf-8",
     )
     session_dir = agent_dir / "sessions"
@@ -443,6 +456,8 @@ def test_codex_trajectory_uses_real_stream_events(tmp_path: Path) -> None:
     assert metadata["trajectory_status"] == "real"
     assert metadata["runtime_model_name"] == "gpt-5.5"
     assert metadata["canonical_model_identity"] is True
+    assert metadata["trajectory_validation"]["diagnostic_lines"] == 1
+    assert metadata["trajectory_validation"]["malformed_event_lines"] == 0
     assert trajectory["session_id"] == "thread-123"
     assert len(trajectory["steps"]) == 6
     assert trajectory["steps"][2]["tool_calls"][0]["function_name"] == "shell"
@@ -524,6 +539,61 @@ def test_codex_trajectory_rejects_truncated_or_mismatched_stream(tmp_path: Path)
     assert metadata["runtime_model_name"] == "gpt-5.6-sol"
     assert metadata["canonical_model_identity"] is False
     assert metadata["trajectory_validation"]["terminal_event_seen"] is False
+
+
+def test_codex_trajectory_rejects_unknown_interleaved_output(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    session_dir = agent_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    events = [
+        {"type": "thread.started", "thread_id": "thread-123"},
+        "not a recognized codex diagnostic",
+        {
+            "type": "item.completed",
+            "item": {"id": "message-1", "type": "agent_message", "text": "done"},
+        },
+        {"type": "turn.completed", "usage": {"input_tokens": 1}},
+    ]
+    (agent_dir / "codex.txt").write_text(
+        "\n".join(
+            event if isinstance(event, str) else json.dumps(event)
+            for event in events
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (session_dir / "rollout.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.5"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="codex-gpt55-calibration",
+        harness="codex",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260727",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+
+    assert metadata["trajectory_status"] == "unavailable"
+    assert metadata["trajectory_validation"]["diagnostic_lines"] == 0
+    assert metadata["trajectory_validation"]["malformed_event_lines"] == 1
 
 
 def test_unsupported_trajectory_is_explicitly_unranked(tmp_path: Path) -> None:
