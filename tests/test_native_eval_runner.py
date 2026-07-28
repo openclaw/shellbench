@@ -871,6 +871,56 @@ def test_hermes_session_converts_parallel_tools_to_atif(tmp_path: Path) -> None:
     assert trajectory["final_metrics"]["total_completion_tokens"] == 25
 
 
+def test_hermes_session_preserves_unicode_line_separator(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    session = {
+        "id": "hermes-session-unicode",
+        "model": "gpt-5.5",
+        "message_count": 2,
+        "tool_call_count": 0,
+        "messages": [
+            {
+                "id": 1,
+                "role": "user",
+                "content": "do the task",
+                "timestamp": 1.0,
+            },
+            {
+                "id": 2,
+                "role": "assistant",
+                "content": "line one\u2028line two",
+                "timestamp": 2.0,
+                "finish_reason": "stop",
+            },
+        ],
+    }
+    (agent_dir / "hermes-session.jsonl").write_text(
+        json.dumps(session, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="hermes-gpt55",
+        harness="hermes",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260728",
+    )
+    task = _trajectory_task(tmp_path, "do the task")
+
+    metadata = write_agent_trajectory(task, run, agent_dir)
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["canonical_model_identity"] is True
+    assert trajectory["steps"][-1]["message"] == "line one\u2028line two"
+
+
 def _trajectory_task(tmp_path: Path, instruction: str) -> TaskSpec:
     task_dir = tmp_path / "task"
     task_dir.mkdir(exist_ok=True)

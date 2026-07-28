@@ -517,7 +517,7 @@ def _load_hermes_sessions(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     sessions: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").split("\n"):
         try:
             value = json.loads(line)
         except json.JSONDecodeError:

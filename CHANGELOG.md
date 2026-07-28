@@ -15,6 +15,7 @@
   diagnostics from previously combined streams.
 - Reattach active AWS leases through their recorded SSH endpoint when Crabbox
   readiness probing is stale.
+- Preserve Hermes JSONL sessions containing literal Unicode line separators.
 - Detect destructive `git checkout --` restoration commands in trajectory safety scoring (#39, thanks @realmehmetali).
 
 ### Added
