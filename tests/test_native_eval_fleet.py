@@ -457,6 +457,58 @@ def test_model_cap_counts_adopted_run_before_dispatching_same_model(
     assert adopted_stop < pending_fable_dispatch
 
 
+def test_recovery_uses_recorded_ssh_endpoint_when_crabbox_ready_probe_is_stale(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = _planned(_run_spec(label))
+    run["status"] = "recovery_required"
+    run["lease"] = {
+        "id": "cbx_existing",
+        "slug": "existing",
+        "provider": "aws",
+        "instance_type": "c7a.24xlarge",
+        "region": "eu-west-1",
+        "host": "192.0.2.50",
+        "ssh_user": "crabbox",
+        "ssh_port": 22,
+        "identity_file": "/tmp/cbx_existing.key",
+        "state": "active",
+    }
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={label: 2},
+        running_labels={label},
+    )
+    executor.leases["cbx_existing"] = {
+        "id": "cbx_existing",
+        "slug": "existing",
+        "state": "active",
+        "ready": False,
+        "serverType": "c7a.24xlarge",
+        "sshHost": "192.0.2.50",
+        "sshUser": "crabbox",
+        "sshPort": "2222",
+        "sshKey": "/tmp/cbx_existing.key",
+    }
+    executor.active_leases = 1
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    recovered = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
+    assert recovered["status"] == "completed"
+    assert executor.dispatches == []
+    reachability_probe = next(
+        command
+        for command in executor.commands
+        if command and command[0] == "ssh" and command[-1] == "true"
+    )
+    assert "22" in reachability_probe
+
+
 def test_model_task_concurrency_override_is_used_at_dispatch(tmp_path: Path) -> None:
     fable_label = "openclaw-fable5-full-2-r1-20260727"
     gpt_label = "openclaw-gpt55-full-2-r1-20260727"
