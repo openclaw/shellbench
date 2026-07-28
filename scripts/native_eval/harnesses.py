@@ -290,8 +290,10 @@ def _codex(
         f"--model {shlex.quote(run.model_id)} "
         "--json --enable unified_exec -- "
         "\"$(cat /tmp/shellbench-instruction.md)\" "
-        ">/logs/agent/codex.txt 2>&1 </dev/null; status=$?; "
-        "cat /logs/agent/codex.txt; exit \"$status\""
+        ">/logs/agent/codex.txt 2>/logs/agent/codex-stderr.txt "
+        "</dev/null; status=$?; "
+        "cat /logs/agent/codex.txt; "
+        "cat /logs/agent/codex-stderr.txt >&2; exit \"$status\""
     )
     cleanup = (
         "rm -rf /logs/agent/sessions; "

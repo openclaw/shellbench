@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -46,6 +47,12 @@ class NonZeroAgentExitCodeError(NativeEvalError):
 
 class RewardFileNotFoundError(NativeEvalError):
     pass
+
+
+CODEX_DIAGNOSTIC_LINE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\S+\s+"
+    r"(?:TRACE|DEBUG|INFO|WARN|ERROR)\s+codex[\w:.-]*:"
+)
 
 
 @dataclass(frozen=True)
@@ -745,9 +752,12 @@ def _load_json_events(path: Path) -> list[dict[str, Any]]:
     return events
 
 
-def _load_codex_stream(path: Path) -> tuple[list[dict[str, Any]], int, int]:
+def _load_codex_stream(
+    path: Path,
+) -> tuple[list[dict[str, Any]], int, int, int]:
     events: list[dict[str, Any]] = []
     preamble_lines = 0
+    diagnostic_lines = 0
     malformed_event_lines = 0
     stream_started = False
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -756,6 +766,9 @@ def _load_codex_stream(path: Path) -> tuple[list[dict[str, Any]], int, int]:
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
+            if CODEX_DIAGNOSTIC_LINE.match(line):
+                diagnostic_lines += 1
+                continue
             if stream_started:
                 malformed_event_lines += 1
             else:
@@ -766,7 +779,7 @@ def _load_codex_stream(path: Path) -> tuple[list[dict[str, Any]], int, int]:
             events.append(item)
         else:
             malformed_event_lines += 1
-    return events, preamble_lines, malformed_event_lines
+    return events, preamble_lines, diagnostic_lines, malformed_event_lines
 
 
 def _observed_codex_models(agent_dir: Path) -> set[str]:
@@ -879,9 +892,14 @@ def write_agent_trajectory(
 
     source_path = agent_dir / "codex.txt"
     if source_path.is_file():
-        events, preamble_lines, malformed_event_lines = _load_codex_stream(source_path)
+        (
+            events,
+            preamble_lines,
+            diagnostic_lines,
+            malformed_event_lines,
+        ) = _load_codex_stream(source_path)
     else:
-        events, preamble_lines, malformed_event_lines = [], 0, 0
+        events, preamble_lines, diagnostic_lines, malformed_event_lines = [], 0, 0, 0
     observed_models = _observed_codex_models(agent_dir)
     runtime_model_name = (
         next(iter(observed_models)) if len(observed_models) == 1 else None
@@ -921,6 +939,7 @@ def write_agent_trajectory(
             "trajectory_validation": {
                 "terminal_event_seen": terminal_event_seen,
                 "preamble_lines": preamble_lines,
+                "diagnostic_lines": diagnostic_lines,
                 "malformed_event_lines": malformed_event_lines,
                 "observed_models": sorted(observed_models),
             },
@@ -953,6 +972,7 @@ def write_agent_trajectory(
             "native_raw_trace_file": source_path.name,
             "native_raw_event_count": len(events),
             "native_raw_preamble_lines": preamble_lines,
+            "native_raw_diagnostic_lines": diagnostic_lines,
             "native_raw_malformed_event_lines": malformed_event_lines,
             "observed_models": sorted(observed_models),
             "terminal_event_seen": terminal_event_seen,
@@ -968,6 +988,7 @@ def write_agent_trajectory(
         "trajectory_validation": {
             "terminal_event_seen": terminal_event_seen,
             "preamble_lines": preamble_lines,
+            "diagnostic_lines": diagnostic_lines,
             "malformed_event_lines": malformed_event_lines,
             "observed_models": sorted(observed_models),
         },

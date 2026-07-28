@@ -11,6 +11,8 @@
 - Preserve restricted harness trace files in checkpoint and final archives.
 - Keep pre-agent infrastructure failures from invalidating otherwise verified
   native model identity and trajectory coverage.
+- Keep Codex stderr diagnostics out of JSONL traces and recover known
+  diagnostics from previously combined streams.
 - Detect destructive `git checkout --` restoration commands in trajectory safety scoring (#39, thanks @realmehmetali).
 
 ### Added
