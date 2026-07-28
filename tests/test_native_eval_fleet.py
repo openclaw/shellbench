@@ -93,6 +93,38 @@ def test_provisioning_lease_is_not_ready_before_ssh_details_exist() -> None:
         )
 
 
+def test_wait_for_lease_ready_retries_provisioning_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = object.__new__(FleetController)
+    ready = Lease(
+        lease_id="cbx_ready",
+        slug="sb-native-ready",
+        host="192.0.2.10",
+        user="crabbox",
+        port=22,
+        identity_file=Path("/tmp/cbx_ready.key"),
+        instance_type="c7a.24xlarge",
+        region="eu-west-1",
+    )
+    attempts = 0
+
+    def inspect(identifier: str, *, required: bool) -> Lease:
+        nonlocal attempts
+        assert identifier == "sb-native-ready"
+        assert required is True
+        attempts += 1
+        if attempts < 3:
+            raise LeaseNotReadyError("lease is provisioning but not ready")
+        return ready
+
+    monkeypatch.setattr(controller, "_inspect_lease", inspect)
+    monkeypatch.setattr("scripts.native_eval.fleet.time.sleep", lambda _: None)
+
+    assert controller._wait_for_lease_ready("sb-native-ready") == ready
+    assert attempts == 3
+
+
 def test_subprocess_timeout_output_is_normalized_to_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

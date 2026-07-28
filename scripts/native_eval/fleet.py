@@ -52,6 +52,8 @@ REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
 # bounded backoff. Give it enough time to finish instead of leaking live AWS
 # leases after a verified export.
 CRABBOX_STOP_TIMEOUT_SECONDS = 6 * 60
+CRABBOX_READY_ATTEMPTS = 30
+CRABBOX_READY_BACKOFF_SECONDS = 10
 
 
 class CommandExecutor(Protocol):
@@ -622,7 +624,10 @@ class FleetController:
             status="leasing",
             requested_lease_slug=slug,
         )
-        existing = self._inspect_lease(slug, required=False)
+        try:
+            existing = self._inspect_lease(slug, required=False)
+        except LeaseNotReadyError:
+            existing = self._wait_for_lease_ready(slug)
         if existing is None:
             command = [
                 "env",
@@ -643,13 +648,26 @@ class FleetController:
             if self.config.instance_type:
                 command.extend(["--type", self.config.instance_type])
             self._warmup_lease(command, slug)
-            existing = self._inspect_lease(slug, required=True)
+            existing = self._wait_for_lease_ready(slug)
         self._store.update(
             entry["run_label"],
             status="bootstrapping",
             lease={**existing.to_dict(), "started_at_utc": utc_now()},
         )
         return existing
+
+    def _wait_for_lease_ready(self, identifier: str) -> Lease:
+        for attempt in range(1, CRABBOX_READY_ATTEMPTS + 1):
+            try:
+                lease = self._inspect_lease(identifier, required=True)
+            except LeaseNotReadyError:
+                if attempt == CRABBOX_READY_ATTEMPTS:
+                    raise
+                time.sleep(CRABBOX_READY_BACKOFF_SECONDS)
+                continue
+            assert lease is not None
+            return lease
+        raise AssertionError("unreachable")
 
     def _warmup_lease(self, command: Sequence[str], slug: str) -> None:
         for attempt in range(1, self.config.warmup_capacity_attempts + 1):
