@@ -172,6 +172,41 @@ def test_optional_inspect_treats_stopped_lease_as_absent(tmp_path: Path) -> None
         controller._inspect_lease("cbx_stopped", required=True)
 
 
+def test_inspect_retries_transient_coordinator_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={},
+        inspect_transient_failures={"cbx_ready": 2},
+    )
+    executor.leases["cbx_ready"] = {
+        "id": "cbx_ready",
+        "slug": "ready",
+        "state": "active",
+        "ready": True,
+        "serverType": "c7a.24xlarge",
+        "sshHost": "192.0.2.10",
+        "sshUser": "crabbox",
+        "sshPort": "22",
+        "sshKey": "/tmp/cbx_ready.key",
+    }
+    monkeypatch.setattr("scripts.native_eval.fleet.time.sleep", lambda _: None)
+
+    lease = FleetController(config, executor=executor)._inspect_lease(
+        "cbx_ready",
+        required=True,
+    )
+
+    assert lease is not None
+    assert lease.lease_id == "cbx_ready"
+    assert executor.inspect_attempts["cbx_ready"] == 3
+
+
 def _write_archive(path: Path) -> None:
     source = path.parent / f"{path.stem}-source"
     source.mkdir()
@@ -216,6 +251,7 @@ class FakeExecutor:
         stop_code: int = 0,
         stop_removes_lease_on_error: bool = False,
         inspect_errors: set[str] | None = None,
+        inspect_transient_failures: dict[str, int] | None = None,
         warmup_capacity_failures: dict[str, int] | None = None,
         dispatch_failures: dict[str, int] | None = None,
     ) -> None:
@@ -228,6 +264,8 @@ class FakeExecutor:
         self.stop_code = stop_code
         self.stop_removes_lease_on_error = stop_removes_lease_on_error
         self.inspect_errors = inspect_errors or set()
+        self.inspect_transient_failures = inspect_transient_failures or {}
+        self.inspect_attempts: dict[str, int] = {}
         self.warmup_capacity_failures = warmup_capacity_failures or {}
         self.dispatch_failures = dispatch_failures or {}
         self.warmup_attempts: dict[str, int] = {}
@@ -266,6 +304,10 @@ class FakeExecutor:
             identifier = argv[argv.index("--id") + 1]
             if identifier in self.inspect_errors:
                 return _result(argv, 1, stderr="broker request timed out")
+            attempt = self.inspect_attempts.get(identifier, 0) + 1
+            self.inspect_attempts[identifier] = attempt
+            if attempt <= self.inspect_transient_failures.get(identifier, 0):
+                return _result(argv, 1, stderr="http 500: error code: 1101")
             lease = next(
                 (
                     value
