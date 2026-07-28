@@ -395,8 +395,10 @@ def _task_identity(result: dict[str, Any], trial_dir: Path) -> tuple[str, str, s
     task_path = _nested(result, "task_id", "path")
     task_path = str(task_path or "")
     task_name = str(result.get("task_name") or "")
-    if not task_name and task_path:
+    if task_path:
         task_name = Path(task_path).name
+    elif task_name:
+        task_name = Path(task_name).name
     trial_name = str(result.get("trial_name") or trial_dir.name)
     return task_name or trial_name, task_path, trial_name
 
