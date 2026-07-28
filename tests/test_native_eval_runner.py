@@ -655,6 +655,171 @@ def test_codex_trajectory_rejects_unknown_interleaved_output(tmp_path: Path) -> 
     assert metadata["trajectory_validation"]["malformed_event_lines"] == 1
 
 
+def test_codex_trajectory_retries_transient_malformed_stream(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    session_dir = agent_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    events = [
+        {"type": "thread.started", "thread_id": "thread-123"},
+        {
+            "type": "item.completed",
+            "item": {"id": "message-1", "type": "agent_message", "text": "done"},
+        },
+        {"type": "turn.completed", "usage": {"input_tokens": 1}},
+    ]
+    (agent_dir / "codex.txt").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    (session_dir / "rollout.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.5"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    original_loader = native_runtime._load_codex_stream
+    calls = 0
+
+    def transient_loader(path: Path):
+        nonlocal calls
+        calls += 1
+        loaded = original_loader(path)
+        if calls == 1:
+            return (*loaded[:3], 1)
+        return loaded
+
+    monkeypatch.setattr(native_runtime, "_load_codex_stream", transient_loader)
+    monkeypatch.setattr(native_runtime.time, "sleep", lambda _seconds: None)
+    run = RunSpec(
+        run_label="codex-gpt55-calibration",
+        harness="codex",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260727",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["trajectory_validation"]["malformed_event_lines"] == 0
+    assert metadata["trajectory_validation"]["stream_read_attempts"] == 2
+
+
+def test_codex_trajectory_falls_back_to_complete_session_stream(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    session_dir = agent_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    (agent_dir / "codex.txt").write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-123"}),
+                '{"type":"item.completed","item":{"id":"broken"',
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1}}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    session_events = [
+        {
+            "type": "session_meta",
+            "payload": {"session_id": "session-123"},
+        },
+        {
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.5"},
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "inspect"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "call-1",
+                "name": "shell",
+                "input": '{"command":"pwd"}',
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call-1",
+                "output": "/app",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}],
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete"},
+        },
+    ]
+    (session_dir / "rollout.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in session_events) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(native_runtime.time, "sleep", lambda _seconds: None)
+    run = RunSpec(
+        run_label="codex-gpt55-calibration",
+        harness="codex",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260727",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["trajectory_validation"]["session_fallback"] is True
+    assert metadata["trajectory_validation"]["malformed_event_lines"] == 0
+    assert trajectory["session_id"] == "session-123"
+    assert trajectory["steps"][1]["reasoning_content"] == "inspect"
+    assert trajectory["steps"][2]["tool_calls"][0]["function_name"] == "shell"
+    assert trajectory["steps"][2]["observation"]["results"][0]["content"] == "/app"
+    assert trajectory["steps"][3]["message"] == "done"
+
+
 def test_unsupported_trajectory_is_explicitly_unranked(tmp_path: Path) -> None:
     run = RunSpec(
         run_label="claude-code-gpt55",

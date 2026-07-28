@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -54,6 +55,8 @@ CODEX_DIAGNOSTIC_LINE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\S+\s+"
     r"(?:TRACE|DEBUG|INFO|WARN|ERROR)\s+codex[\w:.-]*:"
 )
+CODEX_STREAM_READ_ATTEMPTS = 20
+CODEX_STREAM_READ_DELAY_SECONDS = 0.1
 
 
 def build_judge_env(proxy_url: str, proxy_key: str) -> dict[str, str]:
@@ -785,6 +788,22 @@ def _load_codex_stream(
     return events, preamble_lines, diagnostic_lines, malformed_event_lines
 
 
+def _load_stable_codex_stream(
+    path: Path,
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
+    best = _load_codex_stream(path)
+    attempts = 1
+    while best[3] and attempts < CODEX_STREAM_READ_ATTEMPTS:
+        time.sleep(CODEX_STREAM_READ_DELAY_SECONDS)
+        candidate = _load_codex_stream(path)
+        attempts += 1
+        if (candidate[3], -len(candidate[0])) < (best[3], -len(best[0])):
+            best = candidate
+        if best[3] == 0:
+            break
+    return (*best, attempts)
+
+
 def _observed_codex_models(agent_dir: Path) -> set[str]:
     models: set[str] = set()
     sessions_dir = agent_dir / "sessions"
@@ -800,6 +819,143 @@ def _observed_codex_models(agent_dir: Path) -> set[str]:
             if isinstance(message, dict) and message.get("model"):
                 models.add(str(message["model"]))
     return models
+
+
+def _codex_session_events(agent_dir: Path) -> tuple[Path | None, list[dict[str, Any]]]:
+    sessions_dir = agent_dir / "sessions"
+    if not sessions_dir.is_dir():
+        return None, []
+    candidates: list[tuple[Path, list[dict[str, Any]]]] = []
+    for path in sorted(sessions_dir.rglob("*.jsonl")):
+        events = _load_json_events(path)
+        if events:
+            candidates.append((path, events))
+    if not candidates:
+        return None, []
+    return max(candidates, key=lambda item: len(item[1]))
+
+
+def _codex_session_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(filter(None, (_codex_session_text(item) for item in value)))
+    if not isinstance(value, dict):
+        return ""
+    for key in ("text", "output_text", "input_text"):
+        text = value.get(key)
+        if isinstance(text, str):
+            return text
+    return _codex_session_text(value.get("content"))
+
+
+def _codex_session_arguments(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"value": value}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+    return {"value": value}
+
+
+def _codex_session_steps(
+    events: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str | None, bool]:
+    steps: list[dict[str, Any]] = []
+    session_id: str | None = None
+    terminal_event_seen = False
+    pending_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+
+    for event in events:
+        event_type = str(event.get("type") or "")
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if event_type == "session_meta":
+            candidate = payload.get("session_id") or payload.get("id")
+            if candidate:
+                session_id = str(candidate)
+            continue
+        if event_type == "event_msg":
+            terminal_event_seen = terminal_event_seen or payload.get("type") == "task_complete"
+            continue
+        if event_type != "response_item":
+            continue
+
+        item_type = str(payload.get("type") or "")
+        if item_type == "message" and payload.get("role") == "assistant":
+            text = _codex_session_text(payload.get("content"))
+            if text:
+                steps.append(
+                    {
+                        "source": "agent",
+                        "message": text,
+                        "llm_call_count": 1,
+                    }
+                )
+            continue
+        if item_type == "reasoning":
+            summary = _codex_session_text(payload.get("summary"))
+            if summary:
+                steps.append(
+                    {
+                        "source": "agent",
+                        "message": "",
+                        "reasoning_content": summary,
+                        "llm_call_count": 1,
+                    }
+                )
+            continue
+        if item_type in {"custom_tool_call", "function_call"}:
+            call_id = str(payload.get("call_id") or payload.get("id") or uuid.uuid4())
+            name = str(payload.get("name") or item_type)
+            arguments = _codex_session_arguments(
+                payload.get("input", payload.get("arguments"))
+            )
+            pending_calls[call_id] = (name, arguments)
+            continue
+        if item_type not in {"custom_tool_call_output", "function_call_output"}:
+            continue
+
+        call_id = str(payload.get("call_id") or "")
+        call = pending_calls.pop(call_id, None)
+        if call is None:
+            continue
+        name, arguments = call
+        output = payload.get("output")
+        output_text = (
+            output
+            if isinstance(output, str)
+            else json.dumps(output, ensure_ascii=True, default=str)
+        )
+        steps.append(
+            {
+                "source": "agent",
+                "message": "",
+                "tool_calls": [
+                    {
+                        "tool_call_id": call_id,
+                        "function_name": name,
+                        "arguments": arguments,
+                    }
+                ],
+                "observation": {
+                    "results": [
+                        {
+                            "source_call_id": call_id,
+                            "content": output_text,
+                        }
+                    ]
+                },
+                "llm_call_count": 1,
+            }
+        )
+    return steps, session_id, terminal_event_seen
 
 
 def _completed_codex_items(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -900,9 +1056,16 @@ def write_agent_trajectory(
             preamble_lines,
             diagnostic_lines,
             malformed_event_lines,
-        ) = _load_codex_stream(source_path)
+            stream_read_attempts,
+        ) = _load_stable_codex_stream(source_path)
     else:
-        events, preamble_lines, diagnostic_lines, malformed_event_lines = [], 0, 0, 0
+        (
+            events,
+            preamble_lines,
+            diagnostic_lines,
+            malformed_event_lines,
+            stream_read_attempts,
+        ) = ([], 0, 0, 0, 0)
     observed_models = _observed_codex_models(agent_dir)
     runtime_model_name = (
         next(iter(observed_models)) if len(observed_models) == 1 else None
@@ -927,6 +1090,30 @@ def write_agent_trajectory(
         step["step_id"] = len(steps) + 1
         steps.append(step)
 
+    session_fallback = False
+    if (
+        len(steps) == 1
+        or malformed_event_lines
+        or not terminal_event_seen
+        or runtime_model_name is None
+    ):
+        session_path, session_events = _codex_session_events(agent_dir)
+        session_steps, fallback_session_id, fallback_terminal = _codex_session_steps(
+            session_events
+        )
+        if session_steps and fallback_terminal and runtime_model_name is not None:
+            session_fallback = True
+            source_path = session_path or source_path
+            events = session_events
+            terminal_event_seen = True
+            malformed_event_lines = 0
+            if fallback_session_id:
+                session_id = fallback_session_id
+            steps = steps[:1]
+            for step in session_steps:
+                step["step_id"] = len(steps) + 1
+                steps.append(step)
+
     if (
         len(steps) == 1
         or malformed_event_lines
@@ -944,6 +1131,8 @@ def write_agent_trajectory(
                 "preamble_lines": preamble_lines,
                 "diagnostic_lines": diagnostic_lines,
                 "malformed_event_lines": malformed_event_lines,
+                "stream_read_attempts": stream_read_attempts,
+                "session_fallback": session_fallback,
                 "observed_models": sorted(observed_models),
             },
         }
@@ -977,6 +1166,7 @@ def write_agent_trajectory(
             "native_raw_preamble_lines": preamble_lines,
             "native_raw_diagnostic_lines": diagnostic_lines,
             "native_raw_malformed_event_lines": malformed_event_lines,
+            "native_session_fallback": session_fallback,
             "observed_models": sorted(observed_models),
             "terminal_event_seen": terminal_event_seen,
         },
@@ -993,6 +1183,8 @@ def write_agent_trajectory(
             "preamble_lines": preamble_lines,
             "diagnostic_lines": diagnostic_lines,
             "malformed_event_lines": malformed_event_lines,
+            "stream_read_attempts": stream_read_attempts,
+            "session_fallback": session_fallback,
             "observed_models": sorted(observed_models),
         },
     }

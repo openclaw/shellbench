@@ -13,6 +13,8 @@
   native model identity and trajectory coverage.
 - Keep Codex stderr diagnostics out of JSONL traces and recover known
   diagnostics from previously combined streams.
+- Recover Codex trajectories from complete native session rollouts when its
+  CLI JSONL stream is transiently incomplete or contains binary tool output.
 - Reattach active AWS leases through their recorded SSH endpoint when Crabbox
   readiness probing is stale.
 - Preserve Hermes JSONL sessions containing literal Unicode line separators.
