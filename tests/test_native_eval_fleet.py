@@ -251,7 +251,7 @@ class FakeExecutor:
             )
             remote_command = shlex.split(argv[-1])
             dispatch_marker = remote_command.index("fleet-dispatch")
-            remote_run_args = remote_command[dispatch_marker + 15 :]
+            remote_run_args = remote_command[dispatch_marker + 16 :]
             with self._dispatch_condition:
                 self.dispatches.append(label)
                 self.dispatch_concurrency[label] = int(remote_run_args[10])
@@ -705,6 +705,7 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
             "gpt-5.5",
             "--execution-mode",
             "native",
+            "--parity-validated",
             "--model-task-concurrency",
             "fable5=2",
         ]
@@ -715,6 +716,7 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
     assert args.harbor_reference_commit == "harbor-commit"
     assert args.judge_model_id == "gpt-5.5"
     assert args.execution_mode == "native"
+    assert args.parity_validated is True
     assert args.model_task_concurrency == {"fable5": 2}
 
 

@@ -10,6 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from scripts.native_eval.harness_trajectories import (
+    load_openclaw_envelope,
+    write_hermes_trajectory,
+    write_openclaw_trajectory,
+)
 from scripts.native_eval.harnesses import TOOLCHAIN_ROOT, build_harness_command
 from scripts.native_eval.models import RunSpec
 from scripts.native_eval.tasks import TaskSpec
@@ -704,7 +709,11 @@ def collect_agent_metrics(harness: str, agent_dir: Path) -> dict[str, Any]:
     path = candidates.get(harness)
     if path is None or not path.is_file():
         return metrics
-    events = _load_json_events(path)
+    if harness == "openclaw":
+        envelope = load_openclaw_envelope(path)
+        events = [envelope] if envelope is not None else []
+    else:
+        events = _load_json_events(path)
     for event in events:
         usage = _find_usage(event)
         if usage:
@@ -855,6 +864,10 @@ def write_agent_trajectory(
     run: RunSpec,
     agent_dir: Path,
 ) -> dict[str, Any]:
+    if run.harness == "openclaw":
+        return write_openclaw_trajectory(task.instruction, run, agent_dir)
+    if run.harness == "hermes":
+        return write_hermes_trajectory(task.instruction, run, agent_dir)
     if run.harness != "codex":
         return {
             "trajectory_status": "unsupported",

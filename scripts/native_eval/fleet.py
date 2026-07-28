@@ -164,6 +164,7 @@ class FleetConfig:
     harbor_reference_commit: str = ""
     judge_model_id: str = ""
     execution_mode: str = "native"
+    parity_validated: bool = False
 
 
 class RunIndexStore:
@@ -782,7 +783,8 @@ judge_model_id=$2
 execution_mode=$3
 reasoning_effort=$4
 judge_reasoning_effort=$5
-shift 5
+parity_validated=$6
+shift 6
 mkdir -p "$root/run-logs"
 stdout="$root/run-logs/$label.stdout.log"
 stderr="$root/run-logs/$label.stderr.log"
@@ -799,6 +801,7 @@ nohup env \
   "SHELLBENCH_EXECUTION_MODE=$execution_mode" \
   "SHELLBENCH_REASONING_EFFORT=$reasoning_effort" \
   "SHELLBENCH_JUDGE_REASONING_EFFORT=$judge_reasoning_effort" \
+  "SHELLBENCH_PARITY_VALIDATED=$parity_validated" \
   "$root/runner/scripts/native_eval/remote_run.sh" "$@" \
   >"$stdout" 2>"$stderr" </dev/null &
 pid=$!
@@ -850,6 +853,7 @@ printf '%s\n' "$pid"
                     self.config.execution_mode,
                     reasoning_effort,
                     judge_reasoning_effort,
+                    str(self.config.parity_validated).lower(),
                     *args,
                 ],
             ),
@@ -1376,6 +1380,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--harbor-reference-commit", default="")
     parser.add_argument("--judge-model-id", default="")
     parser.add_argument("--execution-mode", default="native")
+    parser.add_argument("--parity-validated", action="store_true")
     args = parser.parse_args(argv)
     args.model_max_runs = _parse_model_values(
         parser,
@@ -1426,6 +1431,7 @@ def main(argv: list[str] | None = None) -> int:
         harbor_reference_commit=args.harbor_reference_commit,
         judge_model_id=args.judge_model_id,
         execution_mode=args.execution_mode,
+        parity_validated=args.parity_validated,
     )
     try:
         return FleetController(config).run()
