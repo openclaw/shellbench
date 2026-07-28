@@ -26,3 +26,18 @@ def test_openai_proxy_models_enforce_reasoning_effort(
     assert models["gpt-5.6-luna"]["litellm_params"]["reasoning_effort"] == "high"
     assert models["gpt-5.6-terra"]["litellm_params"]["reasoning_effort"] == "high"
     assert config["shellbench_native"]["reasoning_effort"] == "high"
+
+
+def test_openai_proxy_accepts_xhigh_reasoning_effort(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("SHELLBENCH_REASONING_EFFORT", "xhigh")
+    config_path = tmp_path / "proxy.json"
+
+    write_proxy_config(config_path)
+
+    config = json.loads(config_path.read_text())
+    models = {item["model_name"]: item for item in config["model_list"]}
+    assert models["gpt-5.6-sol"]["litellm_params"]["reasoning_effort"] == "xhigh"
+    assert config["shellbench_native"]["reasoning_effort"] == "xhigh"

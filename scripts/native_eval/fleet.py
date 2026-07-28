@@ -47,7 +47,7 @@ RESUMABLE_STATUSES = {
 RERUN_STATUSES = {"failed", "lease_lost"}
 ACTIVE_RUN_STATUSES = {"leasing", "bootstrapping", "ready", "running"}
 CLEANUP_STATUSES = {"exported", "stop_pending"}
-REASONING_EFFORTS = {"low", "medium", "high"}
+REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
 
 
 class CommandExecutor(Protocol):
@@ -352,7 +352,7 @@ class FleetController:
                 if reasoning_effort not in REASONING_EFFORTS:
                     raise FleetError(
                         f"{run.run_label} must set reasoning_effort to "
-                        "low, medium, or high"
+                        "low, medium, high, or xhigh"
                     )
             judge_reasoning_effort = str(
                 entry.get("judge_reasoning_effort") or ""
@@ -360,7 +360,7 @@ class FleetController:
             if judge_reasoning_effort not in REASONING_EFFORTS:
                 raise FleetError(
                     f"{run.run_label} must set judge_reasoning_effort to "
-                    "low, medium, or high"
+                    "low, medium, high, or xhigh"
                 )
 
     def _prepare_inputs(self) -> None:
