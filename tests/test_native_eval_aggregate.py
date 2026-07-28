@@ -175,6 +175,27 @@ def test_aggregate_classifies_harbor_results_and_writes_all_outputs(tmp_path: Pa
     assert (summaries_dir / "cleaned_leaderboard.md").is_file()
 
 
+def test_aggregate_uses_task_path_for_canonical_task_name(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    result = _result("display-name", reward=0.0)
+    result["task_name"] = "computer-use/display-name"
+    result["task_id"] = {"path": "/benchmark/tasks/canonical-task"}
+    _write_run(
+        jobs_root,
+        "model-rep-1",
+        expected_task_count=1,
+        results=[result],
+    )
+
+    aggregate(jobs_root, summaries_dir)
+
+    with (summaries_dir / "per_task_results.csv").open(newline="") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["task_name"] == "canonical-task"
+    assert row["task_path"] == "/benchmark/tasks/canonical-task"
+
+
 def test_pair_aggregates_exclude_incomplete_and_infra_dominated_runs(tmp_path: Path):
     jobs_root = tmp_path / "native"
     summaries_dir = tmp_path / "summaries"
