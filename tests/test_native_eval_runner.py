@@ -259,6 +259,8 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
         if harness.name == "openclaw":
             assert "ended with stopReason=" in command.run_command
             assert "--thinking off" in command.run_command
+            assert "setup --baseline --skip-bootstrap" in command.setup_command
+            assert '"skipBootstrap":true' in command.setup_command
             assert "item.chmod(0o755 if item.is_dir() else 0o644)" in (
                 command.cleanup_command
             )
