@@ -2,11 +2,11 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: remote_run.sh ROOT TASKS_ROOT ENV_FILE RUN_LABEL HARNESS MODEL_SLUG REP EXPECTED_COUNT PUBLIC_TASKS_COMMIT RUN_DATE CONCURRENCY HARNESS_VERSION MODEL_ID MODEL_PROVIDER PROXY_MODEL_NAME [TASK_NAME ...]" >&2
+  echo "usage: remote_run.sh ROOT TASKS_ROOT ENV_FILE RUN_LABEL HARNESS MODEL_SLUG REP EXPECTED_COUNT PUBLIC_TASKS_COMMIT RUN_DATE CONCURRENCY HARNESS_VERSION MODEL_ID MODEL_PROVIDER PROXY_MODEL_NAME RERUN_OF_CANONICAL_RUN [TASK_NAME ...]" >&2
   exit 2
 }
 
-[[ $# -ge 15 ]] || usage
+[[ $# -ge 16 ]] || usage
 
 ROOT="$1"
 TASKS_ROOT="$2"
@@ -23,7 +23,8 @@ HARNESS_VERSION="${12}"
 MODEL_ID="${13}"
 MODEL_PROVIDER="${14}"
 PROXY_MODEL_NAME="${15}"
-shift 15
+RERUN_OF_CANONICAL_RUN="${16}"
+shift 16
 TASK_NAMES=("$@")
 TASK_SUITE_PATH="combined tasks/tasks"
 TOOLCHAIN_ROOT="${TOOLCHAIN_ROOT:-/opt/shellbench-native}"
@@ -127,6 +128,9 @@ RUN_COMMAND=(
   --proxy-url "http://host.docker.internal:4000"
   --concurrency "$CONCURRENCY"
 )
+if [[ -n "$RERUN_OF_CANONICAL_RUN" ]]; then
+  RUN_COMMAND+=(--rerun-of-canonical-run "$RERUN_OF_CANONICAL_RUN")
+fi
 for task_name in "${TASK_NAMES[@]}"; do
   RUN_COMMAND+=(--task "$task_name")
 done
