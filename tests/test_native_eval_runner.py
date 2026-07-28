@@ -18,10 +18,11 @@ from scripts.native_eval.models import (
     build_matrix_plan,
 )
 from scripts.native_eval import plan as native_plan
-from scripts.native_eval.proxy import write_proxy_config
+from scripts.native_eval.proxy import JUDGE_PROXY_MODEL_NAME, write_proxy_config
 from scripts.native_eval.run_job import _git_commit, _run_manifest, build_run_spec
 from scripts.native_eval.runtime import (
     DockerTaskEnvironment,
+    build_judge_env,
     collect_agent_metrics,
     read_reward,
     write_agent_trajectory,
@@ -135,12 +136,13 @@ def test_proxy_config_pins_only_requested_upstreams(
     write_proxy_config(path)
     config = json.loads(path.read_text(encoding="utf-8"))
 
-    assert [item["model_name"] for item in config["model_list"]] == [
+    assert [item["model_name"] for item in config["model_list"][:-1]] == [
         model.provider_model_id for model in MODELS
     ]
-    assert [item["litellm_params"]["model"] for item in config["model_list"]] == [
+    assert [item["litellm_params"]["model"] for item in config["model_list"][:-1]] == [
         f"{model.provider}/{model.provider_model_id}" for model in MODELS
     ]
+    assert config["model_list"][-1]["model_name"] == JUDGE_PROXY_MODEL_NAME
     serialized = path.read_text(encoding="utf-8")
     assert "OPENAI_API_KEY" in serialized
     assert "ANTHROPIC_API_KEY" in serialized
@@ -149,6 +151,16 @@ def test_proxy_config_pins_only_requested_upstreams(
         item["litellm_params"].get("reasoning_effort") == "high"
         for item in config["model_list"]
         if item["model_info"]["provider"] == "openai"
+    )
+
+
+def test_judge_env_uses_dedicated_proxy_alias() -> None:
+    judge_env = build_judge_env("http://proxy:4000/", "proxy-key")
+
+    assert judge_env["AGENT_JUDGE_MODEL"] == JUDGE_PROXY_MODEL_NAME
+    assert judge_env["LLM_JUDGE_MODEL"] == JUDGE_PROXY_MODEL_NAME
+    assert judge_env["AGENT_JUDGE_API_URL"] == (
+        "http://proxy:4000/v1/chat/completions"
     )
 
 

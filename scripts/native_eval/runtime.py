@@ -18,6 +18,7 @@ from scripts.native_eval.harness_trajectories import (
 )
 from scripts.native_eval.harnesses import TOOLCHAIN_ROOT, build_harness_command
 from scripts.native_eval.models import RunSpec
+from scripts.native_eval.proxy import JUDGE_PROXY_MODEL_NAME
 from scripts.native_eval.tasks import TaskSpec
 
 
@@ -53,6 +54,19 @@ CODEX_DIAGNOSTIC_LINE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\S+\s+"
     r"(?:TRACE|DEBUG|INFO|WARN|ERROR)\s+codex[\w:.-]*:"
 )
+
+
+def build_judge_env(proxy_url: str, proxy_key: str) -> dict[str, str]:
+    return {
+        "AGENT_JUDGE_API_URL": f"{proxy_url.rstrip('/')}/v1/chat/completions",
+        "AGENT_JUDGE_MODEL": JUDGE_PROXY_MODEL_NAME,
+        "AGENT_JUDGE_API_KEY": proxy_key,
+        "LLM_JUDGE_API_URL": f"{proxy_url.rstrip('/')}/v1",
+        "LLM_JUDGE_MODEL": JUDGE_PROXY_MODEL_NAME,
+        "LLM_JUDGE_API_KEY": proxy_key,
+        "OPENAI_BASE_URL": f"{proxy_url.rstrip('/')}/v1",
+        "OPENROUTER_API_KEY": proxy_key,
+    }
 
 
 @dataclass(frozen=True)
@@ -535,18 +549,7 @@ async def run_trial(
         await environment.install_tests()
         verifier_started = utc_now()
         verifier_env = task.resolved_verifier_env()
-        judge_env = {
-            "AGENT_JUDGE_API_URL": (
-                f"{proxy_url.rstrip('/')}/v1/chat/completions"
-            ),
-            "AGENT_JUDGE_MODEL": "gpt-5.5",
-            "AGENT_JUDGE_API_KEY": proxy_key,
-            "LLM_JUDGE_API_URL": f"{proxy_url.rstrip('/')}/v1",
-            "LLM_JUDGE_MODEL": "gpt-5.5",
-            "LLM_JUDGE_API_KEY": proxy_key,
-            "OPENAI_BASE_URL": f"{proxy_url.rstrip('/')}/v1",
-            "OPENROUTER_API_KEY": proxy_key,
-        }
+        judge_env = build_judge_env(proxy_url, proxy_key)
         for key, value in judge_env.items():
             if not verifier_env.get(key):
                 verifier_env[key] = value
