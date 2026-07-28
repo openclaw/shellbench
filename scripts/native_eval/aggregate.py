@@ -767,20 +767,23 @@ def _summarize_run(
         manifest.get("runner") == "shellbench-native"
         or any(row.get("source") == "shellbench-native" for row in rows)
     )
+    agent_attempt_rows = [
+        row
+        for row in scored_rows
+        if row.get("_valid_result") and row.get("classification") != "infra"
+    ]
     canonical_model_identity = not native_run or (
         manifest.get("canonical_model_identity") is True
         and all(
             row.get("canonical_model_identity") is True
-            for row in scored_rows
-            if row.get("_valid_result")
+            for row in agent_attempt_rows
         )
     )
     trajectory_complete = not native_run or (
         manifest.get("trajectory_mode") == "real_harness_events"
         and all(
             row.get("trajectory_status") == "real"
-            for row in scored_rows
-            if row.get("_valid_result")
+            for row in agent_attempt_rows
         )
     )
     parity_validated = not native_run or manifest.get("parity_validated") is True

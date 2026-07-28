@@ -292,6 +292,38 @@ def test_native_run_requires_parity_validation_for_leaderboard(tmp_path: Path):
     assert report["runs"][0]["exclusion_reason"] == "parity_not_validated"
 
 
+def test_native_identity_checks_ignore_pre_agent_infra_failures(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "hermes-gpt56-terra",
+        expected_task_count=3,
+        results=[
+            _native_result("a"),
+            _native_result("b", reward=0.0),
+            _result(
+                "environment-timeout",
+                source="shellbench-native",
+                exception_type="EnvironmentStartTimeoutError",
+            ),
+        ],
+        harness="hermes",
+        model_slug="gpt56-terra",
+        native=True,
+        parity_validated=True,
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    run = report["runs"][0]
+    assert run["infra"] == 1
+    assert run["infra_dominated"] is False
+    assert run["canonical_model_identity"] is True
+    assert run["trajectory_complete"] is True
+    assert run["eligible"] is True
+
+
 def test_manifest_can_explicitly_exclude_complete_run(tmp_path: Path):
     jobs_root = tmp_path / "native"
     summaries_dir = tmp_path / "summaries"
