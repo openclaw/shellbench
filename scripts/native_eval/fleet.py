@@ -48,7 +48,10 @@ RERUN_STATUSES = {"failed", "lease_lost"}
 ACTIVE_RUN_STATUSES = {"leasing", "bootstrapping", "ready", "running"}
 CLEANUP_STATUSES = {"exported", "stop_pending"}
 REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
-CRABBOX_STOP_TIMEOUT_SECONDS = 15
+# Crabbox's coordinator release path retries five 60-second requests with
+# bounded backoff. Give it enough time to finish instead of leaking live AWS
+# leases after a verified export.
+CRABBOX_STOP_TIMEOUT_SECONDS = 6 * 60
 
 
 class CommandExecutor(Protocol):
