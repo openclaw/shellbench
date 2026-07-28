@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tarfile
 from argparse import Namespace
@@ -16,13 +17,16 @@ from scripts.native_eval.models import (
     RunSpec,
     build_matrix_plan,
 )
+from scripts.native_eval import plan as native_plan
 from scripts.native_eval.proxy import write_proxy_config
 from scripts.native_eval.run_job import _git_commit, _run_manifest, build_run_spec
 from scripts.native_eval.runtime import (
+    DockerTaskEnvironment,
     collect_agent_metrics,
     read_reward,
     write_agent_trajectory,
 )
+from scripts.native_eval import runtime as native_runtime
 from scripts.native_eval.tasks import TaskSpec, validate_suite
 
 
@@ -34,6 +38,26 @@ def test_matrix_plan_contains_only_requested_models_and_harnesses() -> None:
     assert {run.harness for run in plan} == {harness.name for harness in HARNESSES}
     assert {run.model_slug for run in plan} == {model.slug for model in MODELS}
     assert {run.repetition for run in plan} == {1, 2, 3}
+
+
+def test_run_index_records_agent_and_judge_reasoning(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(native_plan, "validate_suite", lambda _root: [object()])
+
+    entries = native_plan.write_run_index(
+        tasks_root=tmp_path,
+        output=tmp_path / "run-index.json",
+        public_tasks_commit="tasks-commit",
+        run_date="20260728",
+        reasoning_effort="high",
+        judge_reasoning_effort="high",
+    )
+
+    assert len(entries) == 72
+    assert {entry["reasoning_effort"] for entry in entries} == {"high"}
+    assert {entry["judge_reasoning_effort"] for entry in entries} == {"high"}
 
 
 def test_task_loader_accepts_rich_manifest_and_compose(tmp_path: Path) -> None:
@@ -102,7 +126,11 @@ def test_validate_suite_reports_missing_required_file(tmp_path: Path) -> None:
         raise AssertionError("expected suite validation to fail")
 
 
-def test_proxy_config_pins_only_requested_upstreams(tmp_path: Path) -> None:
+def test_proxy_config_pins_only_requested_upstreams(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SHELLBENCH_REASONING_EFFORT", "high")
     path = tmp_path / "config.json"
     write_proxy_config(path)
     config = json.loads(path.read_text(encoding="utf-8"))
@@ -117,6 +145,11 @@ def test_proxy_config_pins_only_requested_upstreams(tmp_path: Path) -> None:
     assert "OPENAI_API_KEY" in serialized
     assert "ANTHROPIC_API_KEY" in serialized
     assert "sk-" not in serialized
+    assert all(
+        item["litellm_params"].get("reasoning_effort") == "high"
+        for item in config["model_list"]
+        if item["model_info"]["provider"] == "openai"
+    )
 
 
 def test_run_manifest_records_native_audit_metadata(
@@ -126,6 +159,8 @@ def test_run_manifest_records_native_audit_metadata(
     monkeypatch.setenv("SHELLBENCH_EXECUTION_MODE", "native")
     monkeypatch.setenv("SHELLBENCH_HARBOR_REFERENCE_COMMIT", "harbor-commit")
     monkeypatch.setenv("SHELLBENCH_JUDGE_MODEL_ID", "gpt-5.5")
+    monkeypatch.setenv("SHELLBENCH_REASONING_EFFORT", "high")
+    monkeypatch.setenv("SHELLBENCH_JUDGE_REASONING_EFFORT", "high")
     run = RunSpec(
         run_label="openclaw-gpt55-full-2-r1-20260727",
         harness="openclaw",
@@ -155,6 +190,8 @@ def test_run_manifest_records_native_audit_metadata(
     assert manifest["trajectory_mode"] == "unsupported"
     assert manifest["canonical_model_identity"] is None
     assert manifest["provider_model_id"] == "gpt-5.5"
+    assert manifest["reasoning_effort"] == "high"
+    assert manifest["judge_reasoning_effort"] == "high"
 
 
 def test_run_spec_preserves_explicit_planned_identity() -> None:
@@ -207,6 +244,9 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
         assert "sb-opus5" not in command.run_command
         assert "OPENROUTER_API_KEY" not in command.env
         assert 'exit "$status"' in command.run_command
+        if harness.name == "openclaw":
+            assert "ended with stopReason=" in command.run_command
+            assert "--thinking off" in command.run_command
 
 
 def test_hermes_uses_named_local_proxy_provider() -> None:
@@ -236,6 +276,36 @@ def test_hermes_uses_named_local_proxy_provider() -> None:
     assert command.env == {"SHELLBENCH_PROXY_KEY": "local-proxy-key"}
     assert "custom:shellbench" in command.setup_command
     assert "http://host.docker.internal:4000/v1" in command.setup_command
+    assert '--session-id "$session_id" --yes --redact' in command.cleanup_command
+
+
+def test_workdir_falls_back_to_existing_container_directory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    async def fake_capture(command: list[str]) -> str:
+        commands.append(command)
+        return "" if command[1] == "inspect" else "/workspace"
+
+    monkeypatch.setattr(native_runtime, "capture_process", fake_capture)
+    environment = DockerTaskEnvironment(
+        task=object(),  # type: ignore[arg-type]
+        trial_dir=tmp_path,
+        container_name="trial",
+        project_name="trial",
+        toolchain_root=tmp_path,
+        container_id="container-id",
+    )
+
+    asyncio.run(environment._discover_workdir())
+
+    assert environment.workdir == "/workspace"
+    assert commands[1][-1] == (
+        "if [ -d /app ]; then printf /app; "
+        "elif [ -d /workspace ]; then printf /workspace; else pwd; fi"
+    )
 
 
 def test_claude_code_selects_canonical_model_explicitly() -> None:

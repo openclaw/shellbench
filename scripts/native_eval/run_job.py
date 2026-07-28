@@ -244,6 +244,10 @@ def _run_manifest(
             "SHELLBENCH_HARBOR_REFERENCE_COMMIT"
         ),
         "judge_model_id": os.environ.get("SHELLBENCH_JUDGE_MODEL_ID"),
+        "reasoning_effort": os.environ.get("SHELLBENCH_REASONING_EFFORT"),
+        "judge_reasoning_effort": os.environ.get(
+            "SHELLBENCH_JUDGE_REASONING_EFFORT"
+        ),
         "runner_commit": _git_commit(),
         "runner_patch_hash": _runner_patch_hash(),
         "public_tasks_commit": public_tasks_commit,

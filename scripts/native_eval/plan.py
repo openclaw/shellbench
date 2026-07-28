@@ -14,12 +14,16 @@ def write_run_index(
     output: Path,
     public_tasks_commit: str,
     run_date: str,
+    reasoning_effort: str,
+    judge_reasoning_effort: str,
 ) -> list[dict[str, object]]:
     tasks = validate_suite(tasks_root)
     runs = build_matrix_plan(len(tasks), run_date=run_date)
     entries = [
         {
             **run.to_dict(),
+            "reasoning_effort": reasoning_effort,
+            "judge_reasoning_effort": judge_reasoning_effort,
             "attempt": 0,
             "status": "planned",
             "leaderboard_eligible": None,
@@ -49,12 +53,25 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--public-tasks-commit", required=True)
     parser.add_argument("--run-date", required=True)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "high"),
+        required=True,
+    )
+    parser.add_argument(
+        "--judge-reasoning-effort",
+        choices=("low", "medium", "high"),
+    )
     args = parser.parse_args()
     entries = write_run_index(
         tasks_root=args.tasks_root,
         output=args.output,
         public_tasks_commit=args.public_tasks_commit,
         run_date=args.run_date,
+        reasoning_effort=args.reasoning_effort,
+        judge_reasoning_effort=(
+            args.judge_reasoning_effort or args.reasoning_effort
+        ),
     )
     print(f"wrote {len(entries)} planned runs to {args.output}")
 

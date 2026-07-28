@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from scripts.native_eval.models import LITELLM_VERSION, MODELS
 
 
 def write_proxy_config(path: Path) -> None:
+    reasoning_effort = os.environ.get("SHELLBENCH_REASONING_EFFORT", "").strip()
+    if reasoning_effort not in {"low", "medium", "high"}:
+        raise ValueError(
+            "SHELLBENCH_REASONING_EFFORT must be low, medium, or high"
+        )
     model_list = []
     for model in MODELS:
         litellm_params = {
@@ -15,6 +21,7 @@ def write_proxy_config(path: Path) -> None:
         }
         if model.slug in {"gpt55", "gpt56-sol"}:
             litellm_params["additional_drop_params"] = ["temperature"]
+            litellm_params["reasoning_effort"] = reasoning_effort
         model_list.append(
             {
                 "model_name": model.proxy_model_name,
@@ -44,6 +51,7 @@ def write_proxy_config(path: Path) -> None:
         },
         "shellbench_native": {
             "litellm_version": LITELLM_VERSION,
+            "reasoning_effort": reasoning_effort,
             "models": [
                 {
                     "slug": model.slug,

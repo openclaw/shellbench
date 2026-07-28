@@ -34,6 +34,7 @@ AGENT_EXIT_EXCEPTION_TYPES = {
 }
 
 INFRA_EXCEPTION_TYPES = {
+    "AgentSetupError",
     "AgentSetupTimeoutError",
     "DockerStartupError",
     "EnvironmentStartTimeoutError",
@@ -805,6 +806,11 @@ def _summarize_run(
         exclusion_reason = "parity_not_validated"
     else:
         exclusion_reason = ""
+    if manifest.get("leaderboard_eligible") is False:
+        eligible = False
+        exclusion_reason = (
+            str(manifest.get("exclusion_reason") or "") or "explicitly_excluded"
+        )
 
     return {
         "run_label": run_label,

@@ -59,6 +59,8 @@ def _write_index(
 def _planned(run: RunSpec) -> dict[str, object]:
     return {
         **run.to_dict(),
+        "reasoning_effort": "high",
+        "judge_reasoning_effort": "high",
         "attempt": 0,
         "status": "planned",
         "leaderboard_eligible": None,
@@ -249,7 +251,7 @@ class FakeExecutor:
             )
             remote_command = shlex.split(argv[-1])
             dispatch_marker = remote_command.index("fleet-dispatch")
-            remote_run_args = remote_command[dispatch_marker + 13 :]
+            remote_run_args = remote_command[dispatch_marker + 15 :]
             with self._dispatch_condition:
                 self.dispatches.append(label)
                 self.dispatch_concurrency[label] = int(remote_run_args[10])
@@ -774,6 +776,8 @@ def test_failed_run_is_preserved_and_suffixed_rerun_completes(
     assert runs[0]["final_result_count"] == 1
     assert runs[1]["status"] == "completed"
     assert runs[1]["rerun_of"] == base
+    assert runs[1]["reasoning_effort"] == "high"
+    assert runs[1]["judge_reasoning_effort"] == "high"
     assert executor.dispatches == [base, rerun]
     assert (config.local_root / "raw" / f"{base}-final-artifacts.tar.gz").is_file()
     assert (config.local_root / "raw" / f"{rerun}-final-artifacts.tar.gz").is_file()

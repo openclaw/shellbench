@@ -47,6 +47,7 @@ RESUMABLE_STATUSES = {
 RERUN_STATUSES = {"failed", "lease_lost"}
 ACTIVE_RUN_STATUSES = {"leasing", "bootstrapping", "ready", "running"}
 CLEANUP_STATUSES = {"exported", "stop_pending"}
+REASONING_EFFORTS = {"low", "medium", "high"}
 
 
 class CommandExecutor(Protocol):
@@ -323,6 +324,21 @@ class FleetController:
             if run.expected_task_count != expected:
                 raise FleetError(
                     f"{run.run_label} expects {run.expected_task_count}, index expects {expected}"
+                )
+            if run.provider == "openai":
+                reasoning_effort = str(entry.get("reasoning_effort") or "")
+                if reasoning_effort not in REASONING_EFFORTS:
+                    raise FleetError(
+                        f"{run.run_label} must set reasoning_effort to "
+                        "low, medium, or high"
+                    )
+            judge_reasoning_effort = str(
+                entry.get("judge_reasoning_effort") or ""
+            )
+            if judge_reasoning_effort not in REASONING_EFFORTS:
+                raise FleetError(
+                    f"{run.run_label} must set judge_reasoning_effort to "
+                    "low, medium, or high"
                 )
 
     def _prepare_inputs(self) -> None:
@@ -764,7 +780,9 @@ shift 9
 harbor_reference_commit=$1
 judge_model_id=$2
 execution_mode=$3
-shift 3
+reasoning_effort=$4
+judge_reasoning_effort=$5
+shift 5
 mkdir -p "$root/run-logs"
 stdout="$root/run-logs/$label.stdout.log"
 stderr="$root/run-logs/$label.stderr.log"
@@ -779,6 +797,8 @@ nohup env \
   "SHELLBENCH_HARBOR_REFERENCE_COMMIT=$harbor_reference_commit" \
   "SHELLBENCH_JUDGE_MODEL_ID=$judge_model_id" \
   "SHELLBENCH_EXECUTION_MODE=$execution_mode" \
+  "SHELLBENCH_REASONING_EFFORT=$reasoning_effort" \
+  "SHELLBENCH_JUDGE_REASONING_EFFORT=$judge_reasoning_effort" \
   "$root/runner/scripts/native_eval/remote_run.sh" "$@" \
   >"$stdout" 2>"$stderr" </dev/null &
 pid=$!
@@ -803,6 +823,11 @@ printf '%s\n' "$pid"
             run.provider,
             run.proxy_model_name,
         ]
+        entry = self._store.get(run.run_label)
+        reasoning_effort = str(entry.get("reasoning_effort") or "")
+        judge_reasoning_effort = str(
+            entry.get("judge_reasoning_effort") or reasoning_effort
+        )
         self._checked(
             self._ssh_command(
                 lease,
@@ -823,6 +848,8 @@ printf '%s\n' "$pid"
                     self.config.harbor_reference_commit,
                     self.config.judge_model_id,
                     self.config.execution_mode,
+                    reasoning_effort,
+                    judge_reasoning_effort,
                     *args,
                 ],
             ),
@@ -1162,6 +1189,8 @@ printf '%s\n' "$pid"
         rerun = {
             **run.to_dict(),
             "run_label": label,
+            "reasoning_effort": entry.get("reasoning_effort"),
+            "judge_reasoning_effort": entry.get("judge_reasoning_effort"),
             "attempt": next_attempt,
             "status": "planned",
             "leaderboard_eligible": None,
