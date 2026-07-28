@@ -68,7 +68,12 @@ def _openclaw(
                 "transport": server.transport,
             }
     config = {
-        "agents": {"defaults": {"workspace": "."}},
+        "agents": {
+            "defaults": {
+                "workspace": ".",
+                "skipBootstrap": True,
+            }
+        },
         "gateway": {"mode": "local"},
         "models": {
             "providers": {
@@ -94,7 +99,8 @@ def _openclaw(
     setup = (
         f"export PATH={_base_path()}; export HOME={home}; "
         "rm -rf \"$HOME\"; mkdir -p \"$HOME/.openclaw\"; "
-        "openclaw setup --baseline --workspace . >/logs/agent/setup.log 2>&1; "
+        "openclaw setup --baseline --skip-bootstrap --workspace . "
+        ">/logs/agent/setup.log 2>&1; "
         f"printf %s {config_json} > \"$HOME/.openclaw/openclaw.json\""
     )
     run_command = (
