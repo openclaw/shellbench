@@ -369,6 +369,28 @@ def run_loop(args: argparse.Namespace) -> int:
                     log_path=log_path,
                 )
             except (OSError, subprocess.SubprocessError, tarfile.TarError) as exc:
+                try:
+                    pull_checkpoint(
+                        client=client,
+                        runner_root=args.runner_root,
+                        remote_root=args.remote_root,
+                        run_label=args.run_label,
+                        raw_dir=raw_dir,
+                        log_path=log_path,
+                        sequence=sequence,
+                    )
+                except (
+                    OSError,
+                    subprocess.SubprocessError,
+                    tarfile.TarError,
+                ) as checkpoint_exc:
+                    append_checkpoint_log(
+                        log_path,
+                        event="checkpoint_error",
+                        archive_name="",
+                        result_count=last_archive_count,
+                        detail=str(checkpoint_exc).replace("\n", " ")[:500],
+                    )
                 append_checkpoint_log(
                     log_path,
                     event="final_error",
