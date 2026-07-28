@@ -33,8 +33,8 @@ from scripts.native_eval.tasks import TaskSpec, validate_suite
 def test_matrix_plan_contains_only_requested_models_and_harnesses() -> None:
     plan = build_matrix_plan(116, run_date="20260727")
 
-    assert len(plan) == 72
-    assert len({run.run_label for run in plan}) == 72
+    assert len(plan) == 96
+    assert len({run.run_label for run in plan}) == 96
     assert {run.harness for run in plan} == {harness.name for harness in HARNESSES}
     assert {run.model_slug for run in plan} == {model.slug for model in MODELS}
     assert {run.repetition for run in plan} == {1, 2, 3}
@@ -55,7 +55,7 @@ def test_run_index_records_agent_and_judge_reasoning(
         judge_reasoning_effort="high",
     )
 
-    assert len(entries) == 72
+    assert len(entries) == 96
     assert {entry["reasoning_effort"] for entry in entries} == {"high"}
     assert {entry["judge_reasoning_effort"] for entry in entries} == {"high"}
 
