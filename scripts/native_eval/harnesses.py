@@ -101,6 +101,7 @@ def _openclaw(
         "rm -rf \"$HOME\"; mkdir -p \"$HOME/.openclaw\"; "
         "openclaw setup --baseline --skip-bootstrap --workspace . "
         ">/logs/agent/setup.log 2>&1; "
+        "rm -f BOOTSTRAP.md; "
         f"printf %s {config_json} > \"$HOME/.openclaw/openclaw.json\""
     )
     run_command = (
