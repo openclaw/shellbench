@@ -16,6 +16,7 @@ from scripts.native_eval.fleet import (
     FleetError,
     Lease,
     LeaseNotReadyError,
+    LeaseUnavailableError,
     SubprocessExecutor,
     parse_args,
 )
@@ -114,6 +115,29 @@ def test_subprocess_timeout_output_is_normalized_to_text(
     assert result.returncode == 124
     assert result.stdout == "partial stdout"
     assert result.stderr == "partial stderr"
+
+
+def test_optional_inspect_treats_stopped_lease_as_absent(tmp_path: Path) -> None:
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={})
+    executor.leases["cbx_stopped"] = {
+        "id": "cbx_stopped",
+        "slug": "stopped",
+        "state": "stopped",
+        "ready": False,
+        "serverType": "c7a.24xlarge",
+        "sshHost": "",
+        "sshUser": "crabbox",
+        "sshPort": "22",
+        "sshKey": "/tmp/cbx_stopped.key",
+    }
+    controller = FleetController(config, executor=executor)
+
+    assert controller._inspect_lease("cbx_stopped", required=False) is None
+    with pytest.raises(LeaseUnavailableError):
+        controller._inspect_lease("cbx_stopped", required=True)
 
 
 def _write_archive(path: Path) -> None:

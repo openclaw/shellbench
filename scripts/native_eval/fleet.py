@@ -703,10 +703,15 @@ class FleetController:
             value = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise FleetError(f"invalid Crabbox inspect JSON for {identifier}") from exc
-        lease = Lease.from_inspect(
-            value,
-            region=region_hint or self.config.region,
-        )
+        try:
+            lease = Lease.from_inspect(
+                value,
+                region=region_hint or self.config.region,
+            )
+        except LeaseUnavailableError:
+            if required:
+                raise
+            return None
         return self._detect_region(lease)
 
     def _ssh_reachable(self, lease: Lease) -> bool:
