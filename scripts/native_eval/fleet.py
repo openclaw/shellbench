@@ -286,6 +286,7 @@ class FleetController:
         self.runner_archive_sha256 = ""
         self.task_archive_sha256 = ""
         self.crabbox_cli_version = ""
+        self._dispatch_lock = threading.Lock()
 
     def run(self) -> int:
         self._prepare_local_layout()
@@ -502,7 +503,8 @@ class FleetController:
             if remote_state == "missing":
                 if self._local_artifacts(run.run_label):
                     raise FleetError("local artifacts exist but the remote run state is missing")
-                self._hydrate_lease(lease)
+                if not entry.get("bootstrapped_at_utc"):
+                    self._hydrate_lease(lease)
                 self._dispatch(lease, run)
             elif remote_state == "stale":
                 raise FleetError("remote run state is stale and cannot be overwritten")
@@ -557,6 +559,12 @@ class FleetController:
     def _ensure_lease(self, entry: dict[str, Any]) -> Lease:
         lease_value = entry.get("lease")
         if lease_value:
+            try:
+                stored = Lease.from_manifest(lease_value)
+            except FleetError:
+                stored = None
+            if stored is not None and self._ssh_reachable(stored):
+                return self._detect_region(stored)
             identifier = str(lease_value["id"])
             try:
                 return self._inspect_lease(
@@ -565,7 +573,8 @@ class FleetController:
                     region_hint=str(lease_value.get("region") or ""),
                 )
             except LeaseNotReadyError:
-                stored = Lease.from_manifest(lease_value)
+                if stored is None:
+                    stored = Lease.from_manifest(lease_value)
                 if self._ssh_reachable(stored):
                     return self._detect_region(stored)
                 raise
@@ -667,11 +676,17 @@ class FleetController:
         return self._detect_region(lease)
 
     def _ssh_reachable(self, lease: Lease) -> bool:
-        result = self.executor.run(
-            self._ssh_command(lease, ["true"]),
-            capture_output=True,
-        )
-        return result.returncode == 0
+        with self._dispatch_lock:
+            for attempt in range(1, 5):
+                result = self.executor.run(
+                    self._ssh_command(lease, ["true"]),
+                    capture_output=True,
+                )
+                if result.returncode == 0:
+                    return True
+                if attempt < 4:
+                    time.sleep(attempt * 5)
+        return False
 
     def _detect_region(self, lease: Lease) -> Lease:
         script = """
@@ -885,35 +900,54 @@ printf '%s\n' "$pid"
         judge_reasoning_effort = str(
             entry.get("judge_reasoning_effort") or reasoning_effort
         )
-        self._checked(
-            self._ssh_command(
-                lease,
-                [
-                    "bash",
-                    "-c",
-                    script,
-                    "fleet-dispatch",
-                    self.config.remote_root,
-                    run.run_label,
-                    self.crabbox_cli_version,
-                    lease.slug,
-                    lease.lease_id,
-                    lease.instance_type,
-                    lease.host,
-                    lease.region,
-                    self.runner_commit,
-                    self.config.harbor_reference_commit,
-                    self.config.judge_model_id,
-                    self.config.execution_mode,
-                    reasoning_effort,
-                    judge_reasoning_effort,
-                    str(self.config.parity_validated).lower(),
-                    *args,
-                ],
-            ),
-            capture_output=True,
-            description=f"dispatch {run.run_label}",
+        command = self._ssh_command(
+            lease,
+            [
+                "bash",
+                "-c",
+                script,
+                "fleet-dispatch",
+                self.config.remote_root,
+                run.run_label,
+                self.crabbox_cli_version,
+                lease.slug,
+                lease.lease_id,
+                lease.instance_type,
+                lease.host,
+                lease.region,
+                self.runner_commit,
+                self.config.harbor_reference_commit,
+                self.config.judge_model_id,
+                self.config.execution_mode,
+                reasoning_effort,
+                judge_reasoning_effort,
+                str(self.config.parity_validated).lower(),
+                *args,
+            ],
         )
+        with self._dispatch_lock:
+            for attempt in range(1, 5):
+                result = self.executor.run(command, capture_output=True)
+                if result.returncode == 0:
+                    break
+                detail = (result.stderr or result.stdout or "").strip()
+                retryable = result.returncode == 255 and any(
+                    marker in detail.lower()
+                    for marker in (
+                        "operation timed out",
+                        "connection timed out",
+                        "connection refused",
+                        "connection closed",
+                        "banner exchange",
+                    )
+                )
+                if not retryable or attempt == 4:
+                    suffix = f": {detail[:500]}" if detail else ""
+                    raise FleetError(
+                        f"dispatch {run.run_label} failed with exit "
+                        f"{result.returncode}{suffix}"
+                    )
+                time.sleep(attempt * 5)
         self._store.update(
             run.run_label,
             dispatched_at_utc=utc_now(),

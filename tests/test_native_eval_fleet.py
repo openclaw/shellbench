@@ -114,6 +114,7 @@ class FakeExecutor:
         stop_code: int = 0,
         inspect_errors: set[str] | None = None,
         warmup_capacity_failures: dict[str, int] | None = None,
+        dispatch_failures: dict[str, int] | None = None,
     ) -> None:
         self.local_root = local_root
         self.expected_counts = expected_counts
@@ -124,7 +125,9 @@ class FakeExecutor:
         self.stop_code = stop_code
         self.inspect_errors = inspect_errors or set()
         self.warmup_capacity_failures = warmup_capacity_failures or {}
+        self.dispatch_failures = dispatch_failures or {}
         self.warmup_attempts: dict[str, int] = {}
+        self.dispatch_attempts: dict[str, int] = {}
         self.leases: dict[str, dict[str, object]] = {}
         self.commands: list[list[str]] = []
         self.events: list[tuple[str, str]] = []
@@ -253,6 +256,14 @@ class FakeExecutor:
             dispatch_marker = remote_command.index("fleet-dispatch")
             remote_run_args = remote_command[dispatch_marker + 16 :]
             with self._dispatch_condition:
+                attempt = self.dispatch_attempts.get(label, 0) + 1
+                self.dispatch_attempts[label] = attempt
+                if attempt <= self.dispatch_failures.get(label, 0):
+                    return _result(
+                        argv,
+                        255,
+                        stderr="ssh: connect to host 192.0.2.1 port 22: Operation timed out",
+                    )
                 self.dispatches.append(label)
                 self.dispatch_concurrency[label] = int(remote_run_args[10])
                 self.dispatch_arguments[label] = remote_run_args
@@ -398,6 +409,23 @@ def test_controller_dispatches_targeted_repair_tasks_with_lineage(
     dispatched = executor.dispatch_arguments[label]
     assert dispatched[15] == run["rerun_of_canonical_run"]
     assert dispatched[16:] == ["task-a", "task-b"]
+
+
+def test_controller_retries_transient_dispatch_timeout(tmp_path: Path) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [_planned(_run_spec(label))])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={label: 2},
+        dispatch_failures={label: 1},
+    )
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    assert executor.dispatch_attempts[label] == 2
+    assert executor.dispatches == [label]
 
 
 def test_controller_rejects_task_subset_without_canonical_parent(
