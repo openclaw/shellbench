@@ -10,7 +10,7 @@ from typing import Sequence
 
 import pytest
 
-from scripts.native_eval.fleet import FleetConfig, FleetController, parse_args
+from scripts.native_eval.fleet import FleetConfig, FleetController, FleetError, parse_args
 from scripts.native_eval.models import RunSpec
 
 
@@ -376,6 +376,43 @@ def test_controller_accepts_xhigh_reasoning_effort(tmp_path: Path) -> None:
     assert completed["status"] == "completed"
     assert completed["reasoning_effort"] == "xhigh"
     assert completed["judge_reasoning_effort"] == "high"
+
+
+def test_controller_dispatches_targeted_repair_tasks_with_lineage(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-low-full-116-r1-20260728-repairtasks1"
+    run = _planned(_run_spec(label, expected_task_count=2))
+    run["task_names"] = ["task-a", "task-b"]
+    run["rerun_of_canonical_run"] = (
+        "openclaw-gpt55-low-full-116-r1-20260728-runnerd676-lifecyclefix1"
+    )
+    run["repair_classifications"] = ["infra", "agent_exit"]
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run], expected_task_count=116)
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    dispatched = executor.dispatch_arguments[label]
+    assert dispatched[15] == run["rerun_of_canonical_run"]
+    assert dispatched[16:] == ["task-a", "task-b"]
+
+
+def test_controller_rejects_task_subset_without_canonical_parent(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-low-full-116-r1-20260728-repairtasks1"
+    run = _planned(_run_spec(label, expected_task_count=1))
+    run["task_names"] = ["task-a"]
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run], expected_task_count=116)
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 1})
+
+    with pytest.raises(FleetError, match="task subset lacks rerun_of_canonical_run"):
+        FleetController(config, executor=executor).run()
 
 
 def test_capacity_warmup_retries_same_run_without_recovery_churn(

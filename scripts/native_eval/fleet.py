@@ -340,12 +340,30 @@ class FleetController:
             (self.config.local_root / relative).mkdir(parents=True, exist_ok=True)
 
     def _validate_plan(self) -> None:
-        expected = int(self._store.data["expected_task_count"])
+        suite_expected = int(self._store.data["expected_task_count"])
         for entry in self._store.all_entries():
             run = self._run_spec(entry)
+            task_names = entry.get("task_names")
+            if task_names is None:
+                expected = suite_expected
+            elif not isinstance(task_names, list) or not all(
+                isinstance(name, str) and name for name in task_names
+            ):
+                raise FleetError(
+                    f"{run.run_label} task_names must be a list of non-empty strings"
+                )
+            elif len(set(task_names)) != len(task_names):
+                raise FleetError(f"{run.run_label} task_names contains duplicates")
+            else:
+                expected = len(task_names)
+                if not entry.get("rerun_of_canonical_run"):
+                    raise FleetError(
+                        f"{run.run_label} task subset lacks rerun_of_canonical_run"
+                    )
             if run.expected_task_count != expected:
                 raise FleetError(
-                    f"{run.run_label} expects {run.expected_task_count}, index expects {expected}"
+                    f"{run.run_label} expects {run.expected_task_count} tasks, "
+                    f"plan selects {expected}"
                 )
             if run.provider == "openai":
                 reasoning_effort = str(entry.get("reasoning_effort") or "")
@@ -843,6 +861,7 @@ sleep 1
 kill -0 "$pid"
 printf '%s\n' "$pid"
 """
+        entry = self._store.get(run.run_label)
         args = [
             self.config.remote_root,
             f"{self.config.remote_root}/public-tasks/combined tasks/tasks",
@@ -859,8 +878,9 @@ printf '%s\n' "$pid"
             run.model_id,
             run.provider,
             run.proxy_model_name,
+            str(entry.get("rerun_of_canonical_run") or ""),
+            *[str(name) for name in entry.get("task_names") or []],
         ]
-        entry = self._store.get(run.run_label)
         reasoning_effort = str(entry.get("reasoning_effort") or "")
         judge_reasoning_effort = str(
             entry.get("judge_reasoning_effort") or reasoning_effort
@@ -1237,6 +1257,13 @@ printf '%s\n' "$pid"
             "artifacts": [],
             "created_at_utc": utc_now(),
         }
+        for metadata_field in (
+            "task_names",
+            "rerun_of_canonical_run",
+            "repair_classifications",
+        ):
+            if metadata_field in entry:
+                rerun[metadata_field] = copy.deepcopy(entry[metadata_field])
         self._store.append(rerun)
         return label
 

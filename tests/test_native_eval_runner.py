@@ -7,6 +7,7 @@ import sys
 import tarfile
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts.native_eval.checkpoint_loop import (
     count_result_json,
@@ -209,6 +210,45 @@ def test_run_manifest_records_native_audit_metadata(
     assert manifest["provider_model_id"] == "gpt-5.5"
     assert manifest["reasoning_effort"] == "high"
     assert manifest["judge_reasoning_effort"] == "high"
+    assert manifest["repair_mode"] is False
+    assert manifest["rerun_of_canonical_run"] is None
+    assert manifest["repair_task_names"] == []
+
+
+def test_run_manifest_records_targeted_repair_lineage(tmp_path: Path) -> None:
+    run = RunSpec(
+        run_label="openclaw-gpt55-low-full-116-r1-parent-targetedfix1",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=2,
+        run_date="20260728",
+    )
+    tasks = [
+        SimpleNamespace(name="task-a", path=tmp_path / "task-a", checksum="a"),
+        SimpleNamespace(name="task-b", path=tmp_path / "task-b", checksum="b"),
+    ]
+
+    manifest = _run_manifest(
+        run,
+        public_tasks_commit="tasks-commit",
+        task_suite_path="combined tasks/tasks",
+        concurrency=2,
+        started_at="2026-07-28T00:00:00Z",
+        tasks_root=tmp_path,
+        tasks=tasks,
+        rerun_of_canonical_run="openclaw-gpt55-low-full-116-r1-parent",
+    )
+
+    assert manifest["repair_mode"] is True
+    assert manifest["rerun_of_canonical_run"] == (
+        "openclaw-gpt55-low-full-116-r1-parent"
+    )
+    assert manifest["repair_task_names"] == ["task-a", "task-b"]
 
 
 def test_run_spec_preserves_explicit_planned_identity() -> None:

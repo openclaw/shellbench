@@ -32,6 +32,7 @@ async def run_job(
     proxy_key: str,
     concurrency: int,
     task_names: set[str] | None = None,
+    rerun_of_canonical_run: str | None = None,
 ) -> dict[str, Any]:
     tasks = validate_suite(tasks_root)
     if task_names:
@@ -60,6 +61,7 @@ async def run_job(
         started_at=started_at,
         tasks_root=tasks_root,
         tasks=tasks,
+        rerun_of_canonical_run=rerun_of_canonical_run,
     )
     atomic_write_json(job_dir / "run_manifest.json", manifest)
     atomic_write_json(
@@ -201,6 +203,7 @@ def _run_manifest(
     started_at: str,
     tasks_root: Path,
     tasks: list[TaskSpec],
+    rerun_of_canonical_run: str | None = None,
 ) -> dict[str, Any]:
     return {
         "run_label": run.run_label,
@@ -223,6 +226,11 @@ def _run_manifest(
             }
             for task in tasks
         ],
+        "repair_mode": rerun_of_canonical_run is not None,
+        "rerun_of_canonical_run": rerun_of_canonical_run,
+        "repair_task_names": (
+            [task.name for task in tasks] if rerun_of_canonical_run else []
+        ),
         "task_concurrency": concurrency,
         "agent_concurrency": concurrency,
         "provider": "aws",
@@ -336,6 +344,7 @@ def parse_args() -> argparse.Namespace:
         dest="task_names",
         help="Run only the named task. Repeat for multiple tasks.",
     )
+    parser.add_argument("--rerun-of-canonical-run")
     return parser.parse_args()
 
 
@@ -354,6 +363,7 @@ def main() -> None:
             proxy_key=proxy_key,
             concurrency=args.concurrency,
             task_names=set(args.task_names or []),
+            rerun_of_canonical_run=args.rerun_of_canonical_run,
         )
     )
     print(json.dumps(state, indent=2))
