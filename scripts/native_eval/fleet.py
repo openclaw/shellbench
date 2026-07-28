@@ -326,6 +326,7 @@ class FleetController:
         self.task_archive_sha256 = ""
         self.crabbox_cli_version = ""
         self._dispatch_lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
 
     def run(self) -> int:
         self._prepare_local_layout()
@@ -1239,7 +1240,7 @@ printf '%s\n' "$pid"
         except FleetError:
             lease_still_exists = True
         if lease_still_exists:
-            with self._dispatch_lock:
+            with self._cleanup_lock:
                 if isinstance(self.executor, SubprocessExecutor):
                     stop = self.executor.run_with_timeout(
                         stop_command,
