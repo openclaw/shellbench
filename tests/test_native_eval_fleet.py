@@ -10,7 +10,15 @@ from typing import Sequence
 
 import pytest
 
-from scripts.native_eval.fleet import FleetConfig, FleetController, FleetError, parse_args
+from scripts.native_eval.fleet import (
+    FleetConfig,
+    FleetController,
+    FleetError,
+    Lease,
+    LeaseNotReadyError,
+    SubprocessExecutor,
+    parse_args,
+)
 from scripts.native_eval.models import RunSpec
 
 
@@ -68,6 +76,44 @@ def _planned(run: RunSpec) -> dict[str, object]:
         "lease": None,
         "artifacts": [],
     }
+
+
+def test_provisioning_lease_is_not_ready_before_ssh_details_exist() -> None:
+    with pytest.raises(LeaseNotReadyError, match="provisioning but not ready"):
+        Lease.from_inspect(
+            {
+                "id": "cbx_pending",
+                "slug": "sb-native-pending",
+                "state": "provisioning",
+                "ready": False,
+                "sshHost": "",
+            },
+            region="eu-west-1",
+        )
+
+
+def test_subprocess_timeout_output_is_normalized_to_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def timeout(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise subprocess.TimeoutExpired(
+            ["crabbox", "stop"],
+            45,
+            output=b"partial stdout",
+            stderr=b"partial stderr",
+        )
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    result = SubprocessExecutor().run_with_timeout(
+        ["crabbox", "stop"],
+        capture_output=True,
+        timeout=45,
+    )
+
+    assert result.returncode == 124
+    assert result.stdout == "partial stdout"
+    assert result.stderr == "partial stderr"
 
 
 def _write_archive(path: Path) -> None:

@@ -74,6 +74,36 @@ class SubprocessExecutor:
             stderr=subprocess.PIPE if capture_output else None,
         )
 
+    def run_with_timeout(
+        self,
+        command: Sequence[str],
+        *,
+        capture_output: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                list(command),
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE if capture_output else None,
+                stderr=subprocess.PIPE if capture_output else None,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or f"timed out after {timeout:g}s"
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode(errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+            return subprocess.CompletedProcess(
+                list(command),
+                124,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
 
 class FleetError(RuntimeError):
     pass
@@ -104,14 +134,17 @@ class Lease:
 
     @classmethod
     def from_inspect(cls, value: dict[str, Any], *, region: str) -> Lease:
+        state = str(value.get("state") or "")
+        if not value.get("ready") and state in {"active", "provisioning"}:
+            lease_id = value.get("id") or value.get("slug") or "unknown"
+            raise LeaseNotReadyError(f"lease {lease_id} is {state} but not ready")
+        if state != "active":
+            lease_id = value.get("id") or value.get("slug") or "unknown"
+            raise LeaseUnavailableError(f"lease {lease_id} is no longer active")
         required = ("id", "slug", "sshHost", "sshUser", "sshPort", "sshKey")
         missing = [field for field in required if not value.get(field)]
         if missing:
             raise FleetError(f"Crabbox inspect omitted fields: {', '.join(missing)}")
-        if value.get("state") != "active":
-            raise LeaseUnavailableError(f"lease {value['id']} is no longer active")
-        if not value.get("ready"):
-            raise LeaseNotReadyError(f"lease {value['id']} is active but not ready")
         return cls(
             lease_id=str(value["id"]),
             slug=str(value["slug"]),
@@ -1159,18 +1192,43 @@ printf '%s\n' "$pid"
                         "checkpoint final event after remote done"
                     ),
                 }
-        stop = self.executor.run(
-            [
-                self.config.crabbox_bin,
-                "stop",
-                "--provider",
-                "aws",
-                "--id",
-                str(lease_value["id"]),
-            ],
-            capture_output=True,
+        stop_command = [
+            self.config.crabbox_bin,
+            "stop",
+            "--provider",
+            "aws",
+            "--id",
+            str(lease_value["id"]),
+        ]
+        try:
+            lease_still_exists = (
+                self._inspect_lease(
+                    str(lease_value["id"]),
+                    required=False,
+                    region_hint=str(lease_value.get("region") or ""),
+                )
+                is not None
+            )
+        except FleetError:
+            lease_still_exists = True
+        if lease_still_exists:
+            with self._dispatch_lock:
+                if isinstance(self.executor, SubprocessExecutor):
+                    stop = self.executor.run_with_timeout(
+                        stop_command,
+                        capture_output=True,
+                        timeout=45,
+                    )
+                else:
+                    stop = self.executor.run(stop_command, capture_output=True)
+        else:
+            stop = subprocess.CompletedProcess(stop_command, 0, stdout="", stderr="")
+        stop_detail = (stop.stderr or stop.stdout or "").strip().lower()
+        already_stopped = any(
+            marker in stop_detail
+            for marker in ("not found", "not_found", "http 404", "already stopped")
         )
-        if stop.returncode:
+        if stop.returncode and not already_stopped:
             self._store.update(
                 run.run_label,
                 status="stop_pending",
