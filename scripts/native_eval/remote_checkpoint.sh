@@ -34,14 +34,15 @@ mkdir -p \
   "$SNAPSHOT_DIR/shellbench_meta-$RUN_LABEL"
 
 if [[ -d "$JOB_DIR" ]]; then
-  rsync -a --exclude '*.tmp' "$JOB_DIR/" \
+  sudo rsync -a --exclude '*.tmp' "$JOB_DIR/" \
     "$SNAPSHOT_DIR/results/jobs/$RUN_LABEL/"
 fi
 if [[ -d "$PROXY_DIR" ]]; then
   mkdir -p "$SNAPSHOT_DIR/proxy/$RUN_LABEL"
-  rsync -a --exclude '*.tmp' "$PROXY_DIR/" \
+  sudo rsync -a --exclude '*.tmp' "$PROXY_DIR/" \
     "$SNAPSHOT_DIR/proxy/$RUN_LABEL/"
 fi
+sudo chown -R "$(id -u):$(id -g)" "$SNAPSHOT_DIR"
 if [[ -d "$ROOT/run-logs" ]]; then
   mkdir -p "$SNAPSHOT_DIR/run-logs"
   for suffix in stdout stderr; do

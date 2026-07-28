@@ -161,6 +161,7 @@ for suffix in stdout stderr; do
   fi
 done
 ARCHIVE_ITEMS+=(-C /tmp "shellbench_meta-$RUN_LABEL")
-tar -czf "/tmp/$RUN_LABEL-final-artifacts.tar.gz" "${ARCHIVE_ITEMS[@]}"
+sudo tar -czf "/tmp/$RUN_LABEL-final-artifacts.tar.gz" "${ARCHIVE_ITEMS[@]}"
+sudo chown "$(id -u):$(id -g)" "/tmp/$RUN_LABEL-final-artifacts.tar.gz"
 
 exit "$RUN_STATUS"

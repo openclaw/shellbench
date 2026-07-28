@@ -8,6 +8,7 @@
   reruns, and stabilize OpenClaw and Hermes trace completion.
 - Export OpenClaw and Hermes sessions reliably and convert their native traces
   to Harbor-compatible ATIF trajectories with canonical model identity.
+- Preserve restricted harness trace files in checkpoint and final archives.
 - Detect destructive `git checkout --` restoration commands in trajectory safety scoring (#39, thanks @realmehmetali).
 
 ### Added
