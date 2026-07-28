@@ -13,6 +13,8 @@
   native model identity and trajectory coverage.
 - Keep Codex stderr diagnostics out of JSONL traces and recover known
   diagnostics from previously combined streams.
+- Reattach active AWS leases through their recorded SSH endpoint when Crabbox
+  readiness probing is stale.
 - Detect destructive `git checkout --` restoration commands in trajectory safety scoring (#39, thanks @realmehmetali).
 
 ### Added

@@ -83,6 +83,10 @@ class LeaseUnavailableError(FleetError):
     pass
 
 
+class LeaseNotReadyError(FleetError):
+    pass
+
+
 @dataclass(frozen=True)
 class Lease:
     lease_id: str
@@ -107,7 +111,7 @@ class Lease:
         if value.get("state") != "active":
             raise LeaseUnavailableError(f"lease {value['id']} is no longer active")
         if not value.get("ready"):
-            raise FleetError(f"lease {value['id']} is active but not ready")
+            raise LeaseNotReadyError(f"lease {value['id']} is active but not ready")
         return cls(
             lease_id=str(value["id"]),
             slug=str(value["slug"]),
@@ -117,6 +121,23 @@ class Lease:
             identity_file=Path(str(value["sshKey"])),
             instance_type=str(value.get("serverType") or ""),
             region=region,
+        )
+
+    @classmethod
+    def from_manifest(cls, value: dict[str, Any]) -> Lease:
+        required = ("id", "slug", "host", "ssh_user", "ssh_port", "identity_file")
+        missing = [field for field in required if not value.get(field)]
+        if missing:
+            raise FleetError(f"stored lease omitted fields: {', '.join(missing)}")
+        return cls(
+            lease_id=str(value["id"]),
+            slug=str(value["slug"]),
+            host=str(value["host"]),
+            user=str(value["ssh_user"]),
+            port=int(value["ssh_port"]),
+            identity_file=Path(str(value["identity_file"])),
+            instance_type=str(value.get("instance_type") or ""),
+            region=str(value.get("region") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -519,11 +540,17 @@ class FleetController:
         lease_value = entry.get("lease")
         if lease_value:
             identifier = str(lease_value["id"])
-            return self._inspect_lease(
-                identifier,
-                required=True,
-                region_hint=str(lease_value.get("region") or ""),
-            )
+            try:
+                return self._inspect_lease(
+                    identifier,
+                    required=True,
+                    region_hint=str(lease_value.get("region") or ""),
+                )
+            except LeaseNotReadyError:
+                stored = Lease.from_manifest(lease_value)
+                if self._ssh_reachable(stored):
+                    return self._detect_region(stored)
+                raise
 
         slug = str(entry.get("requested_lease_slug") or self._lease_slug(entry["run_label"]))
         self._store.update(
@@ -620,6 +647,13 @@ class FleetController:
             region=region_hint or self.config.region,
         )
         return self._detect_region(lease)
+
+    def _ssh_reachable(self, lease: Lease) -> bool:
+        result = self.executor.run(
+            self._ssh_command(lease, ["true"]),
+            capture_output=True,
+        )
+        return result.returncode == 0
 
     def _detect_region(self, lease: Lease) -> Lease:
         script = """
