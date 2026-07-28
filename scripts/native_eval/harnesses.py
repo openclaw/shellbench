@@ -99,11 +99,24 @@ def _openclaw(
     )
     run_command = (
         f"export PATH={_base_path()}; export HOME={home}; "
+        "log=/logs/agent/openclaw.txt; "
         "openclaw agent --local --json --agent main --thinking off "
         f"--model {shlex.quote(model)} "
         "--message \"$(cat /tmp/shellbench-instruction.md)\" "
-        ">/logs/agent/openclaw.txt 2>&1 </dev/null; status=$?; "
-        "cat /logs/agent/openclaw.txt; exit \"$status\""
+        ">\"$log\" 2>&1 </dev/null & pid=$!; "
+        "while kill -0 \"$pid\" 2>/dev/null; do "
+        "if grep -Eq \"\\[agents/agent-command\\] \\[agent\\] run .* "
+        "ended with stopReason=\" \"$log\"; then "
+        "sleep 2; kill \"$pid\" 2>/dev/null || true; sleep 1; "
+        "kill -KILL \"$pid\" 2>/dev/null || true; "
+        "for f in /proc/[0-9]*/comm; do "
+        "name=$(cat \"$f\" 2>/dev/null || true); "
+        "case \"$name\" in openclaw-agent|\"npm exec chrome\"|chrome-devtools) "
+        "child=${f#/proc/}; child=${child%/comm}; "
+        "kill -KILL \"$child\" 2>/dev/null || true;; esac; done; "
+        "wait \"$pid\" 2>/dev/null || true; cat \"$log\"; exit 0; "
+        "fi; sleep 1; done; "
+        "wait \"$pid\"; status=$?; cat \"$log\"; exit \"$status\""
     )
     cleanup = (
         "python3 - <<'PY'\n"
@@ -189,8 +202,12 @@ def _hermes(
     )
     cleanup = (
         f"export PATH={_base_path()}; export HERMES_HOME={home}; "
+        "session_id=$(sed -n 's/^session_id: //p' "
+        "/logs/agent/hermes.txt | tail -1); "
+        "if [ -n \"$session_id\" ]; then "
         "hermes sessions export /logs/agent/hermes-session.jsonl "
-        "--source cli 2>/dev/null || true"
+        "--session-id \"$session_id\" --yes --redact; "
+        "fi"
     )
     return HarnessCommand(
         setup_command=setup,

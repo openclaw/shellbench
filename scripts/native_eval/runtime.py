@@ -31,6 +31,10 @@ class AgentSetupTimeoutError(NativeEvalError):
     pass
 
 
+class AgentSetupError(NativeEvalError):
+    pass
+
+
 class NonZeroAgentExitCodeError(NativeEvalError):
     pass
 
@@ -215,7 +219,26 @@ class DockerTaskEnvironment:
                 self.container_id,
             ]
         )
-        self.workdir = output.strip() or "/app"
+        configured = output.strip()
+        if configured:
+            self.workdir = configured
+            return
+        self.workdir = (
+            await capture_process(
+                [
+                    "docker",
+                    "exec",
+                    self.container_id,
+                    "sh",
+                    "-lc",
+                    (
+                        "if [ -d /app ]; then printf /app; "
+                        "elif [ -d /workspace ]; then printf /workspace; "
+                        "else pwd; fi"
+                    ),
+                ]
+            )
+        ).strip() or "/"
 
     async def copy_instruction(self, instruction: str) -> None:
         local = self.trial_dir / "instruction.md"
@@ -444,7 +467,7 @@ async def run_trial(
                 stderr_path=trial_dir / "agent" / "setup-stderr.txt",
             )
             if setup.returncode:
-                raise NativeEvalError(f"Agent setup exited {setup.returncode}")
+                raise AgentSetupError(f"Agent setup exited {setup.returncode}")
         except TimeoutError as exc:
             raise AgentSetupTimeoutError("Agent setup timed out after 300s") from exc
         finally:

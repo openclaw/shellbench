@@ -20,6 +20,8 @@ def _write_run(
     model_slug: str = "model",
     native: bool = False,
     parity_validated: bool = False,
+    leaderboard_eligible: bool | None = None,
+    exclusion_reason: str = "",
 ) -> None:
     run_dir = jobs_root / "jobs" / run_label
     run_dir.mkdir(parents=True)
@@ -41,6 +43,9 @@ def _write_run(
         )
     if pair_label is not None:
         manifest["pair_label"] = pair_label
+    if leaderboard_eligible is not None:
+        manifest["leaderboard_eligible"] = leaderboard_eligible
+        manifest["exclusion_reason"] = exclusion_reason
     if tasks is not None:
         manifest["tasks"] = tasks
     (run_dir / "run_manifest.json").write_text(json.dumps(manifest))
@@ -285,6 +290,40 @@ def test_native_run_requires_parity_validation_for_leaderboard(tmp_path: Path):
 
     assert report["runs"][0]["eligible"] is False
     assert report["runs"][0]["exclusion_reason"] == "parity_not_validated"
+
+
+def test_manifest_can_explicitly_exclude_complete_run(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "openclaw-gpt55-rerun1",
+        expected_task_count=1,
+        results=[_result("a", reward=1.0)],
+        leaderboard_eligible=False,
+        exclusion_reason="manual_intervention",
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    assert report["runs"][0]["eligible"] is False
+    assert report["runs"][0]["exclusion_reason"] == "manual_intervention"
+
+
+def test_agent_setup_error_is_classified_as_infrastructure(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "openclaw-gpt55-setup-failure",
+        expected_task_count=1,
+        results=[_result("a", exception_type="AgentSetupError")],
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    assert report["runs"][0]["infra"] == 1
+    assert report["runs"][0]["agent_exits"] == 0
 
 
 def test_unknown_exception_is_agent_exit_and_gateway_signature_is_excluded(
