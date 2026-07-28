@@ -161,8 +161,16 @@ def test_done_final_copy_failure_logs_recovery_event(
     def fail_final(**_kwargs: object) -> int:
         raise subprocess.CalledProcessError(1, ["scp"])
 
+    diagnostic_checkpoints: list[int] = []
+
+    def pull_diagnostic(**kwargs: object) -> int:
+        diagnostic_checkpoints.append(int(kwargs["sequence"]))
+        return 0
+
     monkeypatch.setattr(checkpoint_loop, "pull_final", fail_final)
+    monkeypatch.setattr(checkpoint_loop, "pull_checkpoint", pull_diagnostic)
 
     assert checkpoint_loop.run_loop(args) == 75
+    assert diagnostic_checkpoints == [1]
     log_path = tmp_path / "logs" / f"{run_label}.checkpoints.log"
     assert "\tfinal_error\t" in log_path.read_text(encoding="utf-8")
