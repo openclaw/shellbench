@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shlex
 import subprocess
@@ -29,10 +30,11 @@ def _run_spec(
     expected_task_count: int = 2,
     model_slug: str = "gpt55",
     repetition: int = 1,
+    harness: str = "openclaw",
 ) -> RunSpec:
     return RunSpec(
         run_label=label,
-        harness="openclaw",
+        harness=harness,
         harness_version="test",
         model_slug=model_slug,
         model_id=f"provider/{model_slug}",
@@ -241,6 +243,31 @@ def _write_archive(path: Path) -> None:
     (source / "marker.txt").write_text("pinned", encoding="utf-8")
     with tarfile.open(path, "w:gz") as handle:
         handle.add(source, arcname=".")
+
+
+def _write_openclaw_package(
+    path: Path,
+    *,
+    name: str = "openclaw",
+    version: str = "test",
+    marker: str | None = None,
+) -> dict[str, str]:
+    source = path.parent / f"{path.stem}-package"
+    package_root = source / "package"
+    package_root.mkdir(parents=True)
+    (package_root / "package.json").write_text(
+        json.dumps({"name": name, "version": version, "candidate_marker": marker}),
+        encoding="utf-8",
+    )
+    with tarfile.open(path, "w:gz") as handle:
+        handle.add(package_root, arcname="package")
+    return {
+        "source_kind": "npm_tarball",
+        "package_name": "openclaw",
+        "package_version": version,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "artifact_filename": "openclaw-candidate.tgz",
+    }
 
 
 def _write_final(
@@ -500,6 +527,7 @@ def _config(
     warmup_capacity_attempts: int = 12,
     warmup_capacity_backoff_seconds: float = 0,
     parity_validated_routes: frozenset[tuple[str, str]] = frozenset(),
+    openclaw_package_tarball: Path | None = None,
 ) -> FleetConfig:
     runner_archive = tmp_path / "runner.tar.gz"
     task_archive = tmp_path / "tasks.tar.gz"
@@ -515,6 +543,7 @@ def _config(
         runner_commit="runner-commit",
         task_archive=task_archive,
         env_file=env_file,
+        openclaw_package_tarball=openclaw_package_tarball,
         max_leases=max_leases,
         max_attempts=max_attempts,
         task_concurrency=task_concurrency,
@@ -526,6 +555,189 @@ def _config(
         warmup_capacity_backoff_seconds=warmup_capacity_backoff_seconds,
         parity_validated_routes=parity_validated_routes,
     )
+
+
+def test_candidate_package_is_validated_staged_and_bootstrapped(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [_planned(_run_spec(label))])
+    package = tmp_path / "private-build-name.tgz"
+    identity = _write_openclaw_package(package)
+    config = _config(
+        tmp_path,
+        run_index,
+        openclaw_package_tarball=package,
+    )
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    staged = config.local_root / "manifests" / "openclaw-candidate.tgz"
+    assert staged.read_bytes() == package.read_bytes()
+    assert json.loads(
+        (config.local_root / "manifests" / "openclaw_package.json").read_text()
+    ) == identity
+    index = json.loads(run_index.read_text(encoding="utf-8"))
+    assert index["fleet"]["openclaw_package"] == identity
+    assert index["runs"][0]["openclaw_package"] == identity
+    assert str(package.resolve()) not in json.dumps(index)
+    scp_commands = [command for command in executor.commands if command[0] == "scp"]
+    candidate_scp = next(
+        command for command in scp_commands if "openclaw-candidate.tgz" in command[-1]
+    )
+    assert candidate_scp[-2] == str(staged)
+    bootstrap = next(
+        command
+        for command in executor.commands
+        if command[0] == "ssh" and "OPENCLAW_PACKAGE_TARBALL" in command[-1]
+    )
+    assert identity["sha256"] in bootstrap[-1]
+    assert identity["package_version"] in bootstrap[-1]
+    assert "TOPSECRET" not in bootstrap[-1]
+
+
+def test_candidate_package_rejects_wrong_npm_identity_before_leasing(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [_planned(_run_spec(label))])
+    package = tmp_path / "wrong.tgz"
+    _write_openclaw_package(package, name="not-openclaw")
+    config = _config(
+        tmp_path,
+        run_index,
+        openclaw_package_tarball=package,
+    )
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    with pytest.raises(FleetError, match="name=openclaw"):
+        FleetController(config, executor=executor).run()
+    assert not any(command[:2] == ["crabbox", "warmup"] for command in executor.commands)
+
+
+def test_candidate_package_rejects_non_openclaw_run_index_before_leasing(
+    tmp_path: Path,
+) -> None:
+    label = "codex-gpt55-full-2-r1-20260727"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(
+        run_index,
+        [_planned(_run_spec(label, harness="codex"))],
+    )
+    package = tmp_path / "candidate.tgz"
+    _write_openclaw_package(package)
+    config = _config(
+        tmp_path,
+        run_index,
+        openclaw_package_tarball=package,
+    )
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    with pytest.raises(FleetError, match="OpenClaw-only"):
+        FleetController(config, executor=executor).run()
+    assert not any(command[:2] == ["crabbox", "warmup"] for command in executor.commands)
+
+
+def test_candidate_package_rejects_planned_harness_version_mismatch(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = _planned(_run_spec(label))
+    run["harness_version"] = "2026.7.28"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    package = tmp_path / "candidate.tgz"
+    _write_openclaw_package(package, version="2026.7.29")
+    config = _config(
+        tmp_path,
+        run_index,
+        openclaw_package_tarball=package,
+    )
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    with pytest.raises(FleetError, match="does not match planned harness_version"):
+        FleetController(config, executor=executor).run()
+    assert not any(command[:2] == ["crabbox", "warmup"] for command in executor.commands)
+
+
+def test_candidate_package_resume_rejects_changed_identity(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = _planned(_run_spec(label))
+    original = tmp_path / "original.tgz"
+    original_identity = _write_openclaw_package(original)
+    run["openclaw_package"] = original_identity
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    index = json.loads(run_index.read_text(encoding="utf-8"))
+    index["fleet"] = {"openclaw_package": original_identity}
+    run_index.write_text(json.dumps(index), encoding="utf-8")
+    changed = tmp_path / "changed.tgz"
+    _write_openclaw_package(changed, marker="changed")
+    config = _config(
+        tmp_path,
+        run_index,
+        openclaw_package_tarball=changed,
+    )
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    with pytest.raises(FleetError, match="identity changed"):
+        FleetController(config, executor=executor).run()
+    assert not any(command[:2] == ["crabbox", "warmup"] for command in executor.commands)
+
+
+def test_candidate_package_resume_requires_original_identity_input(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = _planned(_run_spec(label))
+    package = tmp_path / "candidate.tgz"
+    identity = _write_openclaw_package(package)
+    run["openclaw_package"] = identity
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    index = json.loads(run_index.read_text(encoding="utf-8"))
+    index["fleet"] = {"openclaw_package": identity}
+    run_index.write_text(json.dumps(index), encoding="utf-8")
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    with pytest.raises(
+        FleetError,
+        match="requires --openclaw-package-tarball",
+    ):
+        FleetController(config, executor=executor).run()
+    assert not any(command[:2] == ["crabbox", "warmup"] for command in executor.commands)
+
+
+def test_candidate_package_resume_repairs_missing_run_identity(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = _planned(_run_spec(label))
+    package = tmp_path / "candidate.tgz"
+    identity = _write_openclaw_package(package)
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    index = json.loads(run_index.read_text(encoding="utf-8"))
+    index["fleet"] = {"openclaw_package": identity}
+    run_index.write_text(json.dumps(index), encoding="utf-8")
+    config = _config(
+        tmp_path,
+        run_index,
+        openclaw_package_tarball=package,
+    )
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    repaired = json.loads(run_index.read_text(encoding="utf-8"))
+    assert repaired["fleet"]["openclaw_package"] == identity
+    assert repaired["runs"][0]["openclaw_package"] == identity
 
 
 def test_controller_runs_bounded_wave_and_stops_after_verified_export(
@@ -1077,6 +1289,8 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
             str(tmp_path / "tasks.tar.gz"),
             "--env-file",
             str(tmp_path / ".env"),
+            "--openclaw-package-tarball",
+            str(tmp_path / "openclaw.tgz"),
             "--model-max-runs",
             "fable5=1",
             "--model-max-runs",
@@ -1105,6 +1319,7 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
     assert args.parity_validated is True
     assert args.parity_validated_routes == frozenset({("codex", "gpt55")})
     assert args.model_task_concurrency == {"fable5": 2}
+    assert args.openclaw_package_tarball == tmp_path / "openclaw.tgz"
 
 
 @pytest.mark.parametrize(

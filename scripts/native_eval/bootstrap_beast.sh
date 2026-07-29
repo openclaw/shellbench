@@ -8,6 +8,9 @@ CODEX_VERSION="${CODEX_VERSION:-0.145.0}"
 CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.220}"
 HERMES_COMMIT="${HERMES_COMMIT:-cb06017b1d6e1b9ae0cb35f99a48ffa6bcbaa828}"
 LITELLM_VERSION="${LITELLM_VERSION:-1.93.0}"
+OPENCLAW_PACKAGE_TARBALL="${OPENCLAW_PACKAGE_TARBALL:-}"
+OPENCLAW_PACKAGE_SHA256="${OPENCLAW_PACKAGE_SHA256:-}"
+OPENCLAW_PACKAGE_VERSION="${OPENCLAW_PACKAGE_VERSION:-}"
 
 if [[ "$(id -u)" -ne 0 ]]; then
   exec sudo -E bash "$0" "$@"
@@ -67,6 +70,7 @@ EOF
 
 install_node_tools() {
   local node_root="$TOOLCHAIN_ROOT/node"
+  local openclaw_spec="openclaw@$OPENCLAW_VERSION"
   if [[ ! -x "$node_root/bin/node" ]] || \
     [[ "$("$node_root/bin/node" --version)" != "v$NODE_VERSION" ]]; then
     rm -rf "$node_root"
@@ -79,9 +83,19 @@ install_node_tools() {
   fi
 
   export PATH="$node_root/bin:$PATH"
+  if [[ -n "$OPENCLAW_PACKAGE_TARBALL" ]]; then
+    [[ -n "$OPENCLAW_PACKAGE_SHA256" && -n "$OPENCLAW_PACKAGE_VERSION" ]]
+    [[ -f "$OPENCLAW_PACKAGE_TARBALL" ]]
+    printf '%s  %s\n' \
+      "$OPENCLAW_PACKAGE_SHA256" "$OPENCLAW_PACKAGE_TARBALL" \
+      | sha256sum -c -
+    [[ "$(tar -xOf "$OPENCLAW_PACKAGE_TARBALL" package/package.json | jq -r '.name')" == "openclaw" ]]
+    [[ "$(tar -xOf "$OPENCLAW_PACKAGE_TARBALL" package/package.json | jq -r '.version')" == "$OPENCLAW_PACKAGE_VERSION" ]]
+    openclaw_spec="$OPENCLAW_PACKAGE_TARBALL"
+  fi
   rm -rf "$TOOLCHAIN_ROOT/npm-packages"
   npm install --prefix "$TOOLCHAIN_ROOT/npm-packages" \
-    "openclaw@$OPENCLAW_VERSION" \
+    "$openclaw_spec" \
     "@openai/codex@$CODEX_VERSION" \
     "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
 }
@@ -125,6 +139,16 @@ install_litellm() {
 }
 
 write_manifest() {
+  local openclaw_source_kind="registry"
+  local openclaw_package_version="$OPENCLAW_VERSION"
+  local openclaw_package_sha256=""
+  local openclaw_artifact_filename=""
+  if [[ -n "$OPENCLAW_PACKAGE_TARBALL" ]]; then
+    openclaw_source_kind="npm_tarball"
+    openclaw_package_version="$OPENCLAW_PACKAGE_VERSION"
+    openclaw_package_sha256="$OPENCLAW_PACKAGE_SHA256"
+    openclaw_artifact_filename="$(basename "$OPENCLAW_PACKAGE_TARBALL")"
+  fi
   export PATH="$TOOLCHAIN_ROOT/node/bin:$TOOLCHAIN_ROOT/npm-packages/node_modules/.bin:$TOOLCHAIN_ROOT/home/.local/bin:$PATH"
   jq -n \
     --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -135,10 +159,21 @@ write_manifest() {
     --arg hermes "$(hermes version | head -1)" \
     --arg litellm "$("$TOOLCHAIN_ROOT/litellm-venv/bin/python" -c 'from importlib.metadata import version; print(version("litellm"))')" \
     --arg hermes_commit "$HERMES_COMMIT" \
+    --arg openclaw_source_kind "$openclaw_source_kind" \
+    --arg openclaw_package_version "$openclaw_package_version" \
+    --arg openclaw_package_sha256 "$openclaw_package_sha256" \
+    --arg openclaw_artifact_filename "$openclaw_artifact_filename" \
     '{
       created_at_utc: $created_at,
       node: $node,
       openclaw: $openclaw,
+      openclaw_package: {
+        source_kind: $openclaw_source_kind,
+        package_name: "openclaw",
+        package_version: $openclaw_package_version,
+        sha256: (if $openclaw_package_sha256 == "" then null else $openclaw_package_sha256 end),
+        artifact_filename: (if $openclaw_artifact_filename == "" then null else $openclaw_artifact_filename end)
+      },
       codex: $codex,
       claude_code: $claude_code,
       hermes: $hermes,

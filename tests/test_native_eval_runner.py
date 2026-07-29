@@ -395,6 +395,13 @@ def test_run_manifest_records_native_audit_metadata(
         started_at="2026-07-27T00:00:00Z",
         tasks_root=tmp_path,
         tasks=[],
+        openclaw_package={
+            "source_kind": "npm_tarball",
+            "package_name": "openclaw",
+            "package_version": "2026.7.29-candidate.1",
+            "sha256": "candidate-sha",
+            "artifact_filename": "openclaw-candidate.tgz",
+        },
     )
 
     assert manifest["execution_mode"] == "native"
@@ -415,6 +422,7 @@ def test_run_manifest_records_native_audit_metadata(
     assert manifest["parity_validated"] is False
     assert manifest["parity_validation"] is None
     assert manifest["legacy_parity_validated_claim"] is False
+    assert manifest["openclaw_package"]["sha256"] == "candidate-sha"
 
 
 def test_run_manifest_excludes_r0_from_leaderboard(
