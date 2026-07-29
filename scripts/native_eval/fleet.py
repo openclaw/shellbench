@@ -226,6 +226,7 @@ class FleetConfig:
     judge_model_id: str = ""
     execution_mode: str = "native"
     parity_validated: bool = False
+    parity_validated_routes: frozenset[tuple[str, str]] = frozenset()
 
 
 class RunIndexStore:
@@ -933,7 +934,8 @@ execution_mode=$3
 reasoning_effort=$4
 judge_reasoning_effort=$5
 parity_validated=$6
-shift 6
+parity_validation_json=$7
+shift 7
 mkdir -p "$root/run-logs"
 stdout="$root/run-logs/$label.stdout.log"
 stderr="$root/run-logs/$label.stderr.log"
@@ -951,6 +953,7 @@ nohup env \
   "SHELLBENCH_REASONING_EFFORT=$reasoning_effort" \
   "SHELLBENCH_JUDGE_REASONING_EFFORT=$judge_reasoning_effort" \
   "SHELLBENCH_PARITY_VALIDATED=$parity_validated" \
+  "SHELLBENCH_PARITY_VALIDATION_JSON=$parity_validation_json" \
   "$root/runner/scripts/native_eval/remote_run.sh" "$@" \
   >"$stdout" 2>"$stderr" </dev/null &
 pid=$!
@@ -982,6 +985,19 @@ printf '%s\n' "$pid"
         judge_reasoning_effort = str(
             entry.get("judge_reasoning_effort") or reasoning_effort
         )
+        parity_validation = ""
+        if (run.harness, run.model_slug) in self.config.parity_validated_routes:
+            parity_validation = json.dumps(
+                {
+                    "scope": {
+                        "harness": run.harness,
+                        "model_slug": run.model_slug,
+                    },
+                    "validated": True,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         command = self._ssh_command(
             lease,
             [
@@ -1004,6 +1020,7 @@ printf '%s\n' "$pid"
                 reasoning_effort,
                 judge_reasoning_effort,
                 str(self.config.parity_validated).lower(),
+                parity_validation,
                 *args,
             ],
         )
@@ -1558,6 +1575,24 @@ def _parse_model_values(
     return parsed
 
 
+def _parse_parity_routes(
+    parser: argparse.ArgumentParser,
+    values: list[str],
+) -> frozenset[tuple[str, str]]:
+    parsed: set[tuple[str, str]] = set()
+    for raw in values:
+        harness, separator, model_slug = raw.partition("=")
+        if not separator or not harness or not model_slug:
+            parser.error(
+                f"--parity-validated-route must use HARNESS=MODEL: {raw!r}"
+            )
+        route = (harness, model_slug)
+        if route in parsed:
+            parser.error(f"--parity-validated-route repeats {raw!r}")
+        parsed.add(route)
+    return frozenset(parsed)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-index", type=Path, required=True)
@@ -1602,6 +1637,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--judge-model-id", default="")
     parser.add_argument("--execution-mode", default="native")
     parser.add_argument("--parity-validated", action="store_true")
+    parser.add_argument(
+        "--parity-validated-route",
+        action="append",
+        default=[],
+        metavar="HARNESS=MODEL",
+    )
     args = parser.parse_args(argv)
     args.model_max_runs = _parse_model_values(
         parser,
@@ -1617,6 +1658,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser,
         args.model_task_concurrency,
         "--model-task-concurrency",
+    )
+    args.parity_validated_routes = _parse_parity_routes(
+        parser,
+        args.parity_validated_route,
     )
     return args
 
@@ -1653,6 +1698,7 @@ def main(argv: list[str] | None = None) -> int:
         judge_model_id=args.judge_model_id,
         execution_mode=args.execution_mode,
         parity_validated=args.parity_validated,
+        parity_validated_routes=args.parity_validated_routes,
     )
     try:
         return FleetController(config).run()

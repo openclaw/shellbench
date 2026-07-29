@@ -205,6 +205,7 @@ def _run_manifest(
     tasks: list[TaskSpec],
     rerun_of_canonical_run: str | None = None,
 ) -> dict[str, Any]:
+    parity_validation, parity_validated = _parity_metadata(run)
     return {
         "run_label": run.run_label,
         "harness": run.harness,
@@ -245,7 +246,9 @@ def _run_manifest(
         "observed_model_ids": [],
         "trajectory_mode": trajectory_mode_for_harness(run.harness),
         "trajectory_complete": False,
-        "parity_validated": (
+        "parity_validated": parity_validated,
+        "parity_validation": parity_validation,
+        "legacy_parity_validated_claim": (
             os.environ.get("SHELLBENCH_PARITY_VALIDATED", "").lower() == "true"
         ),
         "harbor_reference_commit": os.environ.get(
@@ -269,6 +272,41 @@ def _run_manifest(
         "finished_at_utc": None,
         "result_json_count": 0,
     }
+
+
+def _parity_metadata(run: RunSpec) -> tuple[dict[str, Any] | None, bool]:
+    raw = os.environ.get("SHELLBENCH_PARITY_VALIDATION_JSON", "").strip()
+    if not raw:
+        return None, False
+    try:
+        validation = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("SHELLBENCH_PARITY_VALIDATION_JSON is invalid JSON") from exc
+    if not isinstance(validation, dict):
+        raise ValueError("SHELLBENCH_PARITY_VALIDATION_JSON must be an object")
+    scope = validation.get("scope")
+    if not isinstance(scope, dict):
+        raise ValueError("parity validation scope must be an object")
+    if "harness" not in scope or not any(
+        key in scope for key in ("model_slug", "model_id", "provider_model_id")
+    ):
+        raise ValueError("parity validation scope must include harness and model")
+
+    comparable = {
+        "harness": run.harness,
+        "model_slug": run.model_slug,
+        "model_id": run.model_id,
+        "provider_model_id": run.model_id,
+    }
+    unsupported_keys = set(scope) - set(comparable)
+    if unsupported_keys:
+        names = ", ".join(sorted(unsupported_keys))
+        raise ValueError(f"unsupported parity validation scope keys: {names}")
+    matches = all(
+        str(comparable[key]) == str(expected)
+        for key, expected in scope.items()
+    )
+    return validation, validation.get("validated") is True and matches
 
 
 def _git_commit() -> str:
