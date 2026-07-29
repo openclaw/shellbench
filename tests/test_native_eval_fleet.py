@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shlex
 import subprocess
 import tarfile
@@ -599,6 +600,47 @@ def test_candidate_package_is_validated_staged_and_bootstrapped(
     assert identity["sha256"] in bootstrap[-1]
     assert identity["package_version"] in bootstrap[-1]
     assert "TOPSECRET" not in bootstrap[-1]
+
+
+def test_bootstrap_preserves_candidate_identity_across_sudo(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_id = fake_bin / "id"
+    fake_id.write_text("#!/bin/sh\nprintf '1000\\n'\n", encoding="utf-8")
+    fake_id.chmod(0o755)
+    fake_sudo = fake_bin / "sudo"
+    fake_sudo.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_sudo.chmod(0o755)
+    candidate = tmp_path / "candidate.tgz"
+    candidate.write_bytes(b"candidate")
+
+    result = subprocess.run(
+        ["bash", "scripts/native_eval/bootstrap_beast.sh"],
+        cwd=Path(__file__).resolve().parents[1],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "OPENCLAW_PACKAGE_TARBALL": str(candidate),
+            "OPENCLAW_PACKAGE_SHA256": "candidate-sha256",
+            "OPENCLAW_PACKAGE_VERSION": "2026.7.2",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.splitlines()[:4] == [
+        "env",
+        "TOOLCHAIN_ROOT=/opt/shellbench-native",
+        "NODE_VERSION=22.23.1",
+        "OPENCLAW_VERSION=2026.7.1-2",
+    ]
+    assert f"OPENCLAW_PACKAGE_TARBALL={candidate}" in result.stdout
+    assert "OPENCLAW_PACKAGE_SHA256=candidate-sha256" in result.stdout
+    assert "OPENCLAW_PACKAGE_VERSION=2026.7.2" in result.stdout
 
 
 def test_candidate_package_rejects_wrong_npm_identity_before_leasing(
