@@ -406,16 +406,26 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
         assert "OPENROUTER_API_KEY" not in command.env
         assert 'exit "$status"' in command.run_command
         if harness.name == "openclaw":
-            assert "ended with stopReason=" in command.run_command
+            assert "ended with stopReason=" not in command.run_command
             assert "python3 -c" in command.run_command
             assert "--thinking off" in command.run_command
             assert "setup --baseline --skip-bootstrap" in command.setup_command
-            assert "rm -f BOOTSTRAP.md" in command.setup_command
+            assert "rm -f AGENTS.md BOOTSTRAP.md HEARTBEAT.md" in (
+                command.setup_command
+            )
             assert '"skipBootstrap":true' in command.setup_command
+            assert '"primary":"openai/claude-opus-5"' in command.setup_command
+            assert '"subagents":{"model":"openai/claude-opus-5"}' in (
+                command.setup_command
+            )
             assert "item.chmod(0o755 if item.is_dir() else 0o644)" in (
                 command.cleanup_command
             )
             assert "destination.chmod(0o644)" in command.cleanup_command
+        if harness.name == "hermes":
+            assert '"delegation":{"max_iterations":50' in command.setup_command
+            assert '"provider":"custom:shellbench"' in command.setup_command
+            assert '"model":"claude-opus-5"' in command.setup_command
         if harness.name == "codex":
             assert "2>/logs/agent/codex-stderr.txt" in command.run_command
             assert "cat /logs/agent/codex-stderr.txt >&2" in command.run_command
@@ -459,6 +469,33 @@ def test_openclaw_completion_probe_rejects_partial_log(tmp_path: Path) -> None:
     assert completed.returncode == 1
 
 
+def test_openclaw_completion_probe_rejects_paused_yielded_envelope(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "openclaw.txt"
+    log_path.write_text(
+        json.dumps(
+            {
+                "payloads": [{"text": "waiting for child"}],
+                "meta": {
+                    "aborted": False,
+                    "livenessState": "paused",
+                    "yielded": True,
+                    "stopReason": "end_turn",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _OPENCLAW_COMPLETION_PROBE, str(log_path)],
+        check=False,
+    )
+
+    assert completed.returncode == 1
+
+
 def test_hermes_uses_named_local_proxy_provider() -> None:
     run = RunSpec(
         run_label="hermes-test",
@@ -486,8 +523,10 @@ def test_hermes_uses_named_local_proxy_provider() -> None:
     assert command.env == {"SHELLBENCH_PROXY_KEY": "local-proxy-key"}
     assert "custom:shellbench" in command.setup_command
     assert "http://host.docker.internal:4000/v1" in command.setup_command
-    assert '--session-id "$session_id" --yes --redact' in command.cleanup_command
-    assert "else hermes sessions export" in command.cleanup_command
+    assert "--session-id" not in command.cleanup_command
+    assert command.cleanup_command.endswith(
+        "hermes sessions export /logs/agent/hermes-session.jsonl --yes --redact"
+    )
 
 
 def test_workdir_falls_back_to_existing_container_directory(
@@ -964,7 +1003,67 @@ def test_codex_trajectory_falls_back_to_complete_session_stream(
     assert trajectory["steps"][3]["message"] == "done"
 
 
-def test_unsupported_trajectory_is_explicitly_unranked(tmp_path: Path) -> None:
+def test_claude_code_stream_converts_to_real_trajectory(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    events = [
+        {
+            "type": "system",
+            "subtype": "init",
+            "session_id": "claude-session-123",
+            "model": "sb-gpt55",
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "model": "gpt-5.5",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call-1",
+                        "name": "Bash",
+                        "input": {"command": "pwd"},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-1",
+                        "content": "/app",
+                        "is_error": False,
+                    }
+                ]
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "model": "gpt-5.5",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "terminal_reason": "completed",
+            "is_error": False,
+            "session_id": "claude-session-123",
+            "result": "done",
+            "usage": {"input_tokens": 10, "output_tokens": 3},
+            "modelUsage": {
+                "sb-gpt55": {"canonicalModel": "sb-gpt55"}
+            },
+        },
+    ]
+    (agent_dir / "claude-code.txt").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
     run = RunSpec(
         run_label="claude-code-gpt55",
         harness="claude-code",
@@ -972,37 +1071,90 @@ def test_unsupported_trajectory_is_explicitly_unranked(tmp_path: Path) -> None:
         model_slug="gpt55",
         model_id="gpt-5.5",
         provider="openai",
-        proxy_model_name="gpt-5.5",
+        proxy_model_name="sb-gpt55",
         repetition=1,
         expected_task_count=1,
         run_date="20260727",
     )
-    task_dir = tmp_path / "task"
-    task_dir.mkdir()
-    task = TaskSpec(
-        name="task",
-        title="task",
-        path=task_dir,
-        instruction="do the task",
-        raw_config={},
-        checksum="abc",
-        dockerfile=task_dir / "Dockerfile",
-        build_context=task_dir,
-        compose_file=None,
-        verifier_command="bash /tests/test.sh",
-        agent_timeout_sec=900,
-        verifier_timeout_sec=300,
-        build_timeout_sec=1800,
-        mcp_servers=(),
-        environment_env={},
-        verifier_env={},
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["runtime_model_name"] == "gpt-5.5"
+    assert metadata["canonical_model_identity"] is True
+    assert metadata["trajectory_validation"]["terminal_event_seen"] is True
+    assert trajectory["session_id"] == "claude-session-123"
+    assert trajectory["steps"][1]["tool_calls"][0]["function_name"] == "Bash"
+    assert trajectory["steps"][1]["observation"]["results"][0]["content"] == "/app"
+    assert trajectory["steps"][-1]["message"] == "done"
+
+
+def test_claude_code_child_model_mismatch_invalidates_identity(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    events = [
+        {
+            "type": "system",
+            "subtype": "init",
+            "session_id": "claude-session-123",
+            "model": "sb-gpt55",
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "model": "gpt-5.5",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "terminal_reason": "completed",
+            "is_error": False,
+            "session_id": "claude-session-123",
+            "result": "done",
+            "modelUsage": {
+                "sb-gpt55": {"canonicalModel": "sb-gpt55"},
+                "gpt-5.6-sol": {"canonicalModel": "gpt-5.6-sol"},
+            },
+        },
+    ]
+    (agent_dir / "claude-code.txt").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="claude-code-gpt55",
+        harness="claude-code",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260727",
     )
 
-    metadata = write_agent_trajectory(task, run, tmp_path / "agent")
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
 
-    assert metadata["trajectory_status"] == "unsupported"
-    assert metadata["runtime_model_name"] is None
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["runtime_model_name"] == "gpt-5.5"
     assert metadata["canonical_model_identity"] is False
+    assert metadata["trajectory_validation"]["observed_models"] == [
+        "gpt-5.5",
+        "gpt-5.6-sol",
+    ]
 
 
 def test_openclaw_mixed_log_converts_harbor_envelope_to_atif(
@@ -1153,6 +1305,105 @@ def test_openclaw_session_without_envelope_converts_to_atif(
     assert trajectory["final_metrics"]["total_cached_tokens"] == 30
 
 
+def test_openclaw_child_model_mismatch_invalidates_identity(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    records = [
+        {
+            "type": "session",
+            "id": "session-123",
+        },
+        {
+            "type": "model_change",
+            "modelId": "gpt-5.6-sol",
+        },
+        {
+            "type": "message",
+            "message": {"role": "user", "content": "do the task"},
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "spawn-1",
+                        "name": "sessions_spawn",
+                        "arguments": {"task": "inspect"},
+                    }
+                ],
+                "stopReason": "toolUse",
+            },
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "status": "accepted",
+                                "resolvedModel": "openai/gpt-5.5",
+                            }
+                        ),
+                    }
+                ],
+            },
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [{"type": "text", "text": "done"}],
+                "stopReason": "stop",
+            },
+        },
+    ]
+    (agent_dir / "openclaw.session.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    (agent_dir / "openclaw.txt").write_text(
+        "[provider-transport-fetch] [model-fetch] response "
+        "provider=openai api=openai-responses model=gpt-5.6-sol status=200\n"
+        "[provider-transport-fetch] [model-fetch] response "
+        "provider=openai api=openai-responses model=gpt-5.5 status=200\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="openclaw-gpt56-sol",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260728",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["runtime_model_name"] == "gpt-5.6-sol"
+    assert metadata["canonical_model_identity"] is False
+    assert metadata["trajectory_validation"]["observed_models"] == [
+        "gpt-5.5",
+        "gpt-5.6-sol",
+    ]
+    assert metadata["trajectory_validation"]["child_models"] == ["gpt-5.5"]
+
+
 def test_hermes_session_converts_parallel_tools_to_atif(tmp_path: Path) -> None:
     agent_dir = tmp_path / "agent"
     agent_dir.mkdir()
@@ -1287,6 +1538,77 @@ def test_hermes_session_preserves_unicode_line_separator(tmp_path: Path) -> None
     assert metadata["trajectory_status"] == "real"
     assert metadata["canonical_model_identity"] is True
     assert trajectory["steps"][-1]["message"] == "line one\u2028line two"
+
+
+def test_hermes_child_session_model_mismatch_invalidates_identity(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    parent = {
+        "id": "parent",
+        "model": "gpt-5.6-sol",
+        "message_count": 2,
+        "tool_call_count": 0,
+        "messages": [
+            {"id": 1, "role": "user", "content": "do the task", "timestamp": 1.0},
+            {
+                "id": 2,
+                "role": "assistant",
+                "content": "done",
+                "model": "gpt-5.6-sol",
+                "finish_reason": "stop",
+                "timestamp": 2.0,
+            },
+        ],
+    }
+    child = {
+        "id": "child",
+        "model": "gpt-5.5",
+        "message_count": 2,
+        "tool_call_count": 0,
+        "messages": [
+            {"id": 3, "role": "user", "content": "inspect", "timestamp": 1.0},
+            {
+                "id": 4,
+                "role": "assistant",
+                "content": "child done",
+                "model": "gpt-5.5",
+                "finish_reason": "stop",
+                "timestamp": 2.0,
+            },
+        ],
+    }
+    (agent_dir / "hermes-session.jsonl").write_text(
+        json.dumps(child) + "\n" + json.dumps(parent) + "\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="hermes-gpt56-sol",
+        harness="hermes",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260728",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["runtime_model_name"] == "gpt-5.6-sol"
+    assert metadata["canonical_model_identity"] is False
+    assert metadata["trajectory_validation"]["observed_models"] == [
+        "gpt-5.5",
+        "gpt-5.6-sol",
+    ]
 
 
 def _trajectory_task(tmp_path: Path, instruction: str) -> TaskSpec:
