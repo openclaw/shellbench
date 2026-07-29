@@ -5,7 +5,10 @@ import json
 from pathlib import Path
 
 from scripts.native_eval.research_audit import (
+    _discovery_operation_count,
     _discovery_status,
+    _invalidate_cross_task_counter_scopes,
+    _normalize_cumulative_discovery_rows,
     _openclaw_code_discovery_rows,
     _structured_discovery_row,
     export_research_tables,
@@ -35,6 +38,38 @@ def test_zero_count_code_telemetry_is_observed_but_not_exercised() -> None:
             {
                 "telemetry": {
                     "catalogSize": 12,
+                    "counterScope": "scope-zero",
+                    "searchCount": 0,
+                    "describeCount": 0,
+                    "callCount": 0,
+                }
+            }
+        ),
+    )
+
+    normalized = _normalize_cumulative_discovery_rows(rows)
+    assert len(normalized) == 3
+    assert {row["count_semantics"] for row in normalized} == {"scope_marker"}
+    assert telemetry_observed is True
+    assert (
+        _discovery_status(
+            harness="openclaw",
+            openclaw_mode="code",
+            tool_names=["tool_search_code"],
+            discovery_rows=normalized,
+            telemetry_observed=telemetry_observed,
+        )
+        == "supported_not_exercised"
+    )
+
+
+def test_zero_count_unscoped_telemetry_is_not_exercised() -> None:
+    rows, telemetry_observed = _openclaw_code_discovery_rows(
+        base={},
+        observation=json.dumps(
+            {
+                "telemetry": {
+                    "catalogSize": 12,
                     "searchCount": 0,
                     "describeCount": 0,
                     "callCount": 0,
@@ -44,7 +79,6 @@ def test_zero_count_code_telemetry_is_observed_but_not_exercised() -> None:
     )
 
     assert rows == []
-    assert telemetry_observed is True
     assert (
         _discovery_status(
             harness="openclaw",
@@ -55,6 +89,227 @@ def test_zero_count_code_telemetry_is_observed_but_not_exercised() -> None:
         )
         == "supported_not_exercised"
     )
+
+
+def test_cumulative_code_telemetry_exports_deltas_within_each_scope() -> None:
+    rows = [
+        {
+            "counter_scope": "scope-a",
+            "count_semantics": "cumulative_scoped",
+            "operation": "search",
+            "count": 1,
+            "tool_call_id": "call-1",
+        },
+        {
+            "counter_scope": "scope-a",
+            "count_semantics": "cumulative_scoped",
+            "operation": "call",
+            "count": 2,
+            "tool_call_id": "call-1",
+        },
+        {
+            "counter_scope": "scope-a",
+            "count_semantics": "cumulative_scoped",
+            "operation": "search",
+            "count": 1,
+            "tool_call_id": "call-2",
+        },
+        {
+            "counter_scope": "scope-a",
+            "count_semantics": "cumulative_scoped",
+            "operation": "call",
+            "count": 5,
+            "tool_call_id": "call-2",
+        },
+        {
+            "counter_scope": "scope-b",
+            "count_semantics": "cumulative_scoped",
+            "operation": "search",
+            "count": 2,
+            "tool_call_id": "call-3",
+        },
+        {
+            "counter_scope": "scope-b",
+            "count_semantics": "cumulative_scoped",
+            "operation": "call",
+            "count": 6,
+            "tool_call_id": "call-3",
+        },
+    ]
+
+    normalized = _normalize_cumulative_discovery_rows(rows)
+
+    assert [
+        (
+            row["tool_call_id"],
+            row["operation"],
+            row["count"],
+            row["count_semantics"],
+        )
+        for row in normalized
+    ] == [
+        ("call-1", "search", 1, "delta"),
+        ("call-1", "call", 2, "delta"),
+        ("call-2", "search", 0, "scope_marker"),
+        ("call-2", "call", 3, "delta"),
+        ("call-3", "search", 2, "delta"),
+        ("call-3", "call", 6, "delta"),
+    ]
+    assert _discovery_operation_count(normalized) == 14
+
+
+def test_counter_scope_reused_across_tasks_is_invalid() -> None:
+    rows = [
+        {
+            "run_label": "run-a",
+            "task_name": task_name,
+            "trajectory_path": trajectory_path,
+            "counter_scope": "scope-a",
+            "count_semantics": "delta",
+            "operation": "call",
+            "count": count,
+        }
+        for task_name, trajectory_path, count in (
+            ("task-a", "/traces/a.json", 5),
+            ("task-b", "/traces/b.json", 2),
+        )
+    ]
+
+    _invalidate_cross_task_counter_scopes(rows)
+
+    assert {row["count_semantics"] for row in rows} == {
+        "invalid_counter_scope"
+    }
+    assert _discovery_operation_count(rows) == 0
+
+
+def test_zero_scope_marker_participates_in_cross_task_validation() -> None:
+    rows = [
+        {
+            "run_label": "run-a",
+            "task_name": "task-a",
+            "trajectory_path": "/traces/a.json",
+            "counter_scope": "scope-a",
+            "count_semantics": "scope_marker",
+            "operation": "call",
+            "count": 0,
+        },
+        {
+            "run_label": "run-a",
+            "task_name": "task-b",
+            "trajectory_path": "/traces/b.json",
+            "counter_scope": "scope-a",
+            "count_semantics": "delta",
+            "operation": "call",
+            "count": 2,
+        },
+    ]
+
+    _invalidate_cross_task_counter_scopes(rows)
+
+    assert {row["count_semantics"] for row in rows} == {
+        "invalid_counter_scope"
+    }
+
+
+def test_unscoped_cumulative_telemetry_stays_visible_but_unresolved() -> None:
+    rows, telemetry_observed = _openclaw_code_discovery_rows(
+        base={},
+        observation=json.dumps(
+            {
+                "telemetry": {
+                    "catalogSize": 12,
+                    "searchCount": 3,
+                    "describeCount": 1,
+                    "callCount": 8,
+                }
+            }
+        ),
+    )
+
+    normalized = _normalize_cumulative_discovery_rows(rows)
+
+    assert {row["count_semantics"] for row in normalized} == {
+        "cumulative_unscoped"
+    }
+    assert _discovery_operation_count(normalized) == 0
+    assert (
+        _discovery_status(
+            harness="openclaw",
+            openclaw_mode="code",
+            tool_names=["tool_search_code"],
+            discovery_rows=normalized,
+            telemetry_observed=telemetry_observed,
+        )
+        == "observed_cumulative_unscoped"
+    )
+
+
+def test_invalid_counter_takes_precedence_over_unscoped_telemetry() -> None:
+    rows, telemetry_observed = _openclaw_code_discovery_rows(
+        base={},
+        observation=json.dumps(
+            {
+                "telemetry": {
+                    "catalogSize": 12,
+                    "searchCount": -1,
+                    "describeCount": 2,
+                    "callCount": 0,
+                }
+            }
+        ),
+    )
+
+    assert (
+        _discovery_status(
+            harness="openclaw",
+            openclaw_mode="code",
+            tool_names=["tool_search_code"],
+            discovery_rows=rows,
+            telemetry_observed=telemetry_observed,
+        )
+        == "invalid_counter_scope"
+    )
+
+
+def test_counter_regression_quarantines_that_scope_operation() -> None:
+    rows = [
+        {
+            "counter_scope": "scope-a",
+            "count_semantics": "cumulative_scoped",
+            "operation": "call",
+            "count": count,
+            "tool_call_id": f"call-{index}",
+        }
+        for index, count in enumerate((5, 5, 3, 4), start=1)
+    ]
+
+    normalized = _normalize_cumulative_discovery_rows(rows)
+
+    assert len(normalized) == 4
+    assert {row["count_semantics"] for row in normalized} == {
+        "invalid_counter_scope"
+    }
+    assert _discovery_operation_count(normalized) == 0
+
+
+def test_negative_scoped_counter_quarantines_prior_deltas() -> None:
+    rows = [
+        {
+            "counter_scope": "scope-a",
+            "count_semantics": "cumulative_scoped",
+            "operation": "call",
+            "count": count,
+        }
+        for count in (5, -1)
+    ]
+
+    normalized = _normalize_cumulative_discovery_rows(rows)
+
+    assert {row["count_semantics"] for row in normalized} == {
+        "invalid_counter_scope"
+    }
+    assert _discovery_operation_count(normalized) == 0
 
 
 def test_research_audit_exports_identity_turn_tool_and_usage_tables(
@@ -269,6 +524,7 @@ def test_research_audit_exports_openclaw_code_discovery_telemetry(
                                         "ok": True,
                                         "telemetry": {
                                             "catalogSize": 42,
+                                            "counterScope": "scope-a",
                                             "sources": {
                                                 "openclaw": 30,
                                                 "mcp": 10,
@@ -315,6 +571,8 @@ def test_research_audit_exports_openclaw_code_discovery_telemetry(
         ("describe", "1"),
         ("call", "1"),
     ]
+    assert {row["counter_scope"] for row in rows} == {"scope-a"}
+    assert {row["count_semantics"] for row in rows} == {"delta"}
     assert {row["catalog_size"] for row in rows} == {"42"}
     assert {row["success"] for row in rows} == {""}
     assert {row["trace_fidelity"] for row in rows} == {"session"}

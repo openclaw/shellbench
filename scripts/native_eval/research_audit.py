@@ -99,8 +99,10 @@ DISCOVERY_FIELDS = (
     "task_name",
     "turn_index",
     "tool_call_id",
+    "counter_scope",
     "operation",
     "count",
+    "count_semantics",
     "query",
     "selected_id",
     "catalog_size",
@@ -385,6 +387,8 @@ def _openclaw_code_discovery_rows(
         return [], False
     sources = telemetry.get("sources")
     source_breakdown = sources if isinstance(sources, dict) else {}
+    scope_value = telemetry.get("counterScope")
+    counter_scope = scope_value.strip() if isinstance(scope_value, str) else ""
     rows: list[dict[str, Any]] = []
     for operation, key in (
         ("search", "searchCount"),
@@ -392,13 +396,24 @@ def _openclaw_code_discovery_rows(
         ("call", "callCount"),
     ):
         count = _number(telemetry.get(key))
-        if count is None or count <= 0:
+        if count is None or (count == 0 and not counter_scope):
             continue
+        count_semantics = (
+            "invalid_counter_scope"
+            if count < 0 and not counter_scope
+            else (
+                "cumulative_scoped"
+                if counter_scope
+                else "cumulative_unscoped"
+            )
+        )
         rows.append(
             {
                 **base,
+                "counter_scope": counter_scope,
                 "operation": operation,
                 "count": count,
+                "count_semantics": count_semantics,
                 "query": "",
                 "selected_id": "",
                 "catalog_size": _number(telemetry.get("catalogSize")),
@@ -429,8 +444,10 @@ def _structured_discovery_row(
     values = arguments if isinstance(arguments, dict) else {}
     return {
         **base,
+        "counter_scope": "",
         "operation": operation,
         "count": 1,
+        "count_semantics": "event",
         "query": values.get("query") if operation == "search" else "",
         "selected_id": (
             values.get("id") or values.get("toolId") or values.get("name")
@@ -452,6 +469,21 @@ def _discovery_status(
     telemetry_observed: bool,
 ) -> str:
     if harness == "openclaw":
+        if any(
+            row.get("count_semantics") == "invalid_counter_scope"
+            for row in discovery_rows
+        ):
+            return "invalid_counter_scope"
+        if any(
+            row.get("count_semantics") == "cumulative_unscoped"
+            for row in discovery_rows
+        ):
+            return "observed_cumulative_unscoped"
+        if discovery_rows and all(
+            row.get("count_semantics") == "scope_marker"
+            for row in discovery_rows
+        ):
+            return "supported_not_exercised"
         if discovery_rows:
             return "observed"
         if telemetry_observed:
@@ -474,7 +506,82 @@ def _discovery_status(
 
 
 def _discovery_operation_count(rows: list[dict[str, Any]]) -> int:
-    return sum(int(_number(row.get("count")) or 0) for row in rows)
+    return sum(
+        int(_number(row.get("count")) or 0)
+        for row in rows
+        if row.get("count_semantics")
+        not in {
+            "cumulative_scoped",
+            "cumulative_unscoped",
+            "invalid_counter_scope",
+        }
+    )
+
+
+def _normalize_cumulative_discovery_rows(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Convert scoped cumulative telemetry into deltas without guessing resets."""
+    previous_counts: dict[tuple[str, str], int] = {}
+    normalized_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    invalid_keys: set[tuple[str, str]] = set()
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        semantics = row.get("count_semantics")
+        if semantics != "cumulative_scoped":
+            normalized.append(row)
+            continue
+        scope = str(row.get("counter_scope") or "")
+        operation = str(row.get("operation") or "")
+        count = int(_number(row.get("count")) or 0)
+        key = (scope, operation)
+        if key in invalid_keys:
+            normalized.append({**row, "count_semantics": "invalid_counter_scope"})
+            continue
+        delta = count - previous_counts.get(key, 0)
+        previous_counts[key] = count
+        if delta < 0:
+            invalid_keys.add(key)
+            for prior_row in normalized_rows.get(key, []):
+                prior_row["count_semantics"] = "invalid_counter_scope"
+            invalid_row = {**row, "count_semantics": "invalid_counter_scope"}
+            normalized.append(invalid_row)
+        elif delta > 0:
+            delta_row = {**row, "count": delta, "count_semantics": "delta"}
+            normalized_rows.setdefault(key, []).append(delta_row)
+            normalized.append(delta_row)
+        else:
+            marker_row = {
+                **row,
+                "count": 0,
+                "count_semantics": "scope_marker",
+            }
+            normalized_rows.setdefault(key, []).append(marker_row)
+            normalized.append(marker_row)
+    return normalized
+
+
+def _invalidate_cross_task_counter_scopes(
+    rows: list[dict[str, Any]],
+) -> None:
+    owners_by_scope: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    rows_by_scope: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        scope = str(row.get("counter_scope") or "")
+        if not scope:
+            continue
+        scope_key = (str(row.get("run_label") or ""), scope)
+        owner = (
+            str(row.get("task_name") or ""),
+            str(row.get("trajectory_path") or ""),
+        )
+        owners_by_scope.setdefault(scope_key, set()).add(owner)
+        rows_by_scope.setdefault(scope_key, []).append(row)
+    for scope_key, owners in owners_by_scope.items():
+        if len(owners) < 2:
+            continue
+        for row in rows_by_scope[scope_key]:
+            row["count_semantics"] = "invalid_counter_scope"
 
 
 def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict[str, Any]]) -> None:
@@ -722,6 +829,10 @@ def export_research_tables(
                         if discovery_row is not None:
                             task_discovery_rows.append(discovery_row)
 
+            if harness == "openclaw" and openclaw_mode == "code":
+                task_discovery_rows = _normalize_cumulative_discovery_rows(
+                    task_discovery_rows
+                )
             discovery_status = _discovery_status(
                 harness=harness,
                 openclaw_mode=openclaw_mode,
@@ -818,6 +929,35 @@ def export_research_tables(
                 "task_cost_unavailable_count": counters["task_cost_unavailable"],
             }
         )
+
+    _invalidate_cross_task_counter_scopes(discovery_rows)
+    discovery_rows_by_trace: dict[
+        tuple[str, str, str], list[dict[str, Any]]
+    ] = {}
+    for row in discovery_rows:
+        key = (
+            str(row.get("run_label") or ""),
+            str(row.get("task_name") or ""),
+            str(row.get("trajectory_path") or ""),
+        )
+        discovery_rows_by_trace.setdefault(key, []).append(row)
+    for trace_row in trace_rows:
+        key = (
+            str(trace_row.get("run_label") or ""),
+            str(trace_row.get("task_name") or ""),
+            str(trace_row.get("trajectory_path") or ""),
+        )
+        task_rows = discovery_rows_by_trace.get(key, [])
+        if not task_rows:
+            continue
+        trace_row["discovery_status"] = _discovery_status(
+            harness=str(trace_row.get("harness") or ""),
+            openclaw_mode=str(trace_row.get("openclaw_tool_search_mode") or ""),
+            tool_names=[],
+            discovery_rows=task_rows,
+            telemetry_observed=True,
+        )
+        trace_row["discovery_event_count"] = _discovery_operation_count(task_rows)
 
     _write_csv(output_dir / "trace_inventory.csv", TRACE_FIELDS, trace_rows)
     _write_csv(output_dir / "turn_usage.csv", TURN_FIELDS, turn_rows)
