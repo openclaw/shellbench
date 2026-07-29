@@ -24,6 +24,9 @@ TRACE_FIELDS = (
     "judge_reasoning_effort",
     "judge_identity_status",
     "repetition",
+    "phase",
+    "qualification_family",
+    "leaderboard_eligible",
     "task_name",
     "reward",
     "result_path",
@@ -95,6 +98,9 @@ RUN_AUDIT_FIELDS = (
     "judge_reasoning_effort",
     "judge_identity_status",
     "repetition",
+    "phase",
+    "qualification_family",
+    "leaderboard_eligible",
     "expected_task_count",
     "result_count",
     "real_trace_count",
@@ -515,6 +521,9 @@ def export_research_tables(
                         "unverified_requires_proxy_request_evidence"
                     ),
                     "repetition": entry.get("repetition"),
+                    "phase": entry.get("phase") or "full",
+                    "qualification_family": entry.get("qualification_family"),
+                    "leaderboard_eligible": entry.get("leaderboard_eligible"),
                     "task_name": task_name,
                     "reward": _reward(result),
                     "result_path": str(result_path),
@@ -557,6 +566,9 @@ def export_research_tables(
                     "unverified_requires_proxy_request_evidence"
                 ),
                 "repetition": entry.get("repetition"),
+                "phase": entry.get("phase") or "full",
+                "qualification_family": entry.get("qualification_family"),
+                "leaderboard_eligible": entry.get("leaderboard_eligible"),
                 "expected_task_count": entry.get("expected_task_count"),
                 "result_count": result_count,
                 "real_trace_count": counters["real_trace"],
@@ -588,6 +600,10 @@ def export_research_tables(
         ),
         "identity_audit_fail_count": sum(
             row["model_identity_audit_passed"] is not True for row in run_rows
+        ),
+        "r0_run_count": sum(row["phase"] == "r0" for row in run_rows),
+        "scoring_run_count": sum(
+            row["leaderboard_eligible"] is not False for row in run_rows
         ),
         "exact_task_cost_count": sum(
             row["cost_provenance"] in {"exact_harness", "exact_trace"}

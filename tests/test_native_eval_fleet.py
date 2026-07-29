@@ -28,6 +28,7 @@ def _run_spec(
     *,
     expected_task_count: int = 2,
     model_slug: str = "gpt55",
+    repetition: int = 1,
 ) -> RunSpec:
     return RunSpec(
         run_label=label,
@@ -37,7 +38,7 @@ def _run_spec(
         model_id=f"provider/{model_slug}",
         provider="anthropic" if model_slug == "fable5" else "openai",
         proxy_model_name=f"sb-{model_slug}",
-        repetition=1,
+        repetition=repetition,
         expected_task_count=expected_task_count,
         run_date="20260727",
     )
@@ -304,6 +305,10 @@ class FakeExecutor:
         self.dispatch_concurrency: dict[str, int] = {}
         self.dispatch_arguments: dict[str, list[str]] = {}
         self.dispatch_parity_validation: dict[str, str] = {}
+        self.dispatch_qualification_family: dict[str, str] = {}
+        self.dispatch_phase: dict[str, str] = {}
+        self.dispatch_leaderboard_eligible: dict[str, str] = {}
+        self.dispatch_exclusion_reason: dict[str, str] = {}
         self.stops: list[str] = []
         self._lock = threading.Lock()
         self._dispatch_condition = threading.Condition(self._lock)
@@ -429,8 +434,12 @@ class FakeExecutor:
             )
             remote_command = shlex.split(argv[-1])
             dispatch_marker = remote_command.index("fleet-dispatch")
-            parity_validation = remote_command[dispatch_marker + 16]
-            remote_run_args = remote_command[dispatch_marker + 17 :]
+            qualification_family = remote_command[dispatch_marker + 15]
+            run_phase = remote_command[dispatch_marker + 16]
+            leaderboard_eligible = remote_command[dispatch_marker + 17]
+            exclusion_reason = remote_command[dispatch_marker + 18]
+            parity_validation = remote_command[dispatch_marker + 20]
+            remote_run_args = remote_command[dispatch_marker + 21 :]
             with self._dispatch_condition:
                 attempt = self.dispatch_attempts.get(label, 0) + 1
                 self.dispatch_attempts[label] = attempt
@@ -444,6 +453,10 @@ class FakeExecutor:
                 self.dispatch_concurrency[label] = int(remote_run_args[10])
                 self.dispatch_arguments[label] = remote_run_args
                 self.dispatch_parity_validation[label] = parity_validation
+                self.dispatch_qualification_family[label] = qualification_family
+                self.dispatch_phase[label] = run_phase
+                self.dispatch_leaderboard_eligible[label] = leaderboard_eligible
+                self.dispatch_exclusion_reason[label] = exclusion_reason
                 self.events.append(("dispatch", label))
                 self.remote_states[label] = "running"
                 self._dispatch_condition.notify_all()
@@ -639,6 +652,45 @@ def test_controller_rejects_task_subset_without_canonical_parent(
 
     with pytest.raises(FleetError, match="task subset lacks rerun_of_canonical_run"):
         FleetController(config, executor=executor).run()
+
+
+def test_controller_accepts_non_scoring_ten_task_r0(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt56-sol-high-smoke-10-r0-20260729"
+    run = _planned(
+        _run_spec(
+            label,
+            expected_task_count=10,
+            model_slug="gpt56-sol",
+            repetition=0,
+        )
+    )
+    run.update(
+        {
+            "phase": "r0",
+            "qualification_family": "gpt-5.6",
+            "task_names": [f"task-{index}" for index in range(10)],
+            "leaderboard_eligible": False,
+            "exclusion_reason": "r0_non_scoring_qualification",
+        }
+    )
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run], expected_task_count=116)
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 10})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    assert executor.dispatch_qualification_family[label] == "gpt-5.6"
+    assert executor.dispatch_phase[label] == "r0"
+    assert executor.dispatch_leaderboard_eligible[label] == "false"
+    assert executor.dispatch_exclusion_reason[label] == (
+        "r0_non_scoring_qualification"
+    )
+    assert executor.dispatch_arguments[label][16:] == [
+        f"task-{index}" for index in range(10)
+    ]
 
 
 def test_capacity_warmup_retries_same_run_without_recovery_churn(

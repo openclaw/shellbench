@@ -100,6 +100,45 @@ def test_run_index_supports_six_repetitions_and_filters(
     assert all("-medium-full-" in str(entry["run_label"]) for entry in entries)
 
 
+def test_run_index_builds_non_scoring_ten_task_r0(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    tasks = [SimpleNamespace(name=f"task-{index}") for index in range(12)]
+    monkeypatch.setattr(native_plan, "validate_suite", lambda _root: tasks)
+    selected = [task.name for task in tasks[:10]]
+
+    entries = native_plan.write_run_index(
+        tasks_root=tmp_path,
+        output=tmp_path / "run-index.json",
+        public_tasks_commit="tasks-commit",
+        run_date="20260729",
+        reasoning_effort="high",
+        judge_reasoning_effort="high",
+        harness_names=["openclaw"],
+        model_slugs=["gpt56-sol"],
+        phase="r0",
+        task_names=selected,
+        qualification_family="gpt-5.6",
+    )
+
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["repetition"] == 0
+    assert entry["expected_task_count"] == 10
+    assert entry["task_names"] == selected
+    assert entry["phase"] == "r0"
+    assert entry["qualification_family"] == "gpt-5.6"
+    assert entry["leaderboard_eligible"] is False
+    assert entry["exclusion_reason"] == "r0_non_scoring_qualification"
+    assert entry["run_label"] == (
+        "openclaw-gpt56-sol-high-smoke-10-r0-20260729"
+    )
+    index = json.loads((tmp_path / "run-index.json").read_text())
+    assert index["expected_task_count"] == 12
+    assert index["planned_repetitions"] == [0]
+
+
 def test_plan_cli_accepts_repetition_count_and_filters() -> None:
     args = native_plan.parse_args(
         [
@@ -125,6 +164,37 @@ def test_plan_cli_accepts_repetition_count_and_filters() -> None:
     assert args.repetitions == 6
     assert args.harness_names == ["openclaw"]
     assert args.model_slugs == ["gpt56-sol"]
+
+
+def test_plan_cli_accepts_r0_qualification_inputs() -> None:
+    task_args = [item for index in range(10) for item in ("--task", f"task-{index}")]
+    args = native_plan.parse_args(
+        [
+            "--tasks-root",
+            "tasks",
+            "--output",
+            "run-index.json",
+            "--public-tasks-commit",
+            "abc",
+            "--run-date",
+            "20260729",
+            "--reasoning-effort",
+            "high",
+            "--phase",
+            "r0",
+            "--qualification-family",
+            "gpt-5.6",
+            "--harness",
+            "openclaw",
+            "--model",
+            "gpt56-sol",
+            *task_args,
+        ]
+    )
+
+    assert args.phase == "r0"
+    assert args.qualification_family == "gpt-5.6"
+    assert args.task_names == [f"task-{index}" for index in range(10)]
 
 
 def test_run_job_cli_accepts_repetition_six() -> None:
@@ -154,6 +224,35 @@ def test_run_job_cli_accepts_repetition_six() -> None:
     )
 
     assert args.repetition == 6
+
+
+def test_run_job_cli_accepts_r0() -> None:
+    args = parse_run_job_args(
+        [
+            "--tasks-root",
+            "tasks",
+            "--jobs-dir",
+            "jobs",
+            "--run-label",
+            "openclaw-gpt56-sol-high-smoke-10-r0-20260729",
+            "--harness",
+            "openclaw",
+            "--model-slug",
+            "gpt56-sol",
+            "--repetition",
+            "0",
+            "--expected-task-count",
+            "10",
+            "--public-tasks-commit",
+            "abc",
+            "--task-suite-path",
+            "combined tasks/tasks",
+            "--run-date",
+            "20260729",
+        ]
+    )
+
+    assert args.repetition == 0
 
 
 def test_task_loader_accepts_rich_manifest_and_compose(tmp_path: Path) -> None:
@@ -301,12 +400,56 @@ def test_run_manifest_records_native_audit_metadata(
     assert manifest["provider_model_id"] == "gpt-5.5"
     assert manifest["reasoning_effort"] == "high"
     assert manifest["judge_reasoning_effort"] == "high"
+    assert manifest["phase"] == "full"
+    assert manifest["qualification_family"] is None
+    assert manifest["leaderboard_eligible"] is None
+    assert manifest["exclusion_reason"] is None
     assert manifest["repair_mode"] is False
     assert manifest["rerun_of_canonical_run"] is None
     assert manifest["repair_task_names"] == []
     assert manifest["parity_validated"] is False
     assert manifest["parity_validation"] is None
     assert manifest["legacy_parity_validated_claim"] is False
+
+
+def test_run_manifest_excludes_r0_from_leaderboard(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SHELLBENCH_RUN_PHASE", "r0")
+    monkeypatch.setenv("SHELLBENCH_QUALIFICATION_FAMILY", "gpt-5.6")
+    monkeypatch.setenv("SHELLBENCH_LEADERBOARD_ELIGIBLE", "false")
+    monkeypatch.setenv(
+        "SHELLBENCH_EXCLUSION_REASON",
+        "r0_non_scoring_qualification",
+    )
+    run = RunSpec(
+        run_label="openclaw-gpt56-sol-high-smoke-10-r0-20260729",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=0,
+        expected_task_count=10,
+        run_date="20260729",
+    )
+
+    manifest = _run_manifest(
+        run,
+        public_tasks_commit="tasks-commit",
+        task_suite_path="combined tasks/tasks",
+        concurrency=2,
+        started_at="2026-07-29T00:00:00Z",
+        tasks_root=tmp_path,
+        tasks=[],
+    )
+
+    assert manifest["phase"] == "r0"
+    assert manifest["qualification_family"] == "gpt-5.6"
+    assert manifest["leaderboard_eligible"] is False
+    assert manifest["exclusion_reason"] == "r0_non_scoring_qualification"
 
 
 def test_run_manifest_scopes_parity_to_matching_route(

@@ -36,6 +36,7 @@ def test_research_audit_exports_identity_turn_tool_and_usage_tables(
                     "judge_model_id": "gpt-5.6-sol",
                     "judge_reasoning_effort": "high",
                     "repetition": 1,
+                    "phase": "full",
                     "expected_task_count": 1,
                 }
             ]
@@ -129,6 +130,7 @@ def test_research_audit_exports_identity_turn_tool_and_usage_tables(
     assert trace_row["judge_identity_status"] == (
         "unverified_requires_proxy_request_evidence"
     )
+    assert trace_row["phase"] == "full"
     assert trace_row["cost_provenance"] == "exact_harness"
     with (output / "turn_usage.csv").open(newline="", encoding="utf-8") as handle:
         turn_row = next(csv.DictReader(handle))
