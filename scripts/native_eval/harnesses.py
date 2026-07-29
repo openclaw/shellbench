@@ -580,7 +580,17 @@ def _openclaw(
             "load": {"paths": [audit_plugin_root]},
             "entries": {"shellbench-audit": {"enabled": True}},
         },
-        "tools": {"deny": ["message"]},
+        "tools": {
+            "deny": ["message"],
+            "toolSearch": (
+                {
+                    "enabled": True,
+                    "mode": run.openclaw_tool_search_mode,
+                }
+                if run.openclaw_tool_search_mode
+                else False
+            ),
+        },
     }
     if servers:
         config["mcp"] = {"servers": servers}

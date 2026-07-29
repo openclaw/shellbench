@@ -32,6 +32,7 @@ class RunSpec:
     repetition: int
     expected_task_count: int
     run_date: str
+    openclaw_tool_search_mode: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)

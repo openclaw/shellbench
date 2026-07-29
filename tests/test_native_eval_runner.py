@@ -415,6 +415,7 @@ def test_run_manifest_records_native_audit_metadata(
     assert manifest["parity_validated"] is False
     assert manifest["parity_validation"] is None
     assert manifest["legacy_parity_validated_claim"] is False
+    assert manifest["openclaw_tool_search_mode"] is None
 
 
 def test_run_manifest_excludes_r0_from_leaderboard(
@@ -612,6 +613,29 @@ def test_run_spec_preserves_explicit_planned_identity() -> None:
     assert run.proxy_model_name == "planned-proxy-name"
 
 
+def test_run_spec_normalizes_empty_tool_search_mode(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SHELLBENCH_OPENCLAW_TOOL_SEARCH_MODE", "")
+
+    run = build_run_spec(
+        Namespace(
+            run_label="openclaw-tool-search-off",
+            harness="openclaw",
+            harness_version="planned-version",
+            model_slug="gpt55",
+            model_id="gpt-5.5",
+            model_provider="openai",
+            proxy_model_name="gpt-5.5",
+            repetition=1,
+            expected_task_count=3,
+            run_date="20260729",
+        )
+    )
+
+    assert run.openclaw_tool_search_mode is None
+
+
 def test_harness_commands_preserve_canonical_model_identity() -> None:
     for harness in HARNESSES:
         run = RunSpec(
@@ -677,6 +701,55 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
         if harness.name == "codex":
             assert "2>/logs/agent/codex-stderr.txt" in command.run_command
             assert "cat /logs/agent/codex-stderr.txt >&2" in command.run_command
+
+
+def test_openclaw_harness_disables_tool_search_by_default() -> None:
+    run = RunSpec(
+        run_label="openclaw-tool-search-off",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=4,
+        run_date="20260729",
+    )
+
+    command = build_harness_command(
+        run,
+        proxy_url="http://host.docker.internal:4000",
+        proxy_key="local-proxy-key",
+        mcp_servers=(),
+    )
+
+    assert '"toolSearch":false' in command.setup_command
+
+
+def test_openclaw_harness_configures_tool_search_code_mode() -> None:
+    run = RunSpec(
+        run_label="openclaw-tool-search-code",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=4,
+        run_date="20260729",
+        openclaw_tool_search_mode="code",
+    )
+
+    command = build_harness_command(
+        run,
+        proxy_url="http://host.docker.internal:4000",
+        proxy_key="local-proxy-key",
+        mcp_servers=(),
+    )
+
+    assert '"toolSearch":{"enabled":true,"mode":"code"}' in command.setup_command
 
 
 def test_openclaw_completion_probe_accepts_markerless_final_envelope(

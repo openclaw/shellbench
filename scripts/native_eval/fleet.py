@@ -48,6 +48,7 @@ RERUN_STATUSES = {"failed", "lease_lost"}
 ACTIVE_RUN_STATUSES = {"leasing", "bootstrapping", "ready", "running"}
 CLEANUP_STATUSES = {"exported", "stop_pending"}
 REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+OPENCLAW_TOOL_SEARCH_MODES = {"directory", "code"}
 # Crabbox's coordinator release path retries five 60-second requests with
 # bounded backoff. Give it enough time to finish instead of leaking live AWS
 # leases after a verified export.
@@ -441,6 +442,18 @@ class FleetController:
                     f"{run.run_label} must set judge_reasoning_effort to "
                     "low, medium, high, or xhigh"
                 )
+            tool_search_mode = str(entry.get("openclaw_tool_search_mode") or "")
+            if tool_search_mode:
+                if run.harness != "openclaw":
+                    raise FleetError(
+                        f"{run.run_label} openclaw_tool_search_mode requires the "
+                        "OpenClaw harness"
+                    )
+                if tool_search_mode not in OPENCLAW_TOOL_SEARCH_MODES:
+                    raise FleetError(
+                        f"{run.run_label} must set openclaw_tool_search_mode to "
+                        f"one of {sorted(OPENCLAW_TOOL_SEARCH_MODES)}"
+                    )
 
     def _prepare_inputs(self) -> None:
         for path, description in (
@@ -958,7 +971,8 @@ exclusion_reason=$9
 shift 9
 parity_validated=$1
 parity_validation_json=$2
-shift 2
+openclaw_tool_search_mode=$3
+shift 3
 mkdir -p "$root/run-logs"
 stdout="$root/run-logs/$label.stdout.log"
 stderr="$root/run-logs/$label.stderr.log"
@@ -981,6 +995,7 @@ nohup env \
   "SHELLBENCH_EXCLUSION_REASON=$exclusion_reason" \
   "SHELLBENCH_PARITY_VALIDATED=$parity_validated" \
   "SHELLBENCH_PARITY_VALIDATION_JSON=$parity_validation_json" \
+  "SHELLBENCH_OPENCLAW_TOOL_SEARCH_MODE=$openclaw_tool_search_mode" \
   "$root/runner/scripts/native_eval/remote_run.sh" "$@" \
   >"$stdout" 2>"$stderr" </dev/null &
 pid=$!
@@ -1031,6 +1046,9 @@ printf '%s\n' "$pid"
                 separators=(",", ":"),
                 sort_keys=True,
             )
+        openclaw_tool_search_mode = str(
+            entry.get("openclaw_tool_search_mode") or ""
+        )
         command = self._ssh_command(
             lease,
             [
@@ -1058,6 +1076,7 @@ printf '%s\n' "$pid"
                 exclusion_reason,
                 str(self.config.parity_validated).lower(),
                 parity_validation,
+                openclaw_tool_search_mode,
                 *args,
             ],
         )
@@ -1463,6 +1482,9 @@ printf '%s\n' "$pid"
             "run_label": label,
             "reasoning_effort": entry.get("reasoning_effort"),
             "judge_reasoning_effort": entry.get("judge_reasoning_effort"),
+            "openclaw_tool_search_mode": entry.get(
+                "openclaw_tool_search_mode"
+            ),
             "phase": entry.get("phase"),
             "qualification_family": entry.get("qualification_family"),
             "attempt": next_attempt,
@@ -1478,6 +1500,7 @@ printf '%s\n' "$pid"
             "task_names",
             "rerun_of_canonical_run",
             "repair_classifications",
+            "openclaw_tool_search_mode",
         ):
             if metadata_field in entry:
                 rerun[metadata_field] = copy.deepcopy(entry[metadata_field])
@@ -1498,7 +1521,12 @@ printf '%s\n' "$pid"
 
     def _run_spec(self, entry: dict[str, Any]) -> RunSpec:
         try:
-            return RunSpec(**{field: entry[field] for field in RUN_SPEC_FIELDS})
+            return RunSpec(
+                **{field: entry[field] for field in RUN_SPEC_FIELDS},
+                openclaw_tool_search_mode=entry.get(
+                    "openclaw_tool_search_mode"
+                ),
+            )
         except KeyError as exc:
             raise FleetError(
                 f"run entry {entry.get('run_label', '<unknown>')} lacks {exc.args[0]}"

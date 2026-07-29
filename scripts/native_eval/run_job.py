@@ -271,6 +271,11 @@ def _run_manifest(
         ),
         "judge_model_id": os.environ.get("SHELLBENCH_JUDGE_MODEL_ID"),
         "reasoning_effort": os.environ.get("SHELLBENCH_REASONING_EFFORT"),
+        "openclaw_tool_search_mode": (
+            run.openclaw_tool_search_mode
+            or os.environ.get("SHELLBENCH_OPENCLAW_TOOL_SEARCH_MODE")
+            or None
+        ),
         "judge_reasoning_effort": os.environ.get(
             "SHELLBENCH_JUDGE_REASONING_EFFORT"
         ),
@@ -358,6 +363,9 @@ def _runner_patch_hash() -> str:
 def build_run_spec(args: argparse.Namespace) -> RunSpec:
     harness = harness_by_name(args.harness)
     model = model_by_slug(args.model_slug)
+    openclaw_tool_search_mode = os.environ.get(
+        "SHELLBENCH_OPENCLAW_TOOL_SEARCH_MODE"
+    ) or None
     return RunSpec(
         run_label=args.run_label,
         harness=harness.name,
@@ -369,6 +377,7 @@ def build_run_spec(args: argparse.Namespace) -> RunSpec:
         repetition=args.repetition,
         expected_task_count=args.expected_task_count,
         run_date=args.run_date,
+        openclaw_tool_search_mode=openclaw_tool_search_mode,
     )
 
 
