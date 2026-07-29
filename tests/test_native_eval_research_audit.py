@@ -4,12 +4,57 @@ import csv
 import json
 from pathlib import Path
 
-from scripts.native_eval.research_audit import export_research_tables
+from scripts.native_eval.research_audit import (
+    _discovery_status,
+    _openclaw_code_discovery_rows,
+    _structured_discovery_row,
+    export_research_tables,
+)
 
 
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def test_structured_discovery_success_stays_unknown_without_result_status() -> None:
+    row = _structured_discovery_row(
+        base={},
+        function_name="tool_call",
+        arguments={"id": "openclaw:core:read"},
+    )
+
+    assert row is not None
+    assert row["success"] == ""
+
+
+def test_zero_count_code_telemetry_is_observed_but_not_exercised() -> None:
+    rows, telemetry_observed = _openclaw_code_discovery_rows(
+        base={},
+        observation=json.dumps(
+            {
+                "telemetry": {
+                    "catalogSize": 12,
+                    "searchCount": 0,
+                    "describeCount": 0,
+                    "callCount": 0,
+                }
+            }
+        ),
+    )
+
+    assert rows == []
+    assert telemetry_observed is True
+    assert (
+        _discovery_status(
+            harness="openclaw",
+            openclaw_mode="code",
+            tool_names=["tool_search_code"],
+            discovery_rows=rows,
+            telemetry_observed=telemetry_observed,
+        )
+        == "supported_not_exercised"
+    )
 
 
 def test_research_audit_exports_identity_turn_tool_and_usage_tables(
@@ -132,6 +177,7 @@ def test_research_audit_exports_identity_turn_tool_and_usage_tables(
     )
     assert trace_row["phase"] == "full"
     assert trace_row["cost_provenance"] == "exact_harness"
+    assert trace_row["discovery_status"] == "disabled"
     with (output / "turn_usage.csv").open(newline="", encoding="utf-8") as handle:
         turn_row = next(csv.DictReader(handle))
     assert turn_row["n_input_tokens"] == "12"
@@ -140,6 +186,138 @@ def test_research_audit_exports_identity_turn_tool_and_usage_tables(
         tool_row = next(csv.DictReader(handle))
     assert tool_row["function_name"] == "shell"
     assert tool_row["observation_excerpt"] == "/workspace"
+    with (output / "discovery_events.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        assert list(csv.DictReader(handle)) == []
+
+
+def test_research_audit_exports_openclaw_code_discovery_telemetry(
+    tmp_path: Path,
+) -> None:
+    run_label = "openclaw-gpt55-high-ablation-1-r1-20260729"
+    run_index = tmp_path / "run-index.json"
+    extracted = tmp_path / "extracted"
+    output = tmp_path / "analysis"
+    job_dir = extracted / run_label
+    trial_dir = job_dir / "task__abc"
+    trajectory_path = trial_dir / "agent" / "trajectory.json"
+    _write_json(
+        run_index,
+        {
+            "runs": [
+                {
+                    "run_label": run_label,
+                    "harness": "openclaw",
+                    "harness_version": "2026.7.1-2",
+                    "model_slug": "gpt55",
+                    "model_id": "gpt-5.5",
+                    "reasoning_effort": "high",
+                    "repetition": 1,
+                    "expected_task_count": 1,
+                    "openclaw_tool_search_mode": "code",
+                }
+            ]
+        },
+    )
+    _write_json(
+        job_dir / "run_manifest.json",
+        {
+            "run_label": run_label,
+            "runner_commit": "runner-sha",
+            "openclaw_tool_search_mode": "code",
+        },
+    )
+    _write_json(
+        trial_dir / "result.json",
+        {
+            "task_id": {"path": "/tasks/example-task"},
+            "agent_result": {
+                "trajectory_status": "real",
+                "runtime_model_name": "gpt-5.5",
+                "canonical_model_identity": True,
+            },
+        },
+    )
+    _write_json(
+        trajectory_path,
+        {
+            "agent": {
+                "name": "openclaw",
+                "version": "2026.7.1-2",
+                "model_name": "openai/gpt-5.5",
+            },
+            "steps": [
+                {
+                    "source": "agent",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": "call-1",
+                            "function_name": "tool_search_code",
+                            "arguments": {
+                                "code": "return await openclaw.tools.search('mail')"
+                            },
+                        }
+                    ],
+                    "observation": {
+                        "results": [
+                            {
+                                "source_call_id": "call-1",
+                                "content": json.dumps(
+                                    {
+                                        "ok": True,
+                                        "telemetry": {
+                                            "catalogSize": 42,
+                                            "sources": {
+                                                "openclaw": 30,
+                                                "mcp": 10,
+                                                "client": 2,
+                                            },
+                                            "searchCount": 2,
+                                            "describeCount": 1,
+                                            "callCount": 1,
+                                        },
+                                    }
+                                ),
+                            }
+                        ]
+                    },
+                }
+            ],
+            "extra": {
+                "observed_models": ["gpt-5.5"],
+                "trace_fidelity": "session",
+            },
+        },
+    )
+
+    summary = export_research_tables(
+        run_index_path=run_index,
+        extracted_root=extracted,
+        output_dir=output,
+    )
+
+    assert summary["discovery_event_count"] == 4
+    with (output / "trace_inventory.csv").open(newline="", encoding="utf-8") as handle:
+        trace_row = next(csv.DictReader(handle))
+    assert trace_row["runner_commit"] == "runner-sha"
+    assert trace_row["trace_fidelity"] == "session"
+    assert trace_row["discovery_status"] == "observed"
+    assert trace_row["discovery_event_count"] == "4"
+    with (output / "discovery_events.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    assert [(row["operation"], row["count"]) for row in rows] == [
+        ("search", "2"),
+        ("describe", "1"),
+        ("call", "1"),
+    ]
+    assert {row["catalog_size"] for row in rows} == {"42"}
+    assert {row["success"] for row in rows} == {""}
+    assert {row["trace_fidelity"] for row in rows} == {"session"}
 
 
 def test_research_audit_fails_identity_when_trace_is_missing(tmp_path: Path) -> None:

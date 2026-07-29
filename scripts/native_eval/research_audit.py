@@ -1,4 +1,4 @@
-"""Export task, turn, tool, usage, and model-identity research tables."""
+"""Export task, turn, tool, discovery, usage, and identity research tables."""
 
 from __future__ import annotations
 
@@ -33,9 +33,13 @@ TRACE_FIELDS = (
     "trajectory_path",
     "toolchain_manifest_path",
     "proxy_log_path",
+    "runner_commit",
     "trajectory_status",
+    "trace_fidelity",
     "observed_model_ids",
     "model_identity_status",
+    "discovery_status",
+    "discovery_event_count",
     "turn_count",
     "tool_call_count",
     "n_input_tokens",
@@ -82,6 +86,27 @@ TOOL_FIELDS = (
     "arguments_json",
     "observation_chars",
     "observation_excerpt",
+    "trajectory_path",
+)
+
+DISCOVERY_FIELDS = (
+    "run_label",
+    "harness",
+    "model_slug",
+    "expected_model_id",
+    "reasoning_effort",
+    "repetition",
+    "task_name",
+    "turn_index",
+    "tool_call_id",
+    "operation",
+    "count",
+    "query",
+    "selected_id",
+    "catalog_size",
+    "source_breakdown_json",
+    "success",
+    "trace_fidelity",
     "trajectory_path",
 )
 
@@ -303,6 +328,155 @@ def _observation(step: dict[str, Any], call_id: str) -> str:
     return "\n".join(str(item.get("content") or "") for item in selected)
 
 
+def _json_values(text: str) -> list[Any]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    try:
+        return [json.loads(stripped)]
+    except json.JSONDecodeError:
+        pass
+    values: list[Any] = []
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        values.append(value)
+    return values
+
+
+def _find_tool_search_telemetry(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        telemetry = value.get("telemetry")
+        if isinstance(telemetry, dict) and any(
+            key in telemetry for key in ("catalogSize", "searchCount", "describeCount", "callCount")
+        ):
+            return telemetry
+        for child in value.values():
+            found = _find_tool_search_telemetry(child)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_tool_search_telemetry(child)
+            if found is not None:
+                return found
+    return None
+
+
+def _openclaw_code_discovery_rows(
+    *,
+    base: dict[str, Any],
+    observation: str,
+) -> tuple[list[dict[str, Any]], bool]:
+    telemetry = next(
+        (
+            found
+            for value in _json_values(observation)
+            if (found := _find_tool_search_telemetry(value)) is not None
+        ),
+        None,
+    )
+    if telemetry is None:
+        return [], False
+    sources = telemetry.get("sources")
+    source_breakdown = sources if isinstance(sources, dict) else {}
+    rows: list[dict[str, Any]] = []
+    for operation, key in (
+        ("search", "searchCount"),
+        ("describe", "describeCount"),
+        ("call", "callCount"),
+    ):
+        count = _number(telemetry.get(key))
+        if count is None or count <= 0:
+            continue
+        rows.append(
+            {
+                **base,
+                "operation": operation,
+                "count": count,
+                "query": "",
+                "selected_id": "",
+                "catalog_size": _number(telemetry.get("catalogSize")),
+                "source_breakdown_json": json.dumps(
+                    source_breakdown,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+                "success": "",
+            }
+        )
+    return rows, True
+
+
+def _structured_discovery_row(
+    *,
+    base: dict[str, Any],
+    function_name: str,
+    arguments: Any,
+) -> dict[str, Any] | None:
+    operation = {
+        "tool_search": "search",
+        "tool_describe": "describe",
+        "tool_call": "call",
+    }.get(function_name)
+    if operation is None:
+        return None
+    values = arguments if isinstance(arguments, dict) else {}
+    return {
+        **base,
+        "operation": operation,
+        "count": 1,
+        "query": values.get("query") if operation == "search" else "",
+        "selected_id": (
+            values.get("id") or values.get("toolId") or values.get("name")
+            if operation in {"describe", "call"}
+            else ""
+        ),
+        "catalog_size": "",
+        "source_breakdown_json": "{}",
+        "success": "",
+    }
+
+
+def _discovery_status(
+    *,
+    harness: str,
+    openclaw_mode: str,
+    tool_names: list[str],
+    discovery_rows: list[dict[str, Any]],
+    telemetry_observed: bool,
+) -> str:
+    if harness == "openclaw":
+        if discovery_rows:
+            return "observed"
+        if telemetry_observed:
+            return "supported_not_exercised"
+        if any(
+            name
+            in {
+                "tool_search_code",
+                "tool_search",
+                "tool_describe",
+                "tool_call",
+            }
+            for name in tool_names
+        ):
+            return "unobservable"
+        return "supported_not_exercised" if openclaw_mode else "disabled"
+    if harness == "codex":
+        return "unobservable_native_stream"
+    return "unsupported"
+
+
+def _discovery_operation_count(rows: list[dict[str, Any]]) -> int:
+    return sum(int(_number(row.get("count")) or 0) for row in rows)
+
+
 def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
@@ -382,6 +556,7 @@ def export_research_tables(
     trace_rows: list[dict[str, Any]] = []
     turn_rows: list[dict[str, Any]] = []
     tool_rows: list[dict[str, Any]] = []
+    discovery_rows: list[dict[str, Any]] = []
     run_rows: list[dict[str, Any]] = []
 
     for entry_value in run_index["runs"]:
@@ -399,6 +574,14 @@ def export_research_tables(
         harness_version_status = _version_status(
             requested_harness_version,
             installed_harness_version,
+        )
+        job_manifest = _read_json(job_dir / "run_manifest.json") if job_dir else {}
+        job_manifest = job_manifest or {}
+        runner_commit = str(job_manifest.get("runner_commit") or "")
+        openclaw_mode = str(
+            entry.get("openclaw_tool_search_mode")
+            or job_manifest.get("openclaw_tool_search_mode")
+            or ""
         )
         proxy_log_path = proxy_logs.get(run_label)
         counters: Counter[str] = Counter()
@@ -434,6 +617,7 @@ def export_research_tables(
             steps = trajectory.get("steps")
             if not isinstance(steps, list):
                 steps = []
+            trace_fidelity = str(_nested(trajectory, "extra", "trace_fidelity") or "")
             input_tokens, cache_tokens, output_tokens = _usage(agent_result, trajectory)
             cost, cost_provenance = _cost(agent_result, trajectory)
             counters[
@@ -442,6 +626,9 @@ def export_research_tables(
                 else "task_cost_unavailable"
             ] += 1
             task_tool_count = 0
+            task_tool_names: list[str] = []
+            task_discovery_rows: list[dict[str, Any]] = []
+            task_discovery_telemetry_observed = False
 
             for turn_index, step_value in enumerate(steps):
                 if not isinstance(step_value, dict):
@@ -481,6 +668,8 @@ def export_research_tables(
                     call_id = str(call_value.get("tool_call_id") or "")
                     observation = _observation(step, call_id)
                     arguments = call_value.get("arguments")
+                    function_name = str(call_value.get("function_name") or "")
+                    task_tool_names.append(function_name)
                     tool_rows.append(
                         {
                             "run_label": run_label,
@@ -493,7 +682,7 @@ def export_research_tables(
                             "turn_index": turn_index,
                             "tool_index": tool_index,
                             "tool_call_id": call_id,
-                            "function_name": call_value.get("function_name"),
+                            "function_name": function_name,
                             "arguments_json": json.dumps(
                                 arguments,
                                 ensure_ascii=True,
@@ -504,6 +693,46 @@ def export_research_tables(
                             "trajectory_path": str(trajectory_path),
                         }
                     )
+                    discovery_base = {
+                        "run_label": run_label,
+                        "harness": harness,
+                        "model_slug": entry.get("model_slug"),
+                        "expected_model_id": expected_model_id,
+                        "reasoning_effort": entry.get("reasoning_effort"),
+                        "repetition": entry.get("repetition"),
+                        "task_name": task_name,
+                        "turn_index": turn_index,
+                        "tool_call_id": call_id,
+                        "trace_fidelity": trace_fidelity,
+                        "trajectory_path": str(trajectory_path),
+                    }
+                    if harness == "openclaw" and function_name == "tool_search_code":
+                        code_rows, telemetry_observed = _openclaw_code_discovery_rows(
+                            base=discovery_base,
+                            observation=observation,
+                        )
+                        task_discovery_rows.extend(code_rows)
+                        task_discovery_telemetry_observed |= telemetry_observed
+                    elif harness == "openclaw":
+                        discovery_row = _structured_discovery_row(
+                            base=discovery_base,
+                            function_name=function_name,
+                            arguments=arguments,
+                        )
+                        if discovery_row is not None:
+                            task_discovery_rows.append(discovery_row)
+
+            discovery_status = _discovery_status(
+                harness=harness,
+                openclaw_mode=openclaw_mode,
+                tool_names=task_tool_names,
+                discovery_rows=task_discovery_rows,
+                telemetry_observed=task_discovery_telemetry_observed,
+            )
+            task_discovery_operation_count = _discovery_operation_count(
+                task_discovery_rows
+            )
+            discovery_rows.extend(task_discovery_rows)
 
             trace_rows.append(
                 {
@@ -532,9 +761,13 @@ def export_research_tables(
                         str(toolchain_path) if toolchain_path else ""
                     ),
                     "proxy_log_path": str(proxy_log_path) if proxy_log_path else "",
+                    "runner_commit": runner_commit,
                     "trajectory_status": agent_result.get("trajectory_status"),
+                    "trace_fidelity": trace_fidelity,
                     "observed_model_ids": json.dumps(sorted(observed)),
                     "model_identity_status": identity_status,
+                    "discovery_status": discovery_status,
+                    "discovery_event_count": task_discovery_operation_count,
                     "turn_count": len(steps),
                     "tool_call_count": task_tool_count,
                     "n_input_tokens": input_tokens,
@@ -589,12 +822,14 @@ def export_research_tables(
     _write_csv(output_dir / "trace_inventory.csv", TRACE_FIELDS, trace_rows)
     _write_csv(output_dir / "turn_usage.csv", TURN_FIELDS, turn_rows)
     _write_csv(output_dir / "tool_calls.csv", TOOL_FIELDS, tool_rows)
+    _write_csv(output_dir / "discovery_events.csv", DISCOVERY_FIELDS, discovery_rows)
     _write_csv(output_dir / "model_identity_audit.csv", RUN_AUDIT_FIELDS, run_rows)
     summary = {
         "run_count": len(run_rows),
         "task_result_count": len(trace_rows),
         "turn_count": len(turn_rows),
         "tool_call_count": len(tool_rows),
+        "discovery_event_count": _discovery_operation_count(discovery_rows),
         "identity_audit_pass_count": sum(
             row["model_identity_audit_passed"] is True for row in run_rows
         ),
@@ -616,6 +851,7 @@ def export_research_tables(
             "trace_inventory": "trace_inventory.csv",
             "turn_usage": "turn_usage.csv",
             "tool_calls": "tool_calls.csv",
+            "discovery_events": "discovery_events.csv",
             "model_identity_audit": "model_identity_audit.csv",
         },
     }
