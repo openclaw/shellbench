@@ -40,6 +40,9 @@ mlflow = [
 analysis = [
     "matplotlib>=3.9,<4",
 ]
+s3 = [
+    "boto3>=1.40,<2",
+]
 hermes = [
     "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main",
 ]

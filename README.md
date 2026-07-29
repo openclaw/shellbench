@@ -456,6 +456,32 @@ task variance rankings, a machine-readable JSON summary, `ANALYSIS.md`, and
 SVG box plots. Different task revisions and task counts remain separate
 datasets and are never silently pooled.
 
+### Publishing trace bundles to private S3
+
+Trace bundles can be uploaded without placing static credentials in command
+arguments or repository files. The command uses the standard AWS credential
+chain and does not expose access-key options:
+
+```bash
+pip install -e '.[s3]'
+
+export AWS_PROFILE="your-private-profile"
+export SHELLBENCH_TRACE_BUCKET="your-private-bucket"
+
+clawbench trace-upload \
+  --run-dir runs-full-YYYYMMDD \
+  --prefix runs-full-YYYYMMDD
+```
+
+The uploader selects final and checkpoint artifact archives, trajectory
+validation reports, trace-gap audits, and the run index. It sets no public ACL,
+uses S3-managed encryption, and records SHA-256 metadata; the destination
+bucket policy remains authoritative. Existing objects with matching size and
+digest are skipped, and a verified `S3_UPLOAD_MANIFEST.json` is written locally
+and uploaded last.
+
+Use `--dry-run` to inspect the selected files without authenticating.
+
 ### Running locally with small models (Ollama)
 
 A single consumer GPU running an open-weight model is enough to develop plugin profiles and validate algorithmic ideas — no API keys or cloud spend required.
@@ -540,6 +566,7 @@ clawbench/
 │   ├── dynamics_archive.py         # Cached-run loading + offline report assembly
 │   ├── dynamics_plots.py           # Offline dynamics visualizations
 │   ├── task_analysis.py            # Native matrix task variance + paired deltas
+│   ├── trace_upload.py             # Private S3 trace publishing + verification
 │   └── cli.py                      # CLI entry points
 │
 ├── tasks-public/                   # Core v1 PUBLIC release (19 tasks)

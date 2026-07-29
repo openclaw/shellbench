@@ -31,3 +31,5 @@
   sensitivity when the original job is available.
 - Export native run metadata into aggregate task rows and add task-matrix
   variance analysis with paired harness/reasoning diagnostics and SVG plots.
+- Add private S3 trace-bundle publishing through the standard AWS credential
+  chain with SHA-256 verification and resumable object checks.
