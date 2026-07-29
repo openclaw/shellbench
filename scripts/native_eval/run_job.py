@@ -140,9 +140,19 @@ async def run_job(
     )
     manifest["observed_model_ids"] = sorted(
         {
-            str(result.get("runtime_model_name"))
+            str(model_id)
             for result in agent_results
-            if result.get("runtime_model_name")
+            for model_id in (
+                (
+                    result.get("trajectory_validation", {}).get(
+                        "observed_models",
+                        [],
+                    )
+                )
+                if isinstance(result.get("trajectory_validation"), dict)
+                else []
+            )
+            if model_id
         }
     )
     manifest["trajectory_complete"] = bool(agent_results) and all(
