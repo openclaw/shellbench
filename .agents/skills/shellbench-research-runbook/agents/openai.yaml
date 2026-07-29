@@ -1,0 +1,7 @@
+interface:
+  display_name: "ShellBench Research Runbook"
+  short_description: "Run reproducible, trace-audited benchmark campaigns"
+  default_prompt: "Use $shellbench-research-runbook to plan and audit a full native ShellBench research campaign."
+
+policy:
+  allow_implicit_invocation: true

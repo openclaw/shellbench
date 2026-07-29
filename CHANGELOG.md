@@ -29,3 +29,6 @@
 - Add `gpt-5.6-luna` and `gpt-5.6-terra` to the native evaluation catalog.
 - Report repair-overlay task provenance and original-versus-repaired score
   sensitivity when the original job is available.
+- Add a research campaign skill with smoke gates, n=3 through n=6 execution,
+  private trace retention, strict model-identity checks, pinned harness
+  versions, and task/turn/tool/token/cost analysis exports.
