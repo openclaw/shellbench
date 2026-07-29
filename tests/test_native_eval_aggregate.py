@@ -210,6 +210,54 @@ def test_aggregate_uses_task_path_for_canonical_task_name(tmp_path: Path):
     assert row["task_path"] == "/benchmark/tasks/canonical-task"
 
 
+def test_aggregate_exports_experiment_metadata_and_reasoning_pair_label(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "openclaw-model-medium-r1",
+        expected_task_count=1,
+        results=[_result("task-a", reward=1.0)],
+        pair_label=None,
+        manifest_extra={
+            "harness_version": "2026.7.1",
+            "model_id": "provider/model",
+            "model_provider": "provider",
+            "reasoning_effort": "medium",
+            "judge_model_id": "judge/model",
+            "judge_reasoning_effort": "high",
+            "public_tasks_commit": "abc123",
+            "task_suite": "combined tasks/tasks",
+        },
+    )
+
+    aggregate(jobs_root, summaries_dir)
+
+    with (summaries_dir / "aggregate_results.csv").open(newline="") as handle:
+        run = next(csv.DictReader(handle))
+    with (summaries_dir / "per_task_results.csv").open(newline="") as handle:
+        task = next(csv.DictReader(handle))
+
+    assert run["pair_label"] == "openclaw-model-medium"
+    for row in (run, task):
+        assert row["harness"] == "openclaw"
+        assert row["harness_version"] == "2026.7.1"
+        assert row["model_slug"] == "model"
+        assert row["model_id"] == "provider/model"
+        assert row["model_provider"] == "provider"
+        assert row["reasoning_effort"] == "medium"
+        assert row["judge_model_id"] == "judge/model"
+        assert row["judge_reasoning_effort"] == "high"
+        assert row["task_revision"] == "abc123"
+        assert row["task_suite"] == "combined tasks/tasks"
+    assert task["run_expected_task_count"] == "1"
+    assert task["run_score"] == "1.0"
+    assert task["run_coverage"] == "1.0"
+    assert task["run_exact_passes"] == "1"
+    assert task["run_eligible"] == "True"
+    assert task["run_exclusion_reason"] == ""
+
+
 def test_pair_aggregates_exclude_incomplete_and_infra_dominated_runs(tmp_path: Path):
     jobs_root = tmp_path / "native"
     summaries_dir = tmp_path / "summaries"

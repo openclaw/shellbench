@@ -254,6 +254,111 @@ def dynamics_report(
     click.echo(f"Saved {len(plots)} plots to {output_dir}/")
 
 
+@cli.command("task-analysis")
+@click.option(
+    "--summaries-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help="Directory containing native aggregate_results.csv and per_task_results.csv.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    default=Path("results/task_analysis"),
+    show_default=True,
+    help="Directory where task diagnostics, Markdown, and plots will be written.",
+)
+@click.option(
+    "--no-plots",
+    is_flag=True,
+    help="Write CSV, JSON, and Markdown outputs without rendering SVG plots.",
+)
+def task_analysis(summaries_dir: Path, output_dir: Path, no_plots: bool) -> None:
+    """Analyze task variance across harness, model, and reasoning cells."""
+    from clawbench.task_analysis import analyze_task_matrix
+
+    try:
+        report = analyze_task_matrix(
+            summaries_dir,
+            output_dir,
+            generate_plots=not no_plots,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(
+        f"Analyzed {report['source']['eligible_run_count']} eligible runs "
+        f"across {len(report['datasets'])} task dataset(s)"
+    )
+    click.echo(f"Task analysis saved to {output_dir}")
+
+
+@cli.command("trace-upload")
+@click.option(
+    "--run-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help="Native run directory containing raw/, summaries/, and manifests/.",
+)
+@click.option(
+    "--bucket",
+    envvar="SHELLBENCH_TRACE_BUCKET",
+    default="",
+    help="Private destination bucket. May be set with SHELLBENCH_TRACE_BUCKET.",
+)
+@click.option(
+    "--prefix",
+    default=None,
+    help="Object prefix. Defaults to the run directory name.",
+)
+@click.option(
+    "--workers",
+    type=click.IntRange(1, 32),
+    default=4,
+    show_default=True,
+    help="Number of files to upload concurrently.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the bundle plan without authenticating or uploading.",
+)
+def trace_upload(
+    run_dir: Path,
+    bucket: str,
+    prefix: str | None,
+    workers: int,
+    dry_run: bool,
+) -> None:
+    """Publish native trace archives to private S3 with hash verification."""
+    from clawbench.trace_upload import trace_bundle_plan, upload_trace_bundle
+
+    try:
+        if dry_run:
+            plan = trace_bundle_plan(run_dir)
+            click.echo(json.dumps(plan, indent=2, sort_keys=True))
+            return
+        if not bucket:
+            raise ValueError(
+                "set --bucket or SHELLBENCH_TRACE_BUCKET before uploading"
+            )
+        report = upload_trace_bundle(
+            run_dir,
+            bucket=bucket,
+            prefix=prefix,
+            workers=workers,
+            progress=click.echo,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(
+        f"Verified {report['file_count']} trace objects "
+        f"({report['uploaded_count']} uploaded, {report['skipped_count']} unchanged)"
+    )
+    click.echo(f"Upload manifest saved to {report['manifest_path']}")
+
+
 def _write_dynamics_report(
     task_runs: dict[str, list],
     output_dir: Path,

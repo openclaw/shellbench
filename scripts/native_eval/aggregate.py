@@ -86,6 +86,22 @@ PER_TASK_FIELDS = (
     "run_label",
     "pair_label",
     "repetition",
+    "harness",
+    "harness_version",
+    "model_slug",
+    "model_id",
+    "model_provider",
+    "reasoning_effort",
+    "judge_model_id",
+    "judge_reasoning_effort",
+    "task_revision",
+    "task_suite",
+    "run_expected_task_count",
+    "run_score",
+    "run_coverage",
+    "run_exact_passes",
+    "run_eligible",
+    "run_exclusion_reason",
     "task_name",
     "task_path",
     "trial_name",
@@ -124,6 +140,16 @@ RUN_FIELDS = (
     "run_label",
     "pair_label",
     "repetition",
+    "harness",
+    "harness_version",
+    "model_slug",
+    "model_id",
+    "model_provider",
+    "reasoning_effort",
+    "judge_model_id",
+    "judge_reasoning_effort",
+    "task_revision",
+    "task_suite",
     "expected_task_count",
     "result_file_count",
     "valid_result_count",
@@ -437,8 +463,26 @@ def _pair_label(manifest: dict[str, Any], run_label: str) -> str:
     harness = manifest.get("harness")
     model_slug = manifest.get("model_slug")
     if harness and model_slug:
+        reasoning_effort = manifest.get("reasoning_effort")
+        if reasoning_effort:
+            return f"{harness}-{model_slug}-{reasoning_effort}"
         return f"{harness}-{model_slug}"
     return _derive_pair_label(run_label)
+
+
+def _experiment_metadata(manifest: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "harness": manifest.get("harness") or "",
+        "harness_version": manifest.get("harness_version") or "",
+        "model_slug": manifest.get("model_slug") or "",
+        "model_id": manifest.get("model_id") or manifest.get("provider_model_id") or "",
+        "model_provider": manifest.get("model_provider") or "",
+        "reasoning_effort": manifest.get("reasoning_effort") or "",
+        "judge_model_id": manifest.get("judge_model_id") or "",
+        "judge_reasoning_effort": manifest.get("judge_reasoning_effort") or "",
+        "task_revision": manifest.get("public_tasks_commit") or "",
+        "task_suite": manifest.get("task_suite") or "",
+    }
 
 
 def _repetition(manifest: dict[str, Any], run_label: str) -> int | None:
@@ -782,6 +826,9 @@ def _load_run(
             )
         )
 
+    metadata = _experiment_metadata(manifest)
+    for row in rows:
+        row.update(metadata)
     rows.sort(key=lambda row: (str(row["task_name"]), str(row["trial_name"])))
     summary = _summarize_run(
         run_label=run_label,
@@ -791,6 +838,16 @@ def _load_run(
         rows=rows,
         manifest=manifest,
     )
+    run_context = {
+        "run_expected_task_count": summary["expected_task_count"],
+        "run_score": summary["score"],
+        "run_coverage": summary["coverage"],
+        "run_exact_passes": summary["exact_passes"],
+        "run_eligible": summary["eligible"],
+        "run_exclusion_reason": summary["exclusion_reason"],
+    }
+    for row in rows:
+        row.update(run_context)
     return summary, rows, manifest
 
 
@@ -944,6 +1001,7 @@ def _summarize_run(
         "run_label": run_label,
         "pair_label": pair_label,
         "repetition": repetition,
+        **_experiment_metadata(manifest),
         "expected_task_count": expected_count,
         "result_file_count": result_file_count,
         "valid_result_count": valid_result_count,
