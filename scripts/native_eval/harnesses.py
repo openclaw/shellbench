@@ -882,7 +882,10 @@ def _claude_code(
         'mkdir -p "$CLAUDE_CONFIG_DIR/debug" "$CLAUDE_CONFIG_DIR/projects/-app"; '
         f'printf %s {mcp_json} > "$CLAUDE_CONFIG_DIR/.claude.json"'
     )
-    effort_option = f"--effort {shlex.quote(run.reasoning_effort)} " if run.reasoning_effort else ""
+    # Claude Code names its top effort level "max"; the other native harnesses
+    # use ShellBench's canonical "xhigh" spelling.
+    claude_effort = "max" if run.reasoning_effort == "xhigh" else run.reasoning_effort
+    effort_option = f"--effort {shlex.quote(claude_effort)} " if claude_effort else ""
     run_command = (
         f"export PATH={_base_path()}; export CLAUDE_CONFIG_DIR={home}; "
         "claude --verbose --output-format=stream-json "

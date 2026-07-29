@@ -715,7 +715,8 @@ def test_harness_commands_apply_native_reasoning_effort(
     elif harness == "codex":
         assert f'model_reasoning_effort="{effort}"' in command.run_command
     else:
-        assert f"--effort {effort}" in command.run_command
+        expected_effort = "max" if effort == "xhigh" else effort
+        assert f"--effort {expected_effort}" in command.run_command
 
 
 def test_harness_commands_preserve_defaults_without_reasoning_effort() -> None:
