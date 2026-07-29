@@ -25,7 +25,12 @@ from scripts.native_eval.models import (
 )
 from scripts.native_eval import plan as native_plan
 from scripts.native_eval.proxy import JUDGE_PROXY_MODEL_NAME, write_proxy_config
-from scripts.native_eval.run_job import _git_commit, _run_manifest, build_run_spec
+from scripts.native_eval.run_job import (
+    _git_commit,
+    _run_manifest,
+    build_run_spec,
+    parse_args as parse_run_job_args,
+)
 from scripts.native_eval.runtime import (
     DockerTaskEnvironment,
     build_judge_env,
@@ -64,7 +69,91 @@ def test_run_index_records_agent_and_judge_reasoning(
 
     assert len(entries) == 96
     assert {entry["reasoning_effort"] for entry in entries} == {"high"}
+    assert {entry["judge_model_id"] for entry in entries} == {"gpt-5.6-sol"}
     assert {entry["judge_reasoning_effort"] for entry in entries} == {"high"}
+    assert all("-high-full-" in str(entry["run_label"]) for entry in entries)
+
+
+def test_run_index_supports_six_repetitions_and_filters(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(native_plan, "validate_suite", lambda _root: [object()])
+
+    entries = native_plan.write_run_index(
+        tasks_root=tmp_path,
+        output=tmp_path / "run-index.json",
+        public_tasks_commit="tasks-commit",
+        run_date="20260729",
+        reasoning_effort="medium",
+        judge_reasoning_effort="high",
+        repetitions=6,
+        harness_names=["openclaw", "hermes"],
+        model_slugs=["gpt56-sol"],
+    )
+
+    assert len(entries) == 12
+    assert {entry["harness"] for entry in entries} == {"openclaw", "hermes"}
+    assert {entry["model_slug"] for entry in entries} == {"gpt56-sol"}
+    assert {entry["repetition"] for entry in entries} == set(range(1, 7))
+    assert len({entry["run_label"] for entry in entries}) == 12
+    assert all("-medium-full-" in str(entry["run_label"]) for entry in entries)
+
+
+def test_plan_cli_accepts_repetition_count_and_filters() -> None:
+    args = native_plan.parse_args(
+        [
+            "--tasks-root",
+            "tasks",
+            "--output",
+            "run-index.json",
+            "--public-tasks-commit",
+            "abc",
+            "--run-date",
+            "20260729",
+            "--reasoning-effort",
+            "low",
+            "--repetitions",
+            "6",
+            "--harness",
+            "openclaw",
+            "--model",
+            "gpt56-sol",
+        ]
+    )
+
+    assert args.repetitions == 6
+    assert args.harness_names == ["openclaw"]
+    assert args.model_slugs == ["gpt56-sol"]
+
+
+def test_run_job_cli_accepts_repetition_six() -> None:
+    args = parse_run_job_args(
+        [
+            "--tasks-root",
+            "tasks",
+            "--jobs-dir",
+            "jobs",
+            "--run-label",
+            "openclaw-gpt56-sol-high-full-115-r6-20260729",
+            "--harness",
+            "openclaw",
+            "--model-slug",
+            "gpt56-sol",
+            "--repetition",
+            "6",
+            "--expected-task-count",
+            "115",
+            "--public-tasks-commit",
+            "abc",
+            "--task-suite-path",
+            "combined tasks/tasks",
+            "--run-date",
+            "20260729",
+        ]
+    )
+
+    assert args.repetition == 6
 
 
 def test_task_loader_accepts_rich_manifest_and_compose(tmp_path: Path) -> None:

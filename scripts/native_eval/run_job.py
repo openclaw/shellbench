@@ -350,7 +350,14 @@ def build_run_spec(args: argparse.Namespace) -> RunSpec:
     )
 
 
-def parse_args() -> argparse.Namespace:
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks-root", type=Path, required=True)
     parser.add_argument("--jobs-dir", type=Path, required=True)
@@ -361,7 +368,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id")
     parser.add_argument("--model-provider")
     parser.add_argument("--proxy-model-name")
-    parser.add_argument("--repetition", type=int, choices=(1, 2, 3), required=True)
+    parser.add_argument("--repetition", type=_positive_int, required=True)
     parser.add_argument("--expected-task-count", type=int, required=True)
     parser.add_argument("--public-tasks-commit", required=True)
     parser.add_argument("--task-suite-path", required=True)
@@ -383,7 +390,7 @@ def parse_args() -> argparse.Namespace:
         help="Run only the named task. Repeat for multiple tasks.",
     )
     parser.add_argument("--rerun-of-canonical-run")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:

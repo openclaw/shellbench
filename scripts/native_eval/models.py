@@ -129,14 +129,22 @@ def build_matrix_plan(
     harnesses: Iterable[HarnessSpec] = HARNESSES,
     models: Iterable[ModelSpec] = MODELS,
     repetitions: Iterable[int] = (1, 2, 3),
+    reasoning_effort: str | None = None,
 ) -> list[RunSpec]:
     stamp = run_date or date.today().strftime("%Y%m%d")
+    repetition_values = tuple(repetitions)
+    if not repetition_values or any(value < 1 for value in repetition_values):
+        raise ValueError("repetitions must contain positive integers")
+    if len(set(repetition_values)) != len(repetition_values):
+        raise ValueError("repetitions must not contain duplicates")
+    reasoning_slug = reasoning_effort.replace("_", "-") if reasoning_effort else None
     plan: list[RunSpec] = []
     for harness in harnesses:
         for model in models:
-            for repetition in repetitions:
+            for repetition in repetition_values:
+                reasoning_label = f"-{reasoning_slug}" if reasoning_slug else ""
                 label = (
-                    f"{harness.name}-{model.slug}-full-"
+                    f"{harness.name}-{model.slug}{reasoning_label}-full-"
                     f"{expected_task_count}-r{repetition}-{stamp}"
                 )
                 plan.append(
