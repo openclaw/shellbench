@@ -15,7 +15,14 @@ from scripts.native_eval.checkpoint_loop import (
 )
 from scripts.native_eval.harnesses import (
     _OPENCLAW_COMPLETION_PROBE,
+    _OPENCLAW_SESSION_PROBE,
     build_harness_command,
+)
+from scripts.native_eval.harness_trajectories import (
+    _openclaw_session_terminal,
+    _openclaw_session_tree,
+    _openclaw_session_tree_steps,
+    _resolve_archived_openclaw_session_path,
 )
 from scripts.native_eval.models import (
     HARNESSES,
@@ -165,9 +172,7 @@ def test_judge_env_uses_dedicated_proxy_alias() -> None:
 
     assert judge_env["AGENT_JUDGE_MODEL"] == JUDGE_PROXY_MODEL_NAME
     assert judge_env["LLM_JUDGE_MODEL"] == JUDGE_PROXY_MODEL_NAME
-    assert judge_env["AGENT_JUDGE_API_URL"] == (
-        "http://proxy:4000/v1/chat/completions"
-    )
+    assert judge_env["AGENT_JUDGE_API_URL"] == ("http://proxy:4000/v1/chat/completions")
 
 
 def test_run_manifest_records_native_audit_metadata(
@@ -349,9 +354,7 @@ def test_run_manifest_records_targeted_repair_lineage(tmp_path: Path) -> None:
     )
 
     assert manifest["repair_mode"] is True
-    assert manifest["rerun_of_canonical_run"] == (
-        "openclaw-gpt55-low-full-116-r1-parent"
-    )
+    assert manifest["rerun_of_canonical_run"] == ("openclaw-gpt55-low-full-116-r1-parent")
     assert manifest["repair_task_names"] == ["task-a", "task-b"]
 
 
@@ -399,8 +402,7 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
         )
 
         assert "claude-opus-5" in command.run_command or (
-            harness.name == "claude-code"
-            and command.env["ANTHROPIC_MODEL"] == "claude-opus-5"
+            harness.name == "claude-code" and command.env["ANTHROPIC_MODEL"] == "claude-opus-5"
         )
         assert "sb-opus5" not in command.run_command
         assert "OPENROUTER_API_KEY" not in command.env
@@ -409,18 +411,32 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
             assert "ended with stopReason=" not in command.run_command
             assert "python3 -c" in command.run_command
             assert "--thinking off" in command.run_command
+            assert "openclaw gateway --port 18789" in command.run_command
+            assert "127.0.0.1:18789/readyz" in command.run_command
+            assert "openclaw agent --local" not in command.run_command
+            assert "OPENCLAW_GATEWAY_TOKEN" in command.env
+            assert len(command.env["OPENCLAW_GATEWAY_TOKEN"]) >= 32
+            assert "seq 1 60" in command.run_command
+            assert "status=71" in command.run_command
             assert "setup --baseline --skip-bootstrap" in command.setup_command
-            assert "rm -f AGENTS.md BOOTSTRAP.md HEARTBEAT.md" in (
-                command.setup_command
-            )
+            assert "rm -f AGENTS.md BOOTSTRAP.md HEARTBEAT.md" in (command.setup_command)
             assert '"skipBootstrap":true' in command.setup_command
             assert '"primary":"openai/claude-opus-5"' in command.setup_command
-            assert '"subagents":{"model":"openai/claude-opus-5"}' in (
-                command.setup_command
-            )
-            assert "item.chmod(0o755 if item.is_dir() else 0o644)" in (
-                command.cleanup_command
-            )
+            assert '"subagents":{"model":"openai/claude-opus-5"}' in (command.setup_command)
+            assert '"agentRuntime":{"id":"openclaw"}' in command.setup_command
+            assert '"shellbench-audit":{"enabled":true}' in command.setup_command
+            assert "openclaw.plugin.json" in command.setup_command
+            assert '"configSchema":{"type":"object"' in command.setup_command
+            assert 'api.on("subagent_spawned"' in command.setup_command
+            assert 'api.on("subagent_ended"' in command.setup_command
+            assert 'api.on("session_end"' in command.setup_command
+            assert "zstdDecompressSync" in command.setup_command
+            assert "catch {" in command.setup_command
+            assert "item.chmod(0o755 if item.is_dir() else 0o644)" in (command.cleanup_command)
+            assert "for agent in agents.iterdir()" in command.cleanup_command
+            assert "archive/'audit'" in command.cleanup_command
+            assert "sources.append(str(sessions" in command.cleanup_command
+            assert "max(candidates" not in command.cleanup_command
             assert "destination.chmod(0o644)" in command.cleanup_command
         if harness.name == "hermes":
             assert '"delegation":{"max_iterations":50' in command.setup_command
@@ -494,6 +510,460 @@ def test_openclaw_completion_probe_rejects_paused_yielded_envelope(
     )
 
     assert completed.returncode == 1
+
+
+def test_openclaw_session_probe_requires_terminal_accepted_tree(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    child_key = "agent:main:subagent:child"
+    root_records = [
+        {"type": "session", "id": "root"},
+        {
+            "type": "message",
+            "message": {"role": "user", "content": "delegate"},
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "spawn-1",
+                        "name": "sessions_spawn",
+                        "arguments": {"task": "inspect"},
+                    }
+                ],
+                "stopReason": "toolUse",
+            },
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "spawn-1",
+                "content": json.dumps(
+                    {
+                        "status": "accepted",
+                        "childSessionKey": child_key,
+                    }
+                ),
+            },
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+                "stopReason": "stop",
+            },
+        },
+    ]
+    child_records = [
+        {"type": "session", "id": "child"},
+        {
+            "type": "message",
+            "message": {"role": "user", "content": "inspect"},
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "inspected"}],
+                "stopReason": "stop",
+            },
+        },
+    ]
+    (sessions / "root.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in root_records) + "\n",
+        encoding="utf-8",
+    )
+    (sessions / "child.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in child_records) + "\n",
+        encoding="utf-8",
+    )
+    store = {
+        "agent:main:main": {
+            "sessionId": "root",
+            "sessionFile": "root.jsonl",
+        },
+        child_key: {
+            "sessionId": "child",
+            "sessionFile": "child.jsonl",
+            "spawnedBy": "agent:main:main",
+            "status": "done",
+        },
+    }
+    (sessions / "sessions.json").write_text(json.dumps(store), encoding="utf-8")
+
+    complete = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _OPENCLAW_SESSION_PROBE,
+            str(sessions),
+            str(audit),
+        ],
+        check=False,
+    )
+
+    assert complete.returncode == 0
+
+    root_records[3]["message"]["content"] = "spawn accepted: " + json.dumps(
+        {
+            "status": "accepted",
+            "childSessionKey": child_key,
+        }
+    )
+    (sessions / "root.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in root_records) + "\n",
+        encoding="utf-8",
+    )
+    embedded_result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _OPENCLAW_SESSION_PROBE,
+            str(sessions),
+            str(audit),
+        ],
+        check=False,
+    )
+
+    assert embedded_result.returncode == 0
+
+    store.pop(child_key)
+    (sessions / "sessions.json").write_text(json.dumps(store), encoding="utf-8")
+    missing_child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _OPENCLAW_SESSION_PROBE,
+            str(sessions),
+            str(audit),
+        ],
+        check=False,
+    )
+
+    assert missing_child.returncode == 1
+
+    (audit / "sessions.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "subagent_ended",
+                "sessionKey": child_key,
+                "spawnedBy": "agent:main:main",
+                "status": "failed",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    failed_without_transcript = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _OPENCLAW_SESSION_PROBE,
+            str(sessions),
+            str(audit),
+        ],
+        check=False,
+    )
+
+    assert failed_without_transcript.returncode == 1
+
+    (audit / "transcripts").mkdir()
+    (audit / "transcripts" / "child.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in child_records) + "\n",
+        encoding="utf-8",
+    )
+    (audit / "sessions.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "subagent_spawned",
+                        "sessionKey": child_key,
+                        "spawnedBy": "agent:main:main",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "session_end",
+                        "sessionKey": child_key,
+                        "sessionId": "child",
+                        "status": "done",
+                        "auditTranscript": "transcripts/child.jsonl",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    audited_child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _OPENCLAW_SESSION_PROBE,
+            str(sessions),
+            str(audit),
+        ],
+        check=False,
+    )
+
+    assert audited_child.returncode == 0
+
+    store[child_key] = {
+        "sessionId": "child",
+        "sessionFile": "missing-child.jsonl",
+        "spawnedBy": "agent:main:main",
+        "status": "done",
+    }
+    (sessions / "sessions.json").write_text(json.dumps(store), encoding="utf-8")
+    stale_index_with_audit = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _OPENCLAW_SESSION_PROBE,
+            str(sessions),
+            str(audit),
+        ],
+        check=False,
+    )
+
+    assert stale_index_with_audit.returncode == 0
+
+    (audit / "transcripts" / "child.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in child_records[:2]) + "\n",
+        encoding="utf-8",
+    )
+    for terminal_status in ("deleted", "error", "reset"):
+        with (audit / "sessions.jsonl").open("a", encoding="utf-8") as audit_file:
+            audit_file.write(
+                json.dumps(
+                    {
+                        "type": "subagent_ended",
+                        "sessionKey": child_key,
+                        "status": terminal_status,
+                    }
+                )
+                + "\n"
+            )
+        failed_child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_SESSION_PROBE,
+                str(sessions),
+                str(audit),
+            ],
+            check=False,
+        )
+
+        assert failed_child.returncode == 0
+
+
+def test_openclaw_terminal_rejects_an_unanswered_latest_user_turn(
+    tmp_path: Path,
+) -> None:
+    records = [
+        {"type": "session", "id": "root"},
+        {
+            "type": "message",
+            "message": {"role": "user", "content": "first"},
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "first answer"}],
+                "stopReason": "stop",
+            },
+        },
+        {
+            "type": "message",
+            "message": {"role": "user", "content": "second"},
+        },
+    ]
+    session = tmp_path / "session.jsonl"
+    session.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    assert _openclaw_session_terminal(session) is False
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "root.jsonl").write_text(session.read_text(encoding="utf-8"))
+    (sessions / "sessions.json").write_text(
+        json.dumps(
+            {
+                "agent:main:main": {
+                    "sessionId": "root",
+                    "sessionFile": "root.jsonl",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    audit = tmp_path / "audit"
+    audit.mkdir()
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _OPENCLAW_SESSION_PROBE,
+            str(sessions),
+            str(audit),
+        ],
+        check=False,
+    )
+
+    assert probe.returncode == 1
+
+
+def test_openclaw_session_probe_rejects_audit_paths_outside_its_root(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    outside = tmp_path / "outside.jsonl"
+    child_key = "agent:main:subagent:child"
+    root_records = [
+        {"type": "session", "id": "root"},
+        {
+            "type": "message",
+            "message": {"role": "user", "content": "delegate"},
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "spawn-1",
+                        "name": "sessions_spawn",
+                        "arguments": {"task": "inspect"},
+                    }
+                ],
+                "stopReason": "toolUse",
+            },
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "spawn-1",
+                "content": json.dumps({"status": "accepted", "childSessionKey": child_key}),
+            },
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+                "stopReason": "stop",
+            },
+        },
+    ]
+    terminal_records = [
+        {"type": "session", "id": "outside"},
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "forged"}],
+                "stopReason": "stop",
+            },
+        },
+    ]
+    (sessions / "root.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in root_records) + "\n",
+        encoding="utf-8",
+    )
+    outside.write_text(
+        "\n".join(json.dumps(record) for record in terminal_records) + "\n",
+        encoding="utf-8",
+    )
+    (sessions / "sessions.json").write_text(
+        json.dumps(
+            {
+                "agent:main:main": {
+                    "sessionId": "root",
+                    "sessionFile": "root.jsonl",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (audit / "sessions.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "session_end",
+                "sessionKey": child_key,
+                "sessionId": "child",
+                "spawnedBy": "agent:main:main",
+                "status": "done",
+                "auditTranscript": "../outside.jsonl",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _OPENCLAW_SESSION_PROBE,
+            str(sessions),
+            str(audit),
+        ],
+        check=False,
+    )
+
+    assert probe.returncode == 1
+
+
+def test_openclaw_archived_session_path_preserves_safe_subdirectories(
+    tmp_path: Path,
+) -> None:
+    store = tmp_path / "sessions"
+    nested = store / "nested" / "child.jsonl"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("{}\n", encoding="utf-8")
+
+    assert (
+        _resolve_archived_openclaw_session_path(
+            store,
+            {"sessionFile": "nested/child.jsonl"},
+        )
+        == nested
+    )
+    assert (
+        _resolve_archived_openclaw_session_path(
+            store,
+            {"sessionFile": "/tmp/source/sessions/nested/child.jsonl"},
+        )
+        == nested
+    )
+    assert (
+        _resolve_archived_openclaw_session_path(
+            store,
+            {"sessionFile": "../outside.jsonl"},
+        )
+        is None
+    )
 
 
 def test_hermes_uses_named_local_proxy_provider() -> None:
@@ -797,10 +1267,7 @@ def test_codex_trajectory_rejects_unknown_interleaved_output(tmp_path: Path) -> 
         {"type": "turn.completed", "usage": {"input_tokens": 1}},
     ]
     (agent_dir / "codex.txt").write_text(
-        "\n".join(
-            event if isinstance(event, str) else json.dumps(event)
-            for event in events
-        )
+        "\n".join(event if isinstance(event, str) else json.dumps(event) for event in events)
         + "\n",
         encoding="utf-8",
     )
@@ -1055,9 +1522,7 @@ def test_claude_code_stream_converts_to_real_trajectory(tmp_path: Path) -> None:
             "session_id": "claude-session-123",
             "result": "done",
             "usage": {"input_tokens": 10, "output_tokens": 3},
-            "modelUsage": {
-                "sb-gpt55": {"canonicalModel": "sb-gpt55"}
-            },
+            "modelUsage": {"sb-gpt55": {"canonicalModel": "sb-gpt55"}},
         },
     ]
     (agent_dir / "claude-code.txt").write_text(
@@ -1304,10 +1769,104 @@ def test_openclaw_session_without_envelope_converts_to_atif(
     assert trajectory["final_metrics"]["total_completion_tokens"] == 7
     assert trajectory["final_metrics"]["total_cached_tokens"] == 30
 
+    records[-1]["message"]["usage"] = {"input": 1}
+    (agent_dir / "openclaw.session.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    envelope = {
+        "payloads": [{"text": "done"}],
+        "meta": {
+            "agentMeta": {
+                "sessionId": "session-only-123",
+                "model": "gpt-5.6-terra",
+                "usage": {"input": 80, "output": 9, "cacheRead": 20},
+            },
+            "executionTrace": {
+                "winnerProvider": "openai",
+                "winnerModel": "gpt-5.6-terra",
+            },
+            "completion": {"stopReason": "stop"},
+            "aborted": False,
+        },
+    }
+    (agent_dir / "openclaw.txt").write_text(
+        json.dumps(envelope),
+        encoding="utf-8",
+    )
+
+    write_agent_trajectory(task, run, agent_dir)
+    fallback_trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert fallback_trajectory["final_metrics"]["total_prompt_tokens"] == 100
+    assert fallback_trajectory["final_metrics"]["total_completion_tokens"] == 9
+    assert fallback_trajectory["final_metrics"]["total_cached_tokens"] == 20
+
+
+def test_openclaw_transport_model_mismatch_invalidates_identity(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    records = [
+        {"type": "session", "id": "session-123"},
+        {"type": "model_change", "modelId": "gpt-5.6-sol"},
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00Z",
+            "message": {"role": "user", "content": "do the task"},
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:01Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [{"type": "text", "text": "done"}],
+                "stopReason": "stop",
+            },
+        },
+    ]
+    (agent_dir / "openclaw.session.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    (agent_dir / "openclaw.txt").write_text(
+        "[provider-transport-fetch] [model-fetch] response "
+        "provider=openai api=openai-responses model=gpt-5.5 status=200\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="openclaw-gpt56-sol",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260729",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["canonical_model_identity"] is False
+    assert metadata["trajectory_validation"]["observed_models"] == [
+        "gpt-5.5",
+        "gpt-5.6-sol",
+    ]
+    assert metadata["trajectory_validation"]["log_models"] == ["gpt-5.5"]
+
 
 def test_openclaw_child_model_mismatch_invalidates_identity(tmp_path: Path) -> None:
     agent_dir = tmp_path / "agent"
-    agent_dir.mkdir()
+    archive = agent_dir / "openclaw.sessions"
+    archive.mkdir(parents=True)
+    child_key = "agent:main:subagent:model-mismatch"
     records = [
         {
             "type": "session",
@@ -1319,10 +1878,12 @@ def test_openclaw_child_model_mismatch_invalidates_identity(tmp_path: Path) -> N
         },
         {
             "type": "message",
+            "timestamp": "2026-07-29T08:00:00Z",
             "message": {"role": "user", "content": "do the task"},
         },
         {
             "type": "message",
+            "timestamp": "2026-07-29T08:00:01Z",
             "message": {
                 "role": "assistant",
                 "model": "gpt-5.6-sol",
@@ -1339,14 +1900,17 @@ def test_openclaw_child_model_mismatch_invalidates_identity(tmp_path: Path) -> N
         },
         {
             "type": "message",
+            "timestamp": "2026-07-29T08:00:02Z",
             "message": {
                 "role": "toolResult",
+                "toolCallId": "spawn-1",
                 "content": [
                     {
                         "type": "text",
                         "text": json.dumps(
                             {
                                 "status": "accepted",
+                                "childSessionKey": child_key,
                                 "resolvedModel": "openai/gpt-5.5",
                             }
                         ),
@@ -1356,6 +1920,7 @@ def test_openclaw_child_model_mismatch_invalidates_identity(tmp_path: Path) -> N
         },
         {
             "type": "message",
+            "timestamp": "2026-07-29T08:00:05Z",
             "message": {
                 "role": "assistant",
                 "model": "gpt-5.6-sol",
@@ -1364,8 +1929,49 @@ def test_openclaw_child_model_mismatch_invalidates_identity(tmp_path: Path) -> N
             },
         },
     ]
+    child_records = [
+        {
+            "type": "session",
+            "id": "child-session-123",
+        },
+        {
+            "type": "model_change",
+            "modelId": "gpt-5.5",
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:03Z",
+            "message": {"role": "user", "content": "[Subagent Task] inspect"},
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:04Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.5",
+                "content": [{"type": "text", "text": "child done"}],
+                "stopReason": "stop",
+            },
+        },
+    ]
     (agent_dir / "openclaw.session.jsonl").write_text(
         "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    (archive / "child-session-123.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in child_records) + "\n",
+        encoding="utf-8",
+    )
+    (archive / "sessions.json").write_text(
+        json.dumps(
+            {
+                "agent:main:main": {"sessionId": "session-123"},
+                child_key: {
+                    "sessionId": "child-session-123",
+                    "spawnedBy": "agent:main:main",
+                },
+            }
+        ),
         encoding="utf-8",
     )
     (agent_dir / "openclaw.txt").write_text(
@@ -1395,6 +2001,7 @@ def test_openclaw_child_model_mismatch_invalidates_identity(tmp_path: Path) -> N
     )
 
     assert metadata["trajectory_status"] == "real"
+    assert metadata["trajectory_validation"]["trace_fidelity"] == "session_tree"
     assert metadata["runtime_model_name"] == "gpt-5.6-sol"
     assert metadata["canonical_model_identity"] is False
     assert metadata["trajectory_validation"]["observed_models"] == [
@@ -1402,6 +2009,1184 @@ def test_openclaw_child_model_mismatch_invalidates_identity(tmp_path: Path) -> N
         "gpt-5.6-sol",
     ]
     assert metadata["trajectory_validation"]["child_models"] == ["gpt-5.5"]
+
+
+def test_openclaw_session_tree_includes_descendant_tools_and_ignores_stale_sessions(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    archive = agent_dir / "openclaw.sessions"
+    archive.mkdir(parents=True)
+    root_key = "agent:main:main"
+    child_key = "agent:main:subagent:worker"
+    stale_key = "agent:main:subagent:stale"
+    root_records = [
+        {
+            "type": "session",
+            "id": "root-session",
+            "timestamp": "2026-07-29T08:00:00Z",
+        },
+        {
+            "type": "model_change",
+            "modelId": "gpt-5.6-sol",
+            "timestamp": "2026-07-29T08:00:00.100Z",
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:01Z",
+            "message": {"role": "user", "content": "fix both files"},
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:02Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "spawn-1",
+                        "name": "sessions_spawn",
+                        "arguments": {"task": "fix notifications.py"},
+                    }
+                ],
+                "usage": {
+                    "input": 10,
+                    "output": 2,
+                    "cacheRead": 3,
+                },
+                "stopReason": "toolUse",
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:02.100Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "spawn-1",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "status": "accepted",
+                                "childSessionKey": child_key,
+                                "resolvedModel": "openai/gpt-5.6-sol",
+                            }
+                        ),
+                    }
+                ],
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:06Z",
+            "message": {
+                "role": "user",
+                "content": "A completed subagent task is ready: child fixed notifications.py",
+                "provenance": {
+                    "kind": "inter_session",
+                    "sourceSessionKey": child_key,
+                    "sourceTool": "subagent_announce",
+                },
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:07Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [{"type": "text", "text": "integrated and verified"}],
+                "usage": {"input": 4, "output": 2},
+                "stopReason": "stop",
+            },
+        },
+    ]
+    child_records = [
+        {
+            "type": "session",
+            "id": "child-session",
+            "timestamp": "2026-07-29T08:00:02.200Z",
+            "parentSession": "/tmp/openclaw/root-session.jsonl",
+        },
+        root_records[2],
+        root_records[3],
+        {
+            "type": "model_change",
+            "modelId": "gpt-5.6-sol",
+            "timestamp": "2026-07-29T08:00:02.300Z",
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:03Z",
+            "message": {
+                "role": "user",
+                "content": (
+                    "[Subagent Context] You are running as a subagent (depth 2/2)."
+                    "\n\n[Subagent Task]\nfix notifications.py"
+                ),
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:04Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "read-1",
+                        "name": "read",
+                        "arguments": {"path": "notifications.py"},
+                    }
+                ],
+                "usage": {
+                    "input": 5,
+                    "output": 1,
+                    "cacheRead": 2,
+                },
+                "stopReason": "toolUse",
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:04.100Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "read-1",
+                "content": [{"type": "text", "text": "broken code"}],
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:05Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "edit-1",
+                        "name": "edit",
+                        "arguments": {"path": "notifications.py"},
+                    }
+                ],
+                "usage": {"input": 6, "output": 1},
+                "stopReason": "toolUse",
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:05.100Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "edit-1",
+                "content": [{"type": "text", "text": "updated"}],
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:05.500Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [{"type": "text", "text": "child fixed notifications.py"}],
+                "usage": {"input": 2, "output": 2},
+                "stopReason": "stop",
+            },
+        },
+    ]
+    stale_records = [
+        {
+            "type": "session",
+            "id": "stale-session",
+            "timestamp": "2026-07-29T07:00:00Z",
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T07:00:01Z",
+            "message": {"role": "user", "content": "old task"},
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T07:00:02Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "stale-1",
+                        "name": "exec",
+                        "arguments": {"command": "old-command"},
+                    }
+                ],
+                "stopReason": "toolUse",
+            },
+        },
+    ]
+    for path, records in (
+        (agent_dir / "openclaw.session.jsonl", root_records),
+        (archive / "root-session.jsonl", root_records),
+        (archive / "child-session.jsonl", child_records),
+        (archive / "stale-session.jsonl", stale_records),
+    ):
+        path.write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n",
+            encoding="utf-8",
+        )
+    (archive / "sessions.json").write_text(
+        json.dumps(
+            {
+                root_key: {
+                    "sessionId": "root-session",
+                    "sessionFile": "/tmp/openclaw/root-session.jsonl",
+                },
+                child_key: {
+                    "sessionId": "child-session",
+                    "sessionFile": "/tmp/openclaw/child-session.jsonl",
+                    "spawnedBy": root_key,
+                    "forkedFromParent": True,
+                },
+                stale_key: {
+                    "sessionId": "stale-session",
+                    "sessionFile": "/tmp/openclaw/stale-session.jsonl",
+                    "spawnedBy": root_key,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (agent_dir / "openclaw.txt").write_text(
+        "[provider-transport-fetch] [model-fetch] response "
+        "provider=openai api=openai-responses model=gpt-5.6-sol status=200\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="openclaw-gpt56-sol-tree",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260729",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "fix both files"),
+        run,
+        agent_dir,
+    )
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+    function_names = [
+        call["function_name"] for step in trajectory["steps"] for call in step.get("tool_calls", [])
+    ]
+    messages = [step["message"] for step in trajectory["steps"]]
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["canonical_model_identity"] is True
+    assert metadata["trajectory_validation"]["trace_fidelity"] == "session_tree"
+    assert metadata["trajectory_validation"]["session_tree_session_count"] == 2
+    assert metadata["trajectory_validation"]["session_tree_descendant_count"] == 1
+    assert metadata["trajectory_validation"]["session_tree_accepted_spawn_count"] == 1
+    assert metadata["trajectory_validation"]["session_tree_reused_spawn_count"] == 0
+    assert metadata["trajectory_validation"]["session_tree_ignored_entry_count"] == 1
+    assert metadata["trajectory_validation"]["session_tree_session_keys"] == [
+        root_key,
+        child_key,
+    ]
+    assert function_names == ["sessions_spawn", "read", "edit"]
+    assert messages.count("child fixed notifications.py") == 1
+    assert messages.count("fix both files") == 1
+    assert "old task" not in messages
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 32
+    assert trajectory["final_metrics"]["total_completion_tokens"] == 8
+    assert trajectory["final_metrics"]["total_cached_tokens"] == 5
+    assert trajectory["steps"][2]["extra"]["openclaw_session_key"] == child_key
+
+
+def test_openclaw_session_tree_preserves_reused_child_tasks_once(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    archive = agent_dir / "openclaw.sessions"
+    archive.mkdir(parents=True)
+    root_key = "agent:main:main"
+    child_key = "agent:main:subagent:worker"
+    root_records = [
+        {"type": "session", "id": "root-session"},
+        {"type": "model_change", "modelId": "gpt-5.6-sol"},
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00.000Z",
+            "message": {"role": "user", "content": "delegate twice"},
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00.100Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "spawn-1",
+                        "name": "sessions_spawn",
+                        "arguments": {"task": "first task"},
+                    },
+                    {
+                        "type": "toolCall",
+                        "id": "spawn-2",
+                        "name": "sessions_spawn",
+                        "arguments": {"task": "second task"},
+                    },
+                ],
+                "usage": {"input": 10, "output": 2, "cacheRead": 2},
+                "stopReason": "toolUse",
+            },
+        },
+        *[
+            {
+                "type": "message",
+                "timestamp": f"2026-07-29T08:00:00.{index}00Z",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": call_id,
+                    "content": json.dumps(
+                        {
+                            "status": "accepted",
+                            "childSessionKey": child_key,
+                            "resolvedModel": "openai/gpt-5.6-sol",
+                        }
+                    ),
+                },
+            }
+            for index, call_id in enumerate(("spawn-1", "spawn-2"), start=2)
+        ],
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00.900Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [{"type": "text", "text": "both tasks complete"}],
+                "usage": {"input": 4, "output": 1},
+                "stopReason": "stop",
+            },
+        },
+    ]
+    child_records = [
+        {"type": "session", "id": "child-session"},
+        {"type": "model_change", "modelId": "gpt-5.6-sol"},
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00.400Z",
+            "message": {"role": "user", "content": "first task"},
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00.500Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "exec-1",
+                        "name": "exec",
+                        "arguments": {"command": "inspect"},
+                    }
+                ],
+                "usage": {"input": 5, "output": 1, "cacheRead": 1},
+                "stopReason": "toolUse",
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00.550Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "exec-1",
+                "content": "inspected",
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00.600Z",
+            "message": {"role": "user", "content": "second task"},
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00.700Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "edit-1",
+                        "name": "edit",
+                        "arguments": {"path": "target.py"},
+                    }
+                ],
+                "usage": {"input": 7, "output": 2},
+                "stopReason": "toolUse",
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00.750Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "edit-1",
+                "content": "edited",
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00.800Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [{"type": "text", "text": "child finished both"}],
+                "usage": {"input": 3, "output": 1},
+                "stopReason": "stop",
+            },
+        },
+    ]
+    for path, records in (
+        (agent_dir / "openclaw.session.jsonl", root_records),
+        (archive / "child-session.jsonl", child_records),
+    ):
+        path.write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n",
+            encoding="utf-8",
+        )
+    (archive / "sessions.json").write_text(
+        json.dumps(
+            {
+                root_key: {"sessionId": "root-session"},
+                child_key: {
+                    "sessionId": "child-session",
+                    "spawnedBy": root_key,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="openclaw-gpt56-sol-reuse",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260729",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "delegate twice"),
+        run,
+        agent_dir,
+    )
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+    function_names = [
+        call["function_name"] for step in trajectory["steps"] for call in step.get("tool_calls", [])
+    ]
+    messages = [step["message"] for step in trajectory["steps"]]
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["trajectory_validation"]["session_tree_accepted_spawn_count"] == 2
+    assert metadata["trajectory_validation"]["session_tree_reused_spawn_count"] == 1
+    assert metadata["trajectory_validation"]["session_tree_session_count"] == 2
+    assert function_names == ["sessions_spawn", "sessions_spawn", "exec", "edit"]
+    assert messages.count("first task") == 1
+    assert messages.count("second task") == 1
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 32
+    assert trajectory["final_metrics"]["total_completion_tokens"] == 7
+    assert trajectory["final_metrics"]["total_cached_tokens"] == 3
+
+    child_records[2].pop("timestamp")
+    (archive / "child-session.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in child_records) + "\n",
+        encoding="utf-8",
+    )
+    _, missing_timestamp_validation = _openclaw_session_tree(
+        agent_dir,
+        agent_dir / "openclaw.session.jsonl",
+    )
+
+    assert missing_timestamp_validation["session_tree_complete"] is False
+    assert missing_timestamp_validation["session_tree_missing_timestamp_count"] == 1
+
+    child_records[2]["timestamp"] = "2026-07-29T08:00:00.900Z"
+    (archive / "child-session.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in child_records) + "\n",
+        encoding="utf-8",
+    )
+    _, ambiguous_timestamp_validation = _openclaw_session_tree(
+        agent_dir,
+        agent_dir / "openclaw.session.jsonl",
+    )
+
+    assert ambiguous_timestamp_validation["session_tree_complete"] is False
+    assert ambiguous_timestamp_validation["session_tree_ambiguous_timestamp_count"] == 1
+
+
+def test_openclaw_session_tree_rejects_missing_accepted_child(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    archive = agent_dir / "openclaw.sessions"
+    archive.mkdir(parents=True)
+    child_key = "agent:main:subagent:missing"
+    records = [
+        {"type": "session", "id": "root-session"},
+        {"type": "model_change", "modelId": "gpt-5.6-sol"},
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00Z",
+            "message": {"role": "user", "content": "delegate the task"},
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:01Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "spawn-1",
+                        "name": "sessions_spawn",
+                        "arguments": {"task": "do work"},
+                    }
+                ],
+                "stopReason": "toolUse",
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:02Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "spawn-1",
+                "content": json.dumps(
+                    {
+                        "status": "accepted",
+                        "childSessionKey": child_key,
+                        "resolvedModel": "openai/gpt-5.6-sol",
+                    }
+                ),
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:05Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [{"type": "text", "text": "done"}],
+                "stopReason": "stop",
+            },
+        },
+    ]
+    (agent_dir / "openclaw.session.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    (archive / "sessions.json").write_text(
+        json.dumps(
+            {
+                "agent:main:main": {
+                    "sessionId": "root-session",
+                    "sessionFile": "/tmp/openclaw/root-session.jsonl",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="openclaw-gpt56-sol-missing-child",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260729",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "delegate the task"),
+        run,
+        agent_dir,
+    )
+
+    assert metadata["trajectory_status"] == "unavailable"
+    assert metadata["trajectory_validation"]["session_tree_complete"] is False
+    assert metadata["trajectory_validation"]["session_tree_missing_transcript_count"] == 1
+    assert metadata["trajectory_validation"]["session_tree_errors"] == [
+        f"missing-session-entry:{child_key}"
+    ]
+
+    child_records = [
+        {"type": "session", "id": "deleted-child-session"},
+        {"type": "model_change", "modelId": "gpt-5.6-sol"},
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:02.500Z",
+            "message": {"role": "user", "content": "inherited parent prompt"},
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:03Z",
+            "message": {
+                "role": "user",
+                "content": (
+                    "[Subagent Context] You are running as a subagent "
+                    "(depth 1/2).\n\n[Subagent Task]\n\ndo work\n\n"
+                    "Begin. Execute the assigned task to completion."
+                ),
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:04Z",
+            "message": {
+                "role": "assistant",
+                "model": "gpt-5.6-sol",
+                "content": [{"type": "text", "text": "child done"}],
+                "stopReason": "stop",
+            },
+        },
+    ]
+    audit_dir = archive / "audit"
+    audit_transcripts = audit_dir / "transcripts"
+    audit_transcripts.mkdir(parents=True)
+    audited_child = audit_transcripts / "deleted-child-session.jsonl"
+    audited_child.write_text(
+        "\n".join(json.dumps(record) for record in child_records) + "\n",
+        encoding="utf-8",
+    )
+    (audit_dir / "sessions.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "session_end",
+                "sessionKey": child_key,
+                "sessionId": "deleted-child-session",
+                "spawnedBy": "agent:main:main",
+                "status": "done",
+                "auditTranscript": "transcripts/deleted-child-session.jsonl",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (archive / "sessions.json").write_text(
+        json.dumps(
+            {
+                "agent:main:main": {"sessionId": "root-session"},
+                child_key: {
+                    "sessionId": "deleted-child-session",
+                    "sessionFile": "missing-child.jsonl",
+                    "spawnedBy": "agent:main:main",
+                    "status": "done",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    audited_tree, audited_validation = _openclaw_session_tree(
+        agent_dir,
+        agent_dir / "openclaw.session.jsonl",
+    )
+
+    assert [key for key, _, _, _ in audited_tree] == [
+        "agent:main:main",
+        child_key,
+    ]
+    assert audited_validation["session_tree_complete"] is True
+
+    (audit_dir / "sessions.jsonl").unlink()
+    audited_child.unlink()
+    (archive / "sessions.json").write_text(
+        json.dumps({"agent:main:main": {"sessionId": "root-session"}}),
+        encoding="utf-8",
+    )
+    deleted_path = archive / "deleted-child-session.jsonl.deleted.2026-07-29T08-00-04.000Z"
+    deleted_path.write_text(
+        "\n".join(json.dumps(record) for record in child_records) + "\n",
+        encoding="utf-8",
+    )
+
+    unaudited_tree, unaudited_validation = _openclaw_session_tree(
+        agent_dir,
+        agent_dir / "openclaw.session.jsonl",
+    )
+
+    assert [key for key, _, _, _ in unaudited_tree] == ["agent:main:main"]
+    assert unaudited_validation["session_tree_complete"] is False
+    assert unaudited_validation["session_tree_errors"] == [f"missing-session-entry:{child_key}"]
+
+
+def test_openclaw_session_tree_uses_only_the_active_transcript_branch(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    archive = agent_dir / "openclaw.sessions"
+    archive.mkdir(parents=True)
+    root_path = agent_dir / "openclaw.session.jsonl"
+    stale_child_key = "agent:main:subagent:stale"
+    records = [
+        {"type": "session", "id": "root-session"},
+        {
+            "type": "message",
+            "id": "user-root",
+            "parentId": None,
+            "message": {"role": "user", "content": "delegate"},
+        },
+        {
+            "type": "message",
+            "id": "assistant-stale",
+            "parentId": "user-root",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "spawn-stale",
+                        "name": "sessions_spawn",
+                        "arguments": {"task": "stale branch"},
+                    }
+                ],
+                "stopReason": "toolUse",
+                "usage": {"input": 1000, "output": 100},
+            },
+        },
+        {
+            "type": "message",
+            "id": "result-stale",
+            "parentId": "assistant-stale",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "spawn-stale",
+                "content": json.dumps(
+                    {
+                        "status": "accepted",
+                        "childSessionKey": stale_child_key,
+                    }
+                ),
+            },
+        },
+        {
+            "type": "message",
+            "id": "user-active",
+            "parentId": "user-root",
+            "message": {"role": "user", "content": "do it locally instead"},
+        },
+        {
+            "type": "message",
+            "id": "assistant-active",
+            "parentId": "user-active",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+                "stopReason": "stop",
+                "usage": {"input": 10, "output": 2},
+            },
+        },
+    ]
+    root_path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    (archive / "sessions.json").write_text(
+        json.dumps({"agent:main:main": {"sessionId": "root-session"}}),
+        encoding="utf-8",
+    )
+
+    tree, validation = _openclaw_session_tree(agent_dir, root_path)
+
+    assert validation["session_tree_complete"] is True
+    assert validation["session_tree_accepted_spawn_count"] == 0
+    assert validation["session_tree_session_count"] == 1
+    assert [record.get("id") for record in tree[0][3]] == [
+        "user-root",
+        "user-active",
+        "assistant-active",
+    ]
+
+    run = RunSpec(
+        run_label="openclaw-gpt55-active-branch",
+        harness="openclaw",
+        harness_version="2026.7.1-2",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260729",
+    )
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "delegate"),
+        run,
+        agent_dir,
+    )
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert metadata["trajectory_status"] == "real"
+    assert [
+        call["function_name"] for step in trajectory["steps"] for call in step.get("tool_calls", [])
+    ] == []
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 10
+    assert trajectory["final_metrics"]["total_completion_tokens"] == 2
+
+
+def test_openclaw_session_tree_recurses_through_grandchildren(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    archive = agent_dir / "openclaw.sessions"
+    archive.mkdir(parents=True)
+    root_key = "agent:main:main"
+    child_key = "agent:main:subagent:child"
+    grandchild_key = "agent:main:subagent:grandchild"
+
+    def write_session(
+        path: Path,
+        session_id: str,
+        child_session_key: str | None = None,
+    ) -> None:
+        timeline = {
+            "root-session": ("00", "01", "02", "09"),
+            "child-session": ("03", "04", "05", "08"),
+            "grandchild-session": ("06", "07"),
+        }[session_id]
+        records: list[dict[str, object]] = [
+            {"type": "session", "id": session_id},
+            {"type": "model_change", "modelId": "gpt-5.6-sol"},
+            {
+                "type": "message",
+                "timestamp": f"2026-07-29T08:00:{timeline[0]}Z",
+                "message": {"role": "user", "content": f"task for {session_id}"},
+            },
+        ]
+        if child_session_key:
+            records.extend(
+                [
+                    {
+                        "type": "message",
+                        "timestamp": f"2026-07-29T08:00:{timeline[1]}Z",
+                        "message": {
+                            "role": "assistant",
+                            "model": "gpt-5.6-sol",
+                            "content": [
+                                {
+                                    "type": "toolCall",
+                                    "id": f"spawn-{session_id}",
+                                    "name": "sessions_spawn",
+                                    "arguments": {"task": "delegate"},
+                                }
+                            ],
+                            "stopReason": "toolUse",
+                        },
+                    },
+                    {
+                        "type": "message",
+                        "timestamp": f"2026-07-29T08:00:{timeline[2]}Z",
+                        "message": {
+                            "role": "toolResult",
+                            "toolCallId": f"spawn-{session_id}",
+                            "content": json.dumps(
+                                {
+                                    "status": "accepted",
+                                    "childSessionKey": child_session_key,
+                                    "resolvedModel": "openai/gpt-5.6-sol",
+                                }
+                            ),
+                        },
+                    },
+                ]
+            )
+        records.append(
+            {
+                "type": "message",
+                "timestamp": f"2026-07-29T08:00:{timeline[-1]}Z",
+                "message": {
+                    "role": "assistant",
+                    "model": "gpt-5.6-sol",
+                    "content": [{"type": "text", "text": f"done {session_id}"}],
+                    "stopReason": "stop",
+                },
+            }
+        )
+        path.write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n",
+            encoding="utf-8",
+        )
+
+    root_path = agent_dir / "openclaw.session.jsonl"
+    write_session(root_path, "root-session", child_key)
+    write_session(archive / "child-session.jsonl", "child-session", grandchild_key)
+    write_session(archive / "grandchild-session.jsonl", "grandchild-session")
+    (archive / "sessions.json").write_text(
+        json.dumps(
+            {
+                root_key: {"sessionId": "root-session"},
+                child_key: {
+                    "sessionId": "child-session",
+                    "spawnedBy": root_key,
+                },
+                grandchild_key: {
+                    "sessionId": "grandchild-session",
+                    "spawnedBy": child_key,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tree, validation = _openclaw_session_tree(agent_dir, root_path)
+
+    assert [(key, depth) for key, _, depth, _ in tree] == [
+        (root_key, 0),
+        (child_key, 1),
+        (grandchild_key, 2),
+    ]
+    assert validation["session_tree_accepted_spawn_count"] == 2
+    assert validation["session_tree_complete"] is True
+
+
+def test_openclaw_session_tree_reconciles_persisted_child_status(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    archive = agent_dir / "openclaw.sessions"
+    archive.mkdir(parents=True)
+    root_key = "agent:main:main"
+    child_key = "agent:main:subagent:child"
+    root_path = agent_dir / "openclaw.session.jsonl"
+    child_path = archive / "child-session.jsonl"
+    root_records = [
+        {"type": "session", "id": "root-session"},
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:00Z",
+            "message": {"role": "user", "content": "delegate"},
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:01Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "spawn-1",
+                        "name": "sessions_spawn",
+                        "arguments": {"task": "inspect"},
+                    }
+                ],
+                "stopReason": "toolUse",
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:02Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "spawn-1",
+                "content": json.dumps(
+                    {
+                        "status": "accepted",
+                        "childSessionKey": child_key,
+                    }
+                ),
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:04.500Z",
+            "message": {
+                "role": "user",
+                "content": "The child failed while running false.",
+                "provenance": {
+                    "kind": "inter_session",
+                    "sourceSessionKey": child_key,
+                    "sourceTool": "subagent_announce",
+                },
+            },
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:05Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+                "stopReason": "stop",
+            },
+        },
+    ]
+    child_records = [
+        {"type": "session", "id": "child-session"},
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:03Z",
+            "message": {"role": "user", "content": "inspect"},
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:04Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "exec-1",
+                        "name": "exec",
+                        "arguments": {"command": "false"},
+                    }
+                ],
+                "stopReason": "toolUse",
+            },
+        },
+    ]
+    root_path.write_text(
+        "\n".join(json.dumps(record) for record in root_records) + "\n",
+        encoding="utf-8",
+    )
+    child_path.write_text(
+        "\n".join(json.dumps(record) for record in child_records) + "\n",
+        encoding="utf-8",
+    )
+
+    def write_index(status: str) -> None:
+        (archive / "sessions.json").write_text(
+            json.dumps(
+                {
+                    root_key: {"sessionId": "root-session"},
+                    child_key: {
+                        "sessionId": "child-session",
+                        "spawnedBy": root_key,
+                        "status": status,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    run = RunSpec(
+        run_label="openclaw-gpt55-status",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260729",
+    )
+
+    for terminal_status in (
+        "cancelled",
+        "deleted",
+        "error",
+        "failed",
+        "killed",
+        "reset",
+        "timeout",
+    ):
+        write_index(terminal_status)
+        _, terminal_validation = _openclaw_session_tree(agent_dir, root_path)
+        assert terminal_validation["session_tree_complete"] is True
+        assert terminal_validation["session_tree_nonterminal_session_keys"] == []
+
+    write_index("failed")
+    failed_tree, failed_validation = _openclaw_session_tree(agent_dir, root_path)
+    failed_steps = _openclaw_session_tree_steps(
+        failed_tree,
+        instruction="delegate",
+        run=run,
+    )
+
+    assert failed_validation["session_tree_complete"] is True
+    assert failed_validation["session_tree_nonterminal_session_keys"] == []
+    assert [
+        step["message"]
+        for step in failed_steps
+        if step.get("extra", {}).get("openclaw_event") == "subagent_announce"
+    ] == ["The child failed while running false."]
+
+    child_records.append(
+        {
+            "type": "message",
+            "timestamp": "2026-07-29T08:00:04.250Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "late final text"}],
+                "stopReason": "stop",
+            },
+        }
+    )
+    child_path.write_text(
+        "\n".join(json.dumps(record) for record in child_records) + "\n",
+        encoding="utf-8",
+    )
+    write_index("running")
+    running_tree, running_validation = _openclaw_session_tree(agent_dir, root_path)
+    running_steps = _openclaw_session_tree_steps(
+        running_tree,
+        instruction="delegate",
+        run=run,
+    )
+
+    assert running_validation["session_tree_complete"] is True
+    assert running_validation["session_tree_nonterminal_session_keys"] == []
+    assert not any(
+        step.get("extra", {}).get("openclaw_event") == "subagent_announce" for step in running_steps
+    )
+
+    write_index("failed")
+    failed_final_tree, failed_final_validation = _openclaw_session_tree(
+        agent_dir,
+        root_path,
+    )
+    failed_final_steps = _openclaw_session_tree_steps(
+        failed_final_tree,
+        instruction="delegate",
+        run=run,
+        failed_session_keys=set(failed_final_validation["session_tree_failed_session_keys"]),
+    )
+
+    assert [
+        step["message"]
+        for step in failed_final_steps
+        if step.get("extra", {}).get("openclaw_event") == "subagent_announce"
+    ] == ["The child failed while running false."]
+
+    child_path.write_text(
+        "\n".join(json.dumps(record) for record in child_records[:-1]) + "\n",
+        encoding="utf-8",
+    )
+    write_index("done")
+    _, stale_done_validation = _openclaw_session_tree(agent_dir, root_path)
+
+    assert stale_done_validation["session_tree_complete"] is False
+    assert stale_done_validation["session_tree_nonterminal_session_keys"] == [child_key]
 
 
 def test_hermes_session_converts_parallel_tools_to_atif(tmp_path: Path) -> None:

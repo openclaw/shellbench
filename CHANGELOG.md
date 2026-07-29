@@ -25,6 +25,8 @@
   so complete runs remain scoreable without an unsupported parity claim.
 - Keep yielded OpenClaw runs alive, pin delegated models, and audit whole-agent
   model identity and terminal trajectories across every native harness.
+- Pin native OpenClaw runs to the embedded runtime, preserve deleted delegated
+  transcripts, and merge accepted terminal subagent trees into one trajectory.
 
 ### Added
 
