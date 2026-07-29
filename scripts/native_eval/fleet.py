@@ -387,6 +387,7 @@ class FleetController:
         for entry in self._store.all_entries():
             run = self._run_spec(entry)
             task_names = entry.get("task_names")
+            phase = str(entry.get("phase") or "full")
             if task_names is None:
                 expected = suite_expected
             elif not isinstance(task_names, list) or not all(
@@ -399,10 +400,27 @@ class FleetController:
                 raise FleetError(f"{run.run_label} task_names contains duplicates")
             else:
                 expected = len(task_names)
-                if not entry.get("rerun_of_canonical_run"):
+                if phase == "r0":
+                    if run.repetition != 0:
+                        raise FleetError(f"{run.run_label} r0 must use repetition 0")
+                    if len(task_names) != 10:
+                        raise FleetError(f"{run.run_label} r0 must select 10 tasks")
+                    if entry.get("leaderboard_eligible") is not False:
+                        raise FleetError(
+                            f"{run.run_label} r0 must be leaderboard-ineligible"
+                        )
+                    if not entry.get("qualification_family"):
+                        raise FleetError(
+                            f"{run.run_label} r0 lacks qualification_family"
+                        )
+                elif not entry.get("rerun_of_canonical_run"):
                     raise FleetError(
                         f"{run.run_label} task subset lacks rerun_of_canonical_run"
                     )
+            if phase == "r0" and task_names is None:
+                raise FleetError(f"{run.run_label} r0 lacks task_names")
+            if phase != "r0" and run.repetition == 0:
+                raise FleetError(f"{run.run_label} repetition 0 requires phase r0")
             if run.expected_task_count != expected:
                 raise FleetError(
                     f"{run.run_label} expects {run.expected_task_count} tasks, "
@@ -933,9 +951,14 @@ judge_model_id=$2
 execution_mode=$3
 reasoning_effort=$4
 judge_reasoning_effort=$5
-parity_validated=$6
-parity_validation_json=$7
-shift 7
+qualification_family=$6
+run_phase=$7
+leaderboard_eligible=$8
+exclusion_reason=$9
+shift 9
+parity_validated=$1
+parity_validation_json=$2
+shift 2
 mkdir -p "$root/run-logs"
 stdout="$root/run-logs/$label.stdout.log"
 stderr="$root/run-logs/$label.stderr.log"
@@ -952,6 +975,10 @@ nohup env \
   "SHELLBENCH_EXECUTION_MODE=$execution_mode" \
   "SHELLBENCH_REASONING_EFFORT=$reasoning_effort" \
   "SHELLBENCH_JUDGE_REASONING_EFFORT=$judge_reasoning_effort" \
+  "SHELLBENCH_QUALIFICATION_FAMILY=$qualification_family" \
+  "SHELLBENCH_RUN_PHASE=$run_phase" \
+  "SHELLBENCH_LEADERBOARD_ELIGIBLE=$leaderboard_eligible" \
+  "SHELLBENCH_EXCLUSION_REASON=$exclusion_reason" \
   "SHELLBENCH_PARITY_VALIDATED=$parity_validated" \
   "SHELLBENCH_PARITY_VALIDATION_JSON=$parity_validation_json" \
   "$root/runner/scripts/native_eval/remote_run.sh" "$@" \
@@ -985,6 +1012,12 @@ printf '%s\n' "$pid"
         judge_reasoning_effort = str(
             entry.get("judge_reasoning_effort") or reasoning_effort
         )
+        qualification_family = str(entry.get("qualification_family") or "")
+        run_phase = str(entry.get("phase") or "full")
+        leaderboard_eligible = (
+            "false" if entry.get("leaderboard_eligible") is False else ""
+        )
+        exclusion_reason = str(entry.get("exclusion_reason") or "")
         parity_validation = ""
         if (run.harness, run.model_slug) in self.config.parity_validated_routes:
             parity_validation = json.dumps(
@@ -1019,6 +1052,10 @@ printf '%s\n' "$pid"
                 self.config.execution_mode,
                 reasoning_effort,
                 judge_reasoning_effort,
+                qualification_family,
+                run_phase,
+                leaderboard_eligible,
+                exclusion_reason,
                 str(self.config.parity_validated).lower(),
                 parity_validation,
                 *args,
@@ -1426,9 +1463,12 @@ printf '%s\n' "$pid"
             "run_label": label,
             "reasoning_effort": entry.get("reasoning_effort"),
             "judge_reasoning_effort": entry.get("judge_reasoning_effort"),
+            "phase": entry.get("phase"),
+            "qualification_family": entry.get("qualification_family"),
             "attempt": next_attempt,
             "status": "planned",
-            "leaderboard_eligible": None,
+            "leaderboard_eligible": entry.get("leaderboard_eligible"),
+            "exclusion_reason": entry.get("exclusion_reason"),
             "rerun_of": root_label,
             "lease": None,
             "artifacts": [],

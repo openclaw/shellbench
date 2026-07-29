@@ -216,6 +216,11 @@ def _run_manifest(
         "model_provider": run.provider,
         "proxy_model_name": run.proxy_model_name,
         "repetition": run.repetition,
+        "phase": os.environ.get("SHELLBENCH_RUN_PHASE", "full"),
+        "qualification_family": os.environ.get(
+            "SHELLBENCH_QUALIFICATION_FAMILY"
+        )
+        or None,
         "task_suite": task_suite_path,
         "task_suite_root": str(tasks_root.resolve()),
         "expected_task_count": run.expected_task_count,
@@ -259,6 +264,13 @@ def _run_manifest(
         "judge_reasoning_effort": os.environ.get(
             "SHELLBENCH_JUDGE_REASONING_EFFORT"
         ),
+        "leaderboard_eligible": (
+            False
+            if os.environ.get("SHELLBENCH_LEADERBOARD_ELIGIBLE", "").lower()
+            == "false"
+            else None
+        ),
+        "exclusion_reason": os.environ.get("SHELLBENCH_EXCLUSION_REASON") or None,
         "runner_commit": _git_commit(),
         "runner_patch_hash": _runner_patch_hash(),
         "public_tasks_commit": public_tasks_commit,
@@ -350,7 +362,14 @@ def build_run_spec(args: argparse.Namespace) -> RunSpec:
     )
 
 
-def parse_args() -> argparse.Namespace:
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return parsed
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks-root", type=Path, required=True)
     parser.add_argument("--jobs-dir", type=Path, required=True)
@@ -361,7 +380,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id")
     parser.add_argument("--model-provider")
     parser.add_argument("--proxy-model-name")
-    parser.add_argument("--repetition", type=int, choices=(1, 2, 3), required=True)
+    parser.add_argument("--repetition", type=_non_negative_int, required=True)
     parser.add_argument("--expected-task-count", type=int, required=True)
     parser.add_argument("--public-tasks-commit", required=True)
     parser.add_argument("--task-suite-path", required=True)
@@ -383,7 +402,7 @@ def parse_args() -> argparse.Namespace:
         help="Run only the named task. Repeat for multiple tasks.",
     )
     parser.add_argument("--rerun-of-canonical-run")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
