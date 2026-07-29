@@ -632,7 +632,8 @@ def test_bootstrap_preserves_candidate_identity_across_sudo(tmp_path: Path) -> N
         text=True,
     )
 
-    assert result.stdout.splitlines()[:4] == [
+    assert result.stdout.splitlines()[:5] == [
+        "-E",
         "env",
         "TOOLCHAIN_ROOT=/opt/shellbench-native",
         "NODE_VERSION=22.23.1",
