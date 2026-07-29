@@ -10,7 +10,16 @@ from typing import Sequence
 
 import pytest
 
-from scripts.native_eval.fleet import FleetConfig, FleetController, parse_args
+from scripts.native_eval.fleet import (
+    FleetConfig,
+    FleetController,
+    FleetError,
+    Lease,
+    LeaseNotReadyError,
+    LeaseUnavailableError,
+    SubprocessExecutor,
+    parse_args,
+)
 from scripts.native_eval.models import RunSpec
 
 
@@ -59,6 +68,8 @@ def _write_index(
 def _planned(run: RunSpec) -> dict[str, object]:
     return {
         **run.to_dict(),
+        "reasoning_effort": "high",
+        "judge_reasoning_effort": "high",
         "attempt": 0,
         "status": "planned",
         "leaderboard_eligible": None,
@@ -66,6 +77,161 @@ def _planned(run: RunSpec) -> dict[str, object]:
         "lease": None,
         "artifacts": [],
     }
+
+
+def test_provisioning_lease_is_not_ready_before_ssh_details_exist() -> None:
+    with pytest.raises(LeaseNotReadyError, match="provisioning but not ready"):
+        Lease.from_inspect(
+            {
+                "id": "cbx_pending",
+                "slug": "sb-native-pending",
+                "state": "provisioning",
+                "ready": False,
+                "sshHost": "",
+            },
+            region="eu-west-1",
+        )
+
+
+def test_wait_for_lease_ready_retries_provisioning_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = object.__new__(FleetController)
+    ready = Lease(
+        lease_id="cbx_ready",
+        slug="sb-native-ready",
+        host="192.0.2.10",
+        user="crabbox",
+        port=22,
+        identity_file=Path("/tmp/cbx_ready.key"),
+        instance_type="c7a.24xlarge",
+        region="eu-west-1",
+    )
+    attempts = 0
+
+    def inspect(identifier: str, *, required: bool) -> Lease:
+        nonlocal attempts
+        assert identifier == "sb-native-ready"
+        assert required is True
+        attempts += 1
+        if attempts < 3:
+            raise LeaseNotReadyError("lease is provisioning but not ready")
+        return ready
+
+    monkeypatch.setattr(controller, "_inspect_lease", inspect)
+    monkeypatch.setattr("scripts.native_eval.fleet.time.sleep", lambda _: None)
+
+    assert controller._wait_for_lease_ready("sb-native-ready") == ready
+    assert attempts == 3
+
+
+def test_stored_lease_losing_readiness_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = object.__new__(FleetController)
+    entry = {
+        "lease": {
+            "id": "cbx_degraded",
+            "slug": "sb-native-degraded",
+            "host": "192.0.2.20",
+            "ssh_user": "crabbox",
+            "ssh_port": 22,
+            "identity_file": "/tmp/cbx_degraded.key",
+            "instance_type": "c7a.24xlarge",
+            "region": "eu-west-1",
+        }
+    }
+    monkeypatch.setattr(controller, "_ssh_reachable", lambda _lease: False)
+
+    def inspect(*_args: object, **_kwargs: object) -> Lease:
+        raise LeaseNotReadyError("lease is active but not ready")
+
+    monkeypatch.setattr(controller, "_inspect_lease", inspect)
+
+    with pytest.raises(LeaseUnavailableError, match="lost readiness"):
+        controller._ensure_lease(entry)
+
+
+def test_subprocess_timeout_output_is_normalized_to_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def timeout(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise subprocess.TimeoutExpired(
+            ["crabbox", "stop"],
+            45,
+            output=b"partial stdout",
+            stderr=b"partial stderr",
+        )
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    result = SubprocessExecutor().run_with_timeout(
+        ["crabbox", "stop"],
+        capture_output=True,
+        timeout=45,
+    )
+
+    assert result.returncode == 124
+    assert result.stdout == "partial stdout"
+    assert result.stderr == "partial stderr"
+
+
+def test_optional_inspect_treats_stopped_lease_as_absent(tmp_path: Path) -> None:
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={})
+    executor.leases["cbx_stopped"] = {
+        "id": "cbx_stopped",
+        "slug": "stopped",
+        "state": "stopped",
+        "ready": False,
+        "serverType": "c7a.24xlarge",
+        "sshHost": "",
+        "sshUser": "crabbox",
+        "sshPort": "22",
+        "sshKey": "/tmp/cbx_stopped.key",
+    }
+    controller = FleetController(config, executor=executor)
+
+    assert controller._inspect_lease("cbx_stopped", required=False) is None
+    with pytest.raises(LeaseUnavailableError):
+        controller._inspect_lease("cbx_stopped", required=True)
+
+
+def test_inspect_retries_transient_coordinator_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={},
+        inspect_transient_failures={"cbx_ready": 2},
+    )
+    executor.leases["cbx_ready"] = {
+        "id": "cbx_ready",
+        "slug": "ready",
+        "state": "active",
+        "ready": True,
+        "serverType": "c7a.24xlarge",
+        "sshHost": "192.0.2.10",
+        "sshUser": "crabbox",
+        "sshPort": "22",
+        "sshKey": "/tmp/cbx_ready.key",
+    }
+    monkeypatch.setattr("scripts.native_eval.fleet.time.sleep", lambda _: None)
+
+    lease = FleetController(config, executor=executor)._inspect_lease(
+        "cbx_ready",
+        required=True,
+    )
+
+    assert lease is not None
+    assert lease.lease_id == "cbx_ready"
+    assert executor.inspect_attempts["cbx_ready"] == 3
 
 
 def _write_archive(path: Path) -> None:
@@ -110,8 +276,11 @@ class FakeExecutor:
         running_labels: set[str] | None = None,
         checkpoint_blocks: dict[str, threading.Event] | None = None,
         stop_code: int = 0,
+        stop_removes_lease_on_error: bool = False,
         inspect_errors: set[str] | None = None,
+        inspect_transient_failures: dict[str, int] | None = None,
         warmup_capacity_failures: dict[str, int] | None = None,
+        dispatch_failures: dict[str, int] | None = None,
     ) -> None:
         self.local_root = local_root
         self.expected_counts = expected_counts
@@ -120,15 +289,21 @@ class FakeExecutor:
         self.remote_states = {label: "running" for label in (running_labels or set())}
         self.checkpoint_blocks = checkpoint_blocks or {}
         self.stop_code = stop_code
+        self.stop_removes_lease_on_error = stop_removes_lease_on_error
         self.inspect_errors = inspect_errors or set()
+        self.inspect_transient_failures = inspect_transient_failures or {}
+        self.inspect_attempts: dict[str, int] = {}
         self.warmup_capacity_failures = warmup_capacity_failures or {}
+        self.dispatch_failures = dispatch_failures or {}
         self.warmup_attempts: dict[str, int] = {}
+        self.dispatch_attempts: dict[str, int] = {}
         self.leases: dict[str, dict[str, object]] = {}
         self.commands: list[list[str]] = []
         self.events: list[tuple[str, str]] = []
         self.dispatches: list[str] = []
         self.dispatch_concurrency: dict[str, int] = {}
         self.dispatch_arguments: dict[str, list[str]] = {}
+        self.dispatch_parity_validation: dict[str, str] = {}
         self.stops: list[str] = []
         self._lock = threading.Lock()
         self._dispatch_condition = threading.Condition(self._lock)
@@ -157,6 +332,10 @@ class FakeExecutor:
             identifier = argv[argv.index("--id") + 1]
             if identifier in self.inspect_errors:
                 return _result(argv, 1, stderr="broker request timed out")
+            attempt = self.inspect_attempts.get(identifier, 0) + 1
+            self.inspect_attempts[identifier] = attempt
+            if attempt <= self.inspect_transient_failures.get(identifier, 0):
+                return _result(argv, 1, stderr="http 500: error code: 1101")
             lease = next(
                 (
                     value
@@ -213,8 +392,9 @@ class FakeExecutor:
             with self._lock:
                 self.stops.append(lease_id)
                 self.events.append(("stop", lease_id))
-                if not self.stop_code:
+                if not self.stop_code or self.stop_removes_lease_on_error:
                     self.active_leases -= 1
+                    self.leases.pop(lease_id, None)
             return _result(argv, self.stop_code)
 
         if "-m" in argv and "scripts.native_eval.checkpoint_loop" in argv:
@@ -249,11 +429,21 @@ class FakeExecutor:
             )
             remote_command = shlex.split(argv[-1])
             dispatch_marker = remote_command.index("fleet-dispatch")
-            remote_run_args = remote_command[dispatch_marker + 13 :]
+            parity_validation = remote_command[dispatch_marker + 16]
+            remote_run_args = remote_command[dispatch_marker + 17 :]
             with self._dispatch_condition:
+                attempt = self.dispatch_attempts.get(label, 0) + 1
+                self.dispatch_attempts[label] = attempt
+                if attempt <= self.dispatch_failures.get(label, 0):
+                    return _result(
+                        argv,
+                        255,
+                        stderr="ssh: connect to host 192.0.2.1 port 22: Operation timed out",
+                    )
                 self.dispatches.append(label)
                 self.dispatch_concurrency[label] = int(remote_run_args[10])
                 self.dispatch_arguments[label] = remote_run_args
+                self.dispatch_parity_validation[label] = parity_validation
                 self.events.append(("dispatch", label))
                 self.remote_states[label] = "running"
                 self._dispatch_condition.notify_all()
@@ -296,6 +486,7 @@ def _config(
     model_task_concurrency: dict[str, int] | None = None,
     warmup_capacity_attempts: int = 12,
     warmup_capacity_backoff_seconds: float = 0,
+    parity_validated_routes: frozenset[tuple[str, str]] = frozenset(),
 ) -> FleetConfig:
     runner_archive = tmp_path / "runner.tar.gz"
     task_archive = tmp_path / "tasks.tar.gz"
@@ -320,6 +511,7 @@ def _config(
         checkpoint_poll_seconds=1,
         warmup_capacity_attempts=warmup_capacity_attempts,
         warmup_capacity_backoff_seconds=warmup_capacity_backoff_seconds,
+        parity_validated_routes=parity_validated_routes,
     )
 
 
@@ -357,6 +549,96 @@ def test_controller_runs_bounded_wave_and_stops_after_verified_export(
         stop_at = executor.events.index(("stop", lease_id))
         assert checkpoint_at < stop_at
     assert "TOPSECRET" not in "\n".join(" ".join(command) for command in executor.commands)
+
+
+def test_controller_dispatches_only_matching_parity_scope(tmp_path: Path) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [_planned(_run_spec(label))])
+    config = _config(
+        tmp_path,
+        run_index,
+        parity_validated_routes=frozenset({("openclaw", "gpt55")}),
+    )
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    assert json.loads(executor.dispatch_parity_validation[label]) == {
+        "scope": {"harness": "openclaw", "model_slug": "gpt55"},
+        "validated": True,
+    }
+
+
+def test_controller_accepts_xhigh_reasoning_effort(tmp_path: Path) -> None:
+    label = "openclaw-gpt56-sol-xhigh-full-2-r1-20260728"
+    run = _planned(_run_spec(label, model_slug="gpt56-sol"))
+    run["reasoning_effort"] = "xhigh"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    completed = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
+    assert completed["status"] == "completed"
+    assert completed["reasoning_effort"] == "xhigh"
+    assert completed["judge_reasoning_effort"] == "high"
+
+
+def test_controller_dispatches_targeted_repair_tasks_with_lineage(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-low-full-116-r1-20260728-repairtasks1"
+    run = _planned(_run_spec(label, expected_task_count=2))
+    run["task_names"] = ["task-a", "task-b"]
+    run["rerun_of_canonical_run"] = (
+        "openclaw-gpt55-low-full-116-r1-20260728-runnerd676-lifecyclefix1"
+    )
+    run["repair_classifications"] = ["infra", "agent_exit"]
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run], expected_task_count=116)
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    dispatched = executor.dispatch_arguments[label]
+    assert dispatched[15] == run["rerun_of_canonical_run"]
+    assert dispatched[16:] == ["task-a", "task-b"]
+
+
+def test_controller_retries_transient_dispatch_timeout(tmp_path: Path) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [_planned(_run_spec(label))])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={label: 2},
+        dispatch_failures={label: 1},
+    )
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    assert executor.dispatch_attempts[label] == 2
+    assert executor.dispatches == [label]
+
+
+def test_controller_rejects_task_subset_without_canonical_parent(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-low-full-116-r1-20260728-repairtasks1"
+    run = _planned(_run_spec(label, expected_task_count=1))
+    run["task_names"] = ["task-a"]
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run], expected_task_count=116)
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 1})
+
+    with pytest.raises(FleetError, match="task subset lacks rerun_of_canonical_run"):
+        FleetController(config, executor=executor).run()
 
 
 def test_capacity_warmup_retries_same_run_without_recovery_churn(
@@ -453,6 +735,58 @@ def test_model_cap_counts_adopted_run_before_dispatching_same_model(
     adopted_stop = executor.events.index(("stop", "cbx_existing"))
     pending_fable_dispatch = executor.events.index(("dispatch", pending_fable_label))
     assert adopted_stop < pending_fable_dispatch
+
+
+def test_recovery_uses_recorded_ssh_endpoint_when_crabbox_ready_probe_is_stale(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = _planned(_run_spec(label))
+    run["status"] = "recovery_required"
+    run["lease"] = {
+        "id": "cbx_existing",
+        "slug": "existing",
+        "provider": "aws",
+        "instance_type": "c7a.24xlarge",
+        "region": "eu-west-1",
+        "host": "192.0.2.50",
+        "ssh_user": "crabbox",
+        "ssh_port": 22,
+        "identity_file": "/tmp/cbx_existing.key",
+        "state": "active",
+    }
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={label: 2},
+        running_labels={label},
+    )
+    executor.leases["cbx_existing"] = {
+        "id": "cbx_existing",
+        "slug": "existing",
+        "state": "active",
+        "ready": False,
+        "serverType": "c7a.24xlarge",
+        "sshHost": "192.0.2.50",
+        "sshUser": "crabbox",
+        "sshPort": "2222",
+        "sshKey": "/tmp/cbx_existing.key",
+    }
+    executor.active_leases = 1
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    recovered = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
+    assert recovered["status"] == "completed"
+    assert executor.dispatches == []
+    reachability_probe = next(
+        command
+        for command in executor.commands
+        if command and command[0] == "ssh" and command[-1] == "true"
+    )
+    assert "22" in reachability_probe
 
 
 def test_model_task_concurrency_override_is_used_at_dispatch(tmp_path: Path) -> None:
@@ -703,6 +1037,9 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
             "gpt-5.5",
             "--execution-mode",
             "native",
+            "--parity-validated",
+            "--parity-validated-route",
+            "codex=gpt55",
             "--model-task-concurrency",
             "fable5=2",
         ]
@@ -713,6 +1050,8 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
     assert args.harbor_reference_commit == "harbor-commit"
     assert args.judge_model_id == "gpt-5.5"
     assert args.execution_mode == "native"
+    assert args.parity_validated is True
+    assert args.parity_validated_routes == frozenset({("codex", "gpt55")})
     assert args.model_task_concurrency == {"fable5": 2}
 
 
@@ -726,6 +1065,8 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
         ("--provider-max-runs", ["anthropic=0"]),
         ("--model-task-concurrency", ["fable5=-1"]),
         ("--model-task-concurrency", ["fable5=1", "fable5=2"]),
+        ("--parity-validated-route", ["codex"]),
+        ("--parity-validated-route", ["codex=gpt55", "codex=gpt55"]),
     ],
 )
 def test_parse_args_rejects_invalid_model_values(
@@ -774,6 +1115,8 @@ def test_failed_run_is_preserved_and_suffixed_rerun_completes(
     assert runs[0]["final_result_count"] == 1
     assert runs[1]["status"] == "completed"
     assert runs[1]["rerun_of"] == base
+    assert runs[1]["reasoning_effort"] == "high"
+    assert runs[1]["judge_reasoning_effort"] == "high"
     assert executor.dispatches == [base, rerun]
     assert (config.local_root / "raw" / f"{base}-final-artifacts.tar.gz").is_file()
     assert (config.local_root / "raw" / f"{rerun}-final-artifacts.tar.gz").is_file()
@@ -964,6 +1307,26 @@ def test_stop_failure_is_left_pending_without_tight_retry(tmp_path: Path) -> Non
 
     run = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
     assert run["status"] == "stop_pending"
+    assert run["verified_final_export"] is True
+    assert len(executor.stops) == 1
+
+
+def test_stop_failure_is_reconciled_when_lease_disappeared(tmp_path: Path) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [_planned(_run_spec(label))])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={label: 2},
+        stop_code=124,
+        stop_removes_lease_on_error=True,
+    )
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    run = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
+    assert run["status"] == "completed"
     assert run["verified_final_export"] is True
     assert len(executor.stops) == 1
 

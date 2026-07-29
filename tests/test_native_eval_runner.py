@@ -1,39 +1,70 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import subprocess
+import sys
 import tarfile
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts.native_eval.checkpoint_loop import (
     count_result_json,
     next_checkpoint_sequence,
 )
-from scripts.native_eval.harnesses import build_harness_command
+from scripts.native_eval.harnesses import (
+    _OPENCLAW_COMPLETION_PROBE,
+    build_harness_command,
+)
 from scripts.native_eval.models import (
     HARNESSES,
     MODELS,
     RunSpec,
     build_matrix_plan,
 )
-from scripts.native_eval.proxy import write_proxy_config
+from scripts.native_eval import plan as native_plan
+from scripts.native_eval.proxy import JUDGE_PROXY_MODEL_NAME, write_proxy_config
 from scripts.native_eval.run_job import _git_commit, _run_manifest, build_run_spec
 from scripts.native_eval.runtime import (
+    DockerTaskEnvironment,
+    build_judge_env,
     collect_agent_metrics,
     read_reward,
     write_agent_trajectory,
 )
+from scripts.native_eval import runtime as native_runtime
 from scripts.native_eval.tasks import TaskSpec, validate_suite
 
 
 def test_matrix_plan_contains_only_requested_models_and_harnesses() -> None:
     plan = build_matrix_plan(116, run_date="20260727")
 
-    assert len(plan) == 72
-    assert len({run.run_label for run in plan}) == 72
+    assert len(plan) == 96
+    assert len({run.run_label for run in plan}) == 96
     assert {run.harness for run in plan} == {harness.name for harness in HARNESSES}
     assert {run.model_slug for run in plan} == {model.slug for model in MODELS}
     assert {run.repetition for run in plan} == {1, 2, 3}
+
+
+def test_run_index_records_agent_and_judge_reasoning(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(native_plan, "validate_suite", lambda _root: [object()])
+
+    entries = native_plan.write_run_index(
+        tasks_root=tmp_path,
+        output=tmp_path / "run-index.json",
+        public_tasks_commit="tasks-commit",
+        run_date="20260728",
+        reasoning_effort="high",
+        judge_reasoning_effort="high",
+    )
+
+    assert len(entries) == 96
+    assert {entry["reasoning_effort"] for entry in entries} == {"high"}
+    assert {entry["judge_reasoning_effort"] for entry in entries} == {"high"}
 
 
 def test_task_loader_accepts_rich_manifest_and_compose(tmp_path: Path) -> None:
@@ -102,30 +133,54 @@ def test_validate_suite_reports_missing_required_file(tmp_path: Path) -> None:
         raise AssertionError("expected suite validation to fail")
 
 
-def test_proxy_config_pins_only_requested_upstreams(tmp_path: Path) -> None:
+def test_proxy_config_pins_only_requested_upstreams(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SHELLBENCH_REASONING_EFFORT", "high")
     path = tmp_path / "config.json"
     write_proxy_config(path)
     config = json.loads(path.read_text(encoding="utf-8"))
 
-    assert [item["model_name"] for item in config["model_list"]] == [
+    assert [item["model_name"] for item in config["model_list"][:-1]] == [
         model.provider_model_id for model in MODELS
     ]
-    assert [item["litellm_params"]["model"] for item in config["model_list"]] == [
+    assert [item["litellm_params"]["model"] for item in config["model_list"][:-1]] == [
         f"{model.provider}/{model.provider_model_id}" for model in MODELS
     ]
+    assert config["model_list"][-1]["model_name"] == JUDGE_PROXY_MODEL_NAME
     serialized = path.read_text(encoding="utf-8")
     assert "OPENAI_API_KEY" in serialized
     assert "ANTHROPIC_API_KEY" in serialized
     assert "sk-" not in serialized
+    assert all(
+        item["litellm_params"].get("reasoning_effort") == "high"
+        for item in config["model_list"]
+        if item["model_info"]["provider"] == "openai"
+    )
+
+
+def test_judge_env_uses_dedicated_proxy_alias() -> None:
+    judge_env = build_judge_env("http://proxy:4000/", "proxy-key")
+
+    assert judge_env["AGENT_JUDGE_MODEL"] == JUDGE_PROXY_MODEL_NAME
+    assert judge_env["LLM_JUDGE_MODEL"] == JUDGE_PROXY_MODEL_NAME
+    assert judge_env["AGENT_JUDGE_API_URL"] == (
+        "http://proxy:4000/v1/chat/completions"
+    )
 
 
 def test_run_manifest_records_native_audit_metadata(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.delenv("SHELLBENCH_PARITY_VALIDATED", raising=False)
+    monkeypatch.delenv("SHELLBENCH_PARITY_VALIDATION_JSON", raising=False)
     monkeypatch.setenv("SHELLBENCH_EXECUTION_MODE", "native")
     monkeypatch.setenv("SHELLBENCH_HARBOR_REFERENCE_COMMIT", "harbor-commit")
     monkeypatch.setenv("SHELLBENCH_JUDGE_MODEL_ID", "gpt-5.5")
+    monkeypatch.setenv("SHELLBENCH_REASONING_EFFORT", "high")
+    monkeypatch.setenv("SHELLBENCH_JUDGE_REASONING_EFFORT", "high")
     run = RunSpec(
         run_label="openclaw-gpt55-full-2-r1-20260727",
         harness="openclaw",
@@ -152,9 +207,152 @@ def test_run_manifest_records_native_audit_metadata(
     assert manifest["execution_mode"] == "native"
     assert manifest["harbor_reference_commit"] == "harbor-commit"
     assert manifest["judge_model_id"] == "gpt-5.5"
-    assert manifest["trajectory_mode"] == "unsupported"
+    assert manifest["trajectory_mode"] == "real_harness_events"
     assert manifest["canonical_model_identity"] is None
     assert manifest["provider_model_id"] == "gpt-5.5"
+    assert manifest["reasoning_effort"] == "high"
+    assert manifest["judge_reasoning_effort"] == "high"
+    assert manifest["repair_mode"] is False
+    assert manifest["rerun_of_canonical_run"] is None
+    assert manifest["repair_task_names"] == []
+    assert manifest["parity_validated"] is False
+    assert manifest["parity_validation"] is None
+    assert manifest["legacy_parity_validated_claim"] is False
+
+
+def test_run_manifest_scopes_parity_to_matching_route(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    validation = {
+        "validated": True,
+        "scope": {"harness": "codex", "model_slug": "gpt55"},
+        "evidence": {"task_count": 20},
+    }
+    monkeypatch.setenv(
+        "SHELLBENCH_PARITY_VALIDATION_JSON",
+        json.dumps(validation),
+    )
+    monkeypatch.setenv("SHELLBENCH_PARITY_VALIDATED", "true")
+    codex_run = RunSpec(
+        run_label="codex-gpt55-cal20-native-r1",
+        harness="codex",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=20,
+        run_date="20260727",
+    )
+    hermes_run = RunSpec(
+        run_label="hermes-gpt55-cal20-native-r1",
+        harness="hermes",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=20,
+        run_date="20260727",
+    )
+
+    codex_manifest = _run_manifest(
+        codex_run,
+        public_tasks_commit="tasks-commit",
+        task_suite_path="combined tasks/tasks",
+        concurrency=4,
+        started_at="2026-07-27T00:00:00Z",
+        tasks_root=tmp_path,
+        tasks=[],
+    )
+    hermes_manifest = _run_manifest(
+        hermes_run,
+        public_tasks_commit="tasks-commit",
+        task_suite_path="combined tasks/tasks",
+        concurrency=4,
+        started_at="2026-07-27T00:00:00Z",
+        tasks_root=tmp_path,
+        tasks=[],
+    )
+
+    assert codex_manifest["parity_validated"] is True
+    assert codex_manifest["parity_validation"] == validation
+    assert codex_manifest["legacy_parity_validated_claim"] is True
+    assert hermes_manifest["parity_validated"] is False
+    assert hermes_manifest["parity_validation"] == validation
+
+
+def test_legacy_global_parity_flag_does_not_publish_validated(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SHELLBENCH_PARITY_VALIDATED", "true")
+    monkeypatch.delenv("SHELLBENCH_PARITY_VALIDATION_JSON", raising=False)
+    run = RunSpec(
+        run_label="openclaw-gpt55-full-116-r1",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=116,
+        run_date="20260728",
+    )
+
+    manifest = _run_manifest(
+        run,
+        public_tasks_commit="tasks-commit",
+        task_suite_path="combined tasks/tasks",
+        concurrency=16,
+        started_at="2026-07-28T00:00:00Z",
+        tasks_root=tmp_path,
+        tasks=[],
+    )
+
+    assert manifest["parity_validated"] is False
+    assert manifest["parity_validation"] is None
+    assert manifest["legacy_parity_validated_claim"] is True
+
+
+def test_run_manifest_records_targeted_repair_lineage(tmp_path: Path) -> None:
+    run = RunSpec(
+        run_label="openclaw-gpt55-low-full-116-r1-parent-targetedfix1",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=2,
+        run_date="20260728",
+    )
+    tasks = [
+        SimpleNamespace(name="task-a", path=tmp_path / "task-a", checksum="a"),
+        SimpleNamespace(name="task-b", path=tmp_path / "task-b", checksum="b"),
+    ]
+
+    manifest = _run_manifest(
+        run,
+        public_tasks_commit="tasks-commit",
+        task_suite_path="combined tasks/tasks",
+        concurrency=2,
+        started_at="2026-07-28T00:00:00Z",
+        tasks_root=tmp_path,
+        tasks=tasks,
+        rerun_of_canonical_run="openclaw-gpt55-low-full-116-r1-parent",
+    )
+
+    assert manifest["repair_mode"] is True
+    assert manifest["rerun_of_canonical_run"] == (
+        "openclaw-gpt55-low-full-116-r1-parent"
+    )
+    assert manifest["repair_task_names"] == ["task-a", "task-b"]
 
 
 def test_run_spec_preserves_explicit_planned_identity() -> None:
@@ -207,6 +405,58 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
         assert "sb-opus5" not in command.run_command
         assert "OPENROUTER_API_KEY" not in command.env
         assert 'exit "$status"' in command.run_command
+        if harness.name == "openclaw":
+            assert "ended with stopReason=" in command.run_command
+            assert "python3 -c" in command.run_command
+            assert "--thinking off" in command.run_command
+            assert "setup --baseline --skip-bootstrap" in command.setup_command
+            assert "rm -f BOOTSTRAP.md" in command.setup_command
+            assert '"skipBootstrap":true' in command.setup_command
+            assert "item.chmod(0o755 if item.is_dir() else 0o644)" in (
+                command.cleanup_command
+            )
+            assert "destination.chmod(0o644)" in command.cleanup_command
+        if harness.name == "codex":
+            assert "2>/logs/agent/codex-stderr.txt" in command.run_command
+            assert "cat /logs/agent/codex-stderr.txt >&2" in command.run_command
+
+
+def test_openclaw_completion_probe_accepts_markerless_final_envelope(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "openclaw.txt"
+    log_path.write_text(
+        "debug preamble\n"
+        + json.dumps(
+            {
+                "payloads": [{"text": "done"}],
+                "meta": {"aborted": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _OPENCLAW_COMPLETION_PROBE, str(log_path)],
+        check=False,
+    )
+
+    assert completed.returncode == 0
+
+
+def test_openclaw_completion_probe_rejects_partial_log(tmp_path: Path) -> None:
+    log_path = tmp_path / "openclaw.txt"
+    log_path.write_text(
+        'debug preamble\n{"payloads":[{"text":"still writing"}]',
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _OPENCLAW_COMPLETION_PROBE, str(log_path)],
+        check=False,
+    )
+
+    assert completed.returncode == 1
 
 
 def test_hermes_uses_named_local_proxy_provider() -> None:
@@ -236,6 +486,37 @@ def test_hermes_uses_named_local_proxy_provider() -> None:
     assert command.env == {"SHELLBENCH_PROXY_KEY": "local-proxy-key"}
     assert "custom:shellbench" in command.setup_command
     assert "http://host.docker.internal:4000/v1" in command.setup_command
+    assert '--session-id "$session_id" --yes --redact' in command.cleanup_command
+    assert "else hermes sessions export" in command.cleanup_command
+
+
+def test_workdir_falls_back_to_existing_container_directory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    async def fake_capture(command: list[str]) -> str:
+        commands.append(command)
+        return "" if command[1] == "inspect" else "/workspace"
+
+    monkeypatch.setattr(native_runtime, "capture_process", fake_capture)
+    environment = DockerTaskEnvironment(
+        task=object(),  # type: ignore[arg-type]
+        trial_dir=tmp_path,
+        container_name="trial",
+        project_name="trial",
+        toolchain_root=tmp_path,
+        container_id="container-id",
+    )
+
+    asyncio.run(environment._discover_workdir())
+
+    assert environment.workdir == "/workspace"
+    assert commands[1][-1] == (
+        "if [ -d /app ]; then printf /app; "
+        "elif [ -d /workspace ]; then printf /workspace; else pwd; fi"
+    )
 
 
 def test_claude_code_selects_canonical_model_explicitly() -> None:
@@ -314,7 +595,17 @@ def test_codex_trajectory_uses_real_stream_events(tmp_path: Path) -> None:
         },
     ]
     (agent_dir / "codex.txt").write_text(
-        "\n".join(json.dumps(event) for event in events) + "\n",
+        "\n".join(
+            [
+                json.dumps(events[0]),
+                (
+                    "2026-07-28T07:10:46.280064Z ERROR "
+                    "codex_core::tools::router: apply_patch verification failed"
+                ),
+                *(json.dumps(event) for event in events[1:]),
+            ]
+        )
+        + "\n",
         encoding="utf-8",
     )
     session_dir = agent_dir / "sessions"
@@ -368,6 +659,8 @@ def test_codex_trajectory_uses_real_stream_events(tmp_path: Path) -> None:
     assert metadata["trajectory_status"] == "real"
     assert metadata["runtime_model_name"] == "gpt-5.5"
     assert metadata["canonical_model_identity"] is True
+    assert metadata["trajectory_validation"]["diagnostic_lines"] == 1
+    assert metadata["trajectory_validation"]["malformed_event_lines"] == 0
     assert trajectory["session_id"] == "thread-123"
     assert len(trajectory["steps"]) == 6
     assert trajectory["steps"][2]["tool_calls"][0]["function_name"] == "shell"
@@ -451,10 +744,230 @@ def test_codex_trajectory_rejects_truncated_or_mismatched_stream(tmp_path: Path)
     assert metadata["trajectory_validation"]["terminal_event_seen"] is False
 
 
-def test_non_codex_trajectory_is_explicitly_unranked(tmp_path: Path) -> None:
+def test_codex_trajectory_rejects_unknown_interleaved_output(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    session_dir = agent_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    events = [
+        {"type": "thread.started", "thread_id": "thread-123"},
+        "not a recognized codex diagnostic",
+        {
+            "type": "item.completed",
+            "item": {"id": "message-1", "type": "agent_message", "text": "done"},
+        },
+        {"type": "turn.completed", "usage": {"input_tokens": 1}},
+    ]
+    (agent_dir / "codex.txt").write_text(
+        "\n".join(
+            event if isinstance(event, str) else json.dumps(event)
+            for event in events
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (session_dir / "rollout.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.5"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     run = RunSpec(
-        run_label="openclaw-gpt55",
-        harness="openclaw",
+        run_label="codex-gpt55-calibration",
+        harness="codex",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260727",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+
+    assert metadata["trajectory_status"] == "unavailable"
+    assert metadata["trajectory_validation"]["diagnostic_lines"] == 0
+    assert metadata["trajectory_validation"]["malformed_event_lines"] == 1
+
+
+def test_codex_trajectory_retries_transient_malformed_stream(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    session_dir = agent_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    events = [
+        {"type": "thread.started", "thread_id": "thread-123"},
+        {
+            "type": "item.completed",
+            "item": {"id": "message-1", "type": "agent_message", "text": "done"},
+        },
+        {"type": "turn.completed", "usage": {"input_tokens": 1}},
+    ]
+    (agent_dir / "codex.txt").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    (session_dir / "rollout.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.5"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    original_loader = native_runtime._load_codex_stream
+    calls = 0
+
+    def transient_loader(path: Path):
+        nonlocal calls
+        calls += 1
+        loaded = original_loader(path)
+        if calls == 1:
+            return (*loaded[:3], 1)
+        return loaded
+
+    monkeypatch.setattr(native_runtime, "_load_codex_stream", transient_loader)
+    monkeypatch.setattr(native_runtime.time, "sleep", lambda _seconds: None)
+    run = RunSpec(
+        run_label="codex-gpt55-calibration",
+        harness="codex",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260727",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["trajectory_validation"]["malformed_event_lines"] == 0
+    assert metadata["trajectory_validation"]["stream_read_attempts"] == 2
+
+
+def test_codex_trajectory_falls_back_to_complete_session_stream(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    session_dir = agent_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    (agent_dir / "codex.txt").write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-123"}),
+                '{"type":"item.completed","item":{"id":"broken"',
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1}}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    session_events = [
+        {
+            "type": "session_meta",
+            "payload": {"session_id": "session-123"},
+        },
+        {
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.5"},
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "inspect"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "call-1",
+                "name": "shell",
+                "input": '{"command":"pwd"}',
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call-1",
+                "output": "/app",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}],
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete"},
+        },
+    ]
+    (session_dir / "rollout.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in session_events) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(native_runtime.time, "sleep", lambda _seconds: None)
+    run = RunSpec(
+        run_label="codex-gpt55-calibration",
+        harness="codex",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260727",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["trajectory_validation"]["session_fallback"] is True
+    assert metadata["trajectory_validation"]["malformed_event_lines"] == 0
+    assert trajectory["session_id"] == "session-123"
+    assert trajectory["steps"][1]["reasoning_content"] == "inspect"
+    assert trajectory["steps"][2]["tool_calls"][0]["function_name"] == "shell"
+    assert trajectory["steps"][2]["observation"]["results"][0]["content"] == "/app"
+    assert trajectory["steps"][3]["message"] == "done"
+
+
+def test_unsupported_trajectory_is_explicitly_unranked(tmp_path: Path) -> None:
+    run = RunSpec(
+        run_label="claude-code-gpt55",
+        harness="claude-code",
         harness_version="test",
         model_slug="gpt55",
         model_id="gpt-5.5",
@@ -490,6 +1003,313 @@ def test_non_codex_trajectory_is_explicitly_unranked(tmp_path: Path) -> None:
     assert metadata["trajectory_status"] == "unsupported"
     assert metadata["runtime_model_name"] is None
     assert metadata["canonical_model_identity"] is False
+
+
+def test_openclaw_mixed_log_converts_harbor_envelope_to_atif(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    envelope = {
+        "payloads": [{"text": "done", "mediaUrl": None}],
+        "meta": {
+            "agentMeta": {
+                "sessionId": "session-123",
+                "model": "gpt-5.6-luna",
+                "usage": {
+                    "input": 10,
+                    "output": 20,
+                    "cacheRead": 30,
+                    "cacheWrite": 4,
+                },
+            },
+            "executionTrace": {
+                "winnerProvider": "openai",
+                "winnerModel": "gpt-5.6-luna",
+            },
+            "completion": {"stopReason": "stop"},
+            "aborted": False,
+        },
+    }
+    (agent_dir / "openclaw.txt").write_text(
+        "debug preamble\n"
+        + json.dumps(envelope, indent=2)
+        + "\n[agents/agent-command] ended with stopReason=stop\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="openclaw-gpt56-luna",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-luna",
+        model_id="gpt-5.6-luna",
+        provider="openai",
+        proxy_model_name="gpt-5.6-luna",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260728",
+    )
+    task = _trajectory_task(tmp_path, "do the task")
+
+    metadata = write_agent_trajectory(task, run, agent_dir)
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+    metrics = collect_agent_metrics("openclaw", agent_dir)
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["canonical_model_identity"] is True
+    assert metadata["trajectory_validation"]["trace_fidelity"] == "envelope"
+    assert trajectory["schema_version"] == "ATIF-v1.7"
+    assert trajectory["session_id"] == "session-123"
+    assert trajectory["agent"]["model_name"] == "openai/gpt-5.6-luna"
+    assert trajectory["steps"][1]["message"] == "done"
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 40
+    assert metrics["n_input_tokens"] == 10
+    assert metrics["n_cache_tokens"] == 30
+    assert metrics["n_output_tokens"] == 20
+
+
+def test_openclaw_session_without_envelope_converts_to_atif(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    records = [
+        {
+            "type": "session",
+            "id": "session-only-123",
+            "timestamp": "2026-07-28T00:00:00Z",
+            "cwd": "/app",
+        },
+        {
+            "type": "model_change",
+            "id": "model-1",
+            "parentId": None,
+            "timestamp": "2026-07-28T00:00:01Z",
+            "provider": "openai",
+            "modelId": "gpt-5.6-terra",
+        },
+        {
+            "type": "message",
+            "id": "user-1",
+            "parentId": "model-1",
+            "timestamp": "2026-07-28T00:00:02Z",
+            "message": {"role": "user", "content": "do the task"},
+        },
+        {
+            "type": "message",
+            "id": "assistant-1",
+            "parentId": "user-1",
+            "timestamp": "2026-07-28T00:00:03Z",
+            "message": {
+                "role": "assistant",
+                "provider": "openai",
+                "model": "gpt-5.6-terra",
+                "content": [{"type": "text", "text": "done"}],
+                "usage": {
+                    "input": 12,
+                    "output": 7,
+                    "cacheRead": 30,
+                    "cacheWrite": 2,
+                },
+                "stopReason": "stop",
+            },
+        },
+    ]
+    (agent_dir / "openclaw.session.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    (agent_dir / "openclaw.txt").write_text(
+        "[provider-transport-fetch] [model-fetch] response "
+        "provider=openai api=openai-responses model=gpt-5.6-terra status=200\n"
+        "run ended before JSON envelope\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="openclaw-gpt56-terra",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-terra",
+        model_id="gpt-5.6-terra",
+        provider="openai",
+        proxy_model_name="gpt-5.6-terra",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260728",
+    )
+    task = _trajectory_task(tmp_path, "do the task")
+
+    metadata = write_agent_trajectory(task, run, agent_dir)
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["canonical_model_identity"] is True
+    assert metadata["trajectory_validation"]["trace_fidelity"] == "session"
+    assert metadata["trajectory_validation"]["log_models"] == ["gpt-5.6-terra"]
+    assert trajectory["session_id"] == "session-only-123"
+    assert trajectory["agent"]["model_name"] == "openai/gpt-5.6-terra"
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 42
+    assert trajectory["final_metrics"]["total_completion_tokens"] == 7
+    assert trajectory["final_metrics"]["total_cached_tokens"] == 30
+
+
+def test_hermes_session_converts_parallel_tools_to_atif(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    session = {
+        "id": "hermes-session-123",
+        "model": "gpt-5.6-sol",
+        "message_count": 4,
+        "tool_call_count": 1,
+        "input_tokens": 100,
+        "output_tokens": 25,
+        "cache_read_tokens": 75,
+        "reasoning_tokens": 8,
+        "api_call_count": 2,
+        "messages": [
+            {
+                "id": 1,
+                "role": "user",
+                "content": "do the task",
+                "timestamp": 1.0,
+            },
+            {
+                "id": 2,
+                "role": "assistant",
+                "content": "",
+                "timestamp": 2.0,
+                "finish_reason": "tool_calls",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"/app/input.txt"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "id": 3,
+                "role": "tool",
+                "content": "input",
+                "tool_call_id": "call-1",
+                "tool_name": "read_file",
+                "timestamp": 3.0,
+            },
+            {
+                "id": 4,
+                "role": "assistant",
+                "content": "done",
+                "timestamp": 4.0,
+                "finish_reason": "stop",
+            },
+        ],
+    }
+    (agent_dir / "hermes-session.jsonl").write_text(
+        json.dumps(session) + "\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="hermes-gpt56-sol",
+        harness="hermes",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260728",
+    )
+    task = _trajectory_task(tmp_path, "do the task")
+
+    metadata = write_agent_trajectory(task, run, agent_dir)
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["canonical_model_identity"] is True
+    assert metadata["trajectory_validation"]["terminal_event_seen"] is True
+    assert metadata["trajectory_validation"]["instruction_matches"] is True
+    assert len(trajectory["steps"]) == 3
+    assert trajectory["steps"][1]["tool_calls"][0]["function_name"] == "read_file"
+    assert trajectory["steps"][1]["observation"]["results"][0]["content"] == "input"
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 100
+    assert trajectory["final_metrics"]["total_cached_tokens"] == 75
+    assert trajectory["final_metrics"]["total_completion_tokens"] == 25
+
+
+def test_hermes_session_preserves_unicode_line_separator(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    session = {
+        "id": "hermes-session-unicode",
+        "model": "gpt-5.5",
+        "message_count": 2,
+        "tool_call_count": 0,
+        "messages": [
+            {
+                "id": 1,
+                "role": "user",
+                "content": "do the task",
+                "timestamp": 1.0,
+            },
+            {
+                "id": 2,
+                "role": "assistant",
+                "content": "line one\u2028line two",
+                "timestamp": 2.0,
+                "finish_reason": "stop",
+            },
+        ],
+    }
+    (agent_dir / "hermes-session.jsonl").write_text(
+        json.dumps(session, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="hermes-gpt55",
+        harness="hermes",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260728",
+    )
+    task = _trajectory_task(tmp_path, "do the task")
+
+    metadata = write_agent_trajectory(task, run, agent_dir)
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["canonical_model_identity"] is True
+    assert trajectory["steps"][-1]["message"] == "line one\u2028line two"
+
+
+def _trajectory_task(tmp_path: Path, instruction: str) -> TaskSpec:
+    task_dir = tmp_path / "task"
+    task_dir.mkdir(exist_ok=True)
+    return TaskSpec(
+        name="task",
+        title="task",
+        path=task_dir,
+        instruction=instruction,
+        raw_config={},
+        checksum="abc",
+        dockerfile=task_dir / "Dockerfile",
+        build_context=task_dir,
+        compose_file=None,
+        verifier_command="bash /tests/test.sh",
+        agent_timeout_sec=900,
+        verifier_timeout_sec=300,
+        build_timeout_sec=1800,
+        mcp_servers=(),
+        environment_env={},
+        verifier_env={},
+    )
 
 
 def test_codex_metrics_include_cached_input_tokens(tmp_path: Path) -> None:

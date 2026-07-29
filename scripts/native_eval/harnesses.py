@@ -14,6 +14,36 @@ NODE_BIN = TOOLCHAIN_ROOT / "node" / "bin"
 NPM_BIN = TOOLCHAIN_ROOT / "npm-packages" / "node_modules" / ".bin"
 HERMES_BIN = TOOLCHAIN_ROOT / "home" / ".local" / "bin"
 
+_OPENCLAW_COMPLETION_PROBE = """\
+import json
+import pathlib
+import sys
+
+try:
+    text = pathlib.Path(sys.argv[1]).read_text(
+        encoding="utf-8",
+        errors="replace",
+    ).strip()
+except OSError:
+    sys.exit(1)
+
+decoder = json.JSONDecoder()
+for start in range(len(text) - 1, -1, -1):
+    if text[start] != "{":
+        continue
+    try:
+        value, _ = decoder.raw_decode(text[start:])
+    except (json.JSONDecodeError, ValueError):
+        continue
+    if (
+        isinstance(value, dict)
+        and isinstance(value.get("payloads"), list)
+        and isinstance(value.get("meta"), dict)
+    ):
+        sys.exit(0)
+sys.exit(1)
+"""
+
 
 @dataclass(frozen=True)
 class HarnessCommand:
@@ -68,7 +98,12 @@ def _openclaw(
                 "transport": server.transport,
             }
     config = {
-        "agents": {"defaults": {"workspace": "."}},
+        "agents": {
+            "defaults": {
+                "workspace": ".",
+                "skipBootstrap": True,
+            }
+        },
         "gateway": {"mode": "local"},
         "models": {
             "providers": {
@@ -90,32 +125,85 @@ def _openclaw(
     if servers:
         config["mcp"] = {"servers": servers}
     config_json = shlex.quote(json.dumps(config, separators=(",", ":")))
+    completion_probe = shlex.quote(_OPENCLAW_COMPLETION_PROBE)
     home = "/tmp/shellbench-openclaw"
     setup = (
         f"export PATH={_base_path()}; export HOME={home}; "
         "rm -rf \"$HOME\"; mkdir -p \"$HOME/.openclaw\"; "
-        "openclaw setup --baseline --workspace . >/logs/agent/setup.log 2>&1; "
+        "openclaw setup --baseline --skip-bootstrap --workspace . "
+        ">/logs/agent/setup.log 2>&1; "
+        "rm -f BOOTSTRAP.md; "
         f"printf %s {config_json} > \"$HOME/.openclaw/openclaw.json\""
     )
     run_command = (
         f"export PATH={_base_path()}; export HOME={home}; "
+        "log=/logs/agent/openclaw.txt; "
         "openclaw agent --local --json --agent main --thinking off "
         f"--model {shlex.quote(model)} "
         "--message \"$(cat /tmp/shellbench-instruction.md)\" "
-        ">/logs/agent/openclaw.txt 2>&1 </dev/null; status=$?; "
-        "cat /logs/agent/openclaw.txt; exit \"$status\""
+        ">\"$log\" 2>&1 </dev/null & pid=$!; "
+        "while kill -0 \"$pid\" 2>/dev/null; do "
+        "if grep -Eq \"\\[agents/agent-command\\] \\[agent\\] run .* "
+        f"ended with stopReason=\" \"$log\" || python3 -c {completion_probe} "
+        "\"$log\"; then "
+        "sleep 2; kill \"$pid\" 2>/dev/null || true; sleep 1; "
+        "kill -KILL \"$pid\" 2>/dev/null || true; "
+        "for f in /proc/[0-9]*/comm; do "
+        "name=$(cat \"$f\" 2>/dev/null || true); "
+        "case \"$name\" in openclaw-agent|\"npm exec chrome\"|chrome-devtools) "
+        "child=${f#/proc/}; child=${child%/comm}; "
+        "kill -KILL \"$child\" 2>/dev/null || true;; esac; done; "
+        "wait \"$pid\" 2>/dev/null || true; cat \"$log\"; exit 0; "
+        "fi; sleep 1; done; "
+        "wait \"$pid\"; status=$?; cat \"$log\"; exit \"$status\""
     )
     cleanup = (
         "python3 - <<'PY'\n"
         "import json, pathlib, shutil\n"
         "p=pathlib.Path('/logs/agent/openclaw.txt')\n"
+        "sessions=pathlib.Path("
+        "'/tmp/shellbench-openclaw/.openclaw/agents/main/sessions')\n"
+        "archive=pathlib.Path('/logs/agent/openclaw.sessions')\n"
+        "if sessions.is_dir():\n"
+        " shutil.copytree(sessions, archive, dirs_exist_ok=True)\n"
+        " for item in [archive, *archive.rglob('*')]:\n"
+        "  item.chmod(0o755 if item.is_dir() else 0o644)\n"
+        "src=None\n"
         "try:\n"
-        " d=json.loads(p.read_text())\n"
-        " src=((d.get('meta') or {}).get('agentMeta') or {}).get('sessionFile')\n"
-        " if src and pathlib.Path(src).is_file():\n"
-        "  shutil.copy2(src, '/logs/agent/openclaw.session.jsonl')\n"
+        " raw=p.read_text(encoding='utf-8', errors='replace').strip()\n"
+        " dec=json.JSONDecoder(); d=None\n"
+        " for start in range(len(raw)-1, -1, -1):\n"
+        "  if raw[start] != '{': continue\n"
+        "  try: candidate, _ = dec.raw_decode(raw[start:])\n"
+        "  except (json.JSONDecodeError, ValueError): continue\n"
+        "  if isinstance(candidate, dict) and "
+        "isinstance(candidate.get('meta'), dict):\n"
+        "   d=candidate; break\n"
+        " if d:\n"
+        "  src=((d.get('meta') or {}).get('agentMeta') or {}).get('sessionFile')\n"
         "except Exception:\n"
         " pass\n"
+        "if not src and sessions.is_dir():\n"
+        " try:\n"
+        "  store=json.loads((sessions/'sessions.json').read_text())\n"
+        "  entry=store.get('agent:main:main') if isinstance(store, dict) else None\n"
+        "  if isinstance(entry, dict):\n"
+        "   src=entry.get('sessionFile')\n"
+        "   if not src and entry.get('sessionId'):\n"
+        "    src=str(sessions/f\"{entry['sessionId']}.jsonl\")\n"
+        " except Exception:\n"
+        "  pass\n"
+        "source=pathlib.Path(src) if src else None\n"
+        "if source and not source.is_absolute(): source=sessions/source\n"
+        "if not source or not source.is_file():\n"
+        " candidates=[f for f in sessions.glob('*.jsonl') "
+        "if '.trajectory.' not in f.name] if sessions.is_dir() else []\n"
+        " source=max(candidates, key=lambda f: f.stat().st_mtime, "
+        "default=None)\n"
+        "if source and source.is_file():\n"
+        " destination=pathlib.Path('/logs/agent/openclaw.session.jsonl')\n"
+        " shutil.copy2(source, destination)\n"
+        " destination.chmod(0o644)\n"
         "PY"
     )
     return HarnessCommand(
@@ -189,8 +277,15 @@ def _hermes(
     )
     cleanup = (
         f"export PATH={_base_path()}; export HERMES_HOME={home}; "
+        "session_id=$(sed -n 's/^session_id: //p' "
+        "/logs/agent/hermes.txt | tail -1); "
+        "if [ -n \"$session_id\" ]; then "
         "hermes sessions export /logs/agent/hermes-session.jsonl "
-        "--source cli 2>/dev/null || true"
+        "--session-id \"$session_id\" --yes --redact; "
+        "else "
+        "hermes sessions export /logs/agent/hermes-session.jsonl "
+        "--yes --redact; "
+        "fi"
     )
     return HarnessCommand(
         setup_command=setup,
@@ -234,8 +329,10 @@ def _codex(
         f"--model {shlex.quote(run.model_id)} "
         "--json --enable unified_exec -- "
         "\"$(cat /tmp/shellbench-instruction.md)\" "
-        ">/logs/agent/codex.txt 2>&1 </dev/null; status=$?; "
-        "cat /logs/agent/codex.txt; exit \"$status\""
+        ">/logs/agent/codex.txt 2>/logs/agent/codex-stderr.txt "
+        "</dev/null; status=$?; "
+        "cat /logs/agent/codex.txt; "
+        "cat /logs/agent/codex-stderr.txt >&2; exit \"$status\""
     )
     cleanup = (
         "rm -rf /logs/agent/sessions; "

@@ -11,6 +11,7 @@ RUN_LABEL="$2"
 ARCHIVE_NAME="$3"
 JOB_DIR="$ROOT/results/jobs/$RUN_LABEL"
 PROXY_DIR="$ROOT/proxy/$RUN_LABEL"
+RUN_STATE_DIR="/tmp/shellbench-runs/$RUN_LABEL"
 SNAPSHOT_DIR="$(mktemp -d "/tmp/$RUN_LABEL-checkpoint.XXXXXX")"
 ARCHIVE_PATH="/tmp/$ARCHIVE_NAME"
 TEMP_ARCHIVE="$ARCHIVE_PATH.tmp"
@@ -34,14 +35,15 @@ mkdir -p \
   "$SNAPSHOT_DIR/shellbench_meta-$RUN_LABEL"
 
 if [[ -d "$JOB_DIR" ]]; then
-  rsync -a --exclude '*.tmp' "$JOB_DIR/" \
+  sudo rsync -a --exclude '*.tmp' "$JOB_DIR/" \
     "$SNAPSHOT_DIR/results/jobs/$RUN_LABEL/"
 fi
 if [[ -d "$PROXY_DIR" ]]; then
   mkdir -p "$SNAPSHOT_DIR/proxy/$RUN_LABEL"
-  rsync -a --exclude '*.tmp' "$PROXY_DIR/" \
+  sudo rsync -a --exclude '*.tmp' "$PROXY_DIR/" \
     "$SNAPSHOT_DIR/proxy/$RUN_LABEL/"
 fi
+sudo chown -R "$(id -u):$(id -g)" "$SNAPSHOT_DIR"
 if [[ -d "$ROOT/run-logs" ]]; then
   mkdir -p "$SNAPSHOT_DIR/run-logs"
   for suffix in stdout stderr; do
@@ -61,6 +63,10 @@ find "$SNAPSHOT_DIR/results/jobs/$RUN_LABEL" \
 cp "$JOB_DIR/run_manifest.json" "$META_DIR/run_manifest.json" 2>/dev/null || true
 cp /opt/shellbench-native/manifest.json \
   "$META_DIR/toolchain_manifest.json" 2>/dev/null || true
+if [[ -d "$RUN_STATE_DIR" ]]; then
+  mkdir -p "$META_DIR/run_state"
+  cp -a "$RUN_STATE_DIR/." "$META_DIR/run_state/"
+fi
 
 tar -czf "$TEMP_ARCHIVE" -C "$SNAPSHOT_DIR" .
 tar -tzf "$TEMP_ARCHIVE" >/dev/null

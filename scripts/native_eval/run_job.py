@@ -32,6 +32,7 @@ async def run_job(
     proxy_key: str,
     concurrency: int,
     task_names: set[str] | None = None,
+    rerun_of_canonical_run: str | None = None,
 ) -> dict[str, Any]:
     tasks = validate_suite(tasks_root)
     if task_names:
@@ -60,6 +61,7 @@ async def run_job(
         started_at=started_at,
         tasks_root=tasks_root,
         tasks=tasks,
+        rerun_of_canonical_run=rerun_of_canonical_run,
     )
     atomic_write_json(job_dir / "run_manifest.json", manifest)
     atomic_write_json(
@@ -201,7 +203,9 @@ def _run_manifest(
     started_at: str,
     tasks_root: Path,
     tasks: list[TaskSpec],
+    rerun_of_canonical_run: str | None = None,
 ) -> dict[str, Any]:
+    parity_validation, parity_validated = _parity_metadata(run)
     return {
         "run_label": run.run_label,
         "harness": run.harness,
@@ -223,6 +227,11 @@ def _run_manifest(
             }
             for task in tasks
         ],
+        "repair_mode": rerun_of_canonical_run is not None,
+        "rerun_of_canonical_run": rerun_of_canonical_run,
+        "repair_task_names": (
+            [task.name for task in tasks] if rerun_of_canonical_run else []
+        ),
         "task_concurrency": concurrency,
         "agent_concurrency": concurrency,
         "provider": "aws",
@@ -237,13 +246,19 @@ def _run_manifest(
         "observed_model_ids": [],
         "trajectory_mode": trajectory_mode_for_harness(run.harness),
         "trajectory_complete": False,
-        "parity_validated": (
+        "parity_validated": parity_validated,
+        "parity_validation": parity_validation,
+        "legacy_parity_validated_claim": (
             os.environ.get("SHELLBENCH_PARITY_VALIDATED", "").lower() == "true"
         ),
         "harbor_reference_commit": os.environ.get(
             "SHELLBENCH_HARBOR_REFERENCE_COMMIT"
         ),
         "judge_model_id": os.environ.get("SHELLBENCH_JUDGE_MODEL_ID"),
+        "reasoning_effort": os.environ.get("SHELLBENCH_REASONING_EFFORT"),
+        "judge_reasoning_effort": os.environ.get(
+            "SHELLBENCH_JUDGE_REASONING_EFFORT"
+        ),
         "runner_commit": _git_commit(),
         "runner_patch_hash": _runner_patch_hash(),
         "public_tasks_commit": public_tasks_commit,
@@ -257,6 +272,41 @@ def _run_manifest(
         "finished_at_utc": None,
         "result_json_count": 0,
     }
+
+
+def _parity_metadata(run: RunSpec) -> tuple[dict[str, Any] | None, bool]:
+    raw = os.environ.get("SHELLBENCH_PARITY_VALIDATION_JSON", "").strip()
+    if not raw:
+        return None, False
+    try:
+        validation = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("SHELLBENCH_PARITY_VALIDATION_JSON is invalid JSON") from exc
+    if not isinstance(validation, dict):
+        raise ValueError("SHELLBENCH_PARITY_VALIDATION_JSON must be an object")
+    scope = validation.get("scope")
+    if not isinstance(scope, dict):
+        raise ValueError("parity validation scope must be an object")
+    if "harness" not in scope or not any(
+        key in scope for key in ("model_slug", "model_id", "provider_model_id")
+    ):
+        raise ValueError("parity validation scope must include harness and model")
+
+    comparable = {
+        "harness": run.harness,
+        "model_slug": run.model_slug,
+        "model_id": run.model_id,
+        "provider_model_id": run.model_id,
+    }
+    unsupported_keys = set(scope) - set(comparable)
+    if unsupported_keys:
+        names = ", ".join(sorted(unsupported_keys))
+        raise ValueError(f"unsupported parity validation scope keys: {names}")
+    matches = all(
+        str(comparable[key]) == str(expected)
+        for key, expected in scope.items()
+    )
+    return validation, validation.get("validated") is True and matches
 
 
 def _git_commit() -> str:
@@ -332,6 +382,7 @@ def parse_args() -> argparse.Namespace:
         dest="task_names",
         help="Run only the named task. Repeat for multiple tasks.",
     )
+    parser.add_argument("--rerun-of-canonical-run")
     return parser.parse_args()
 
 
@@ -350,6 +401,7 @@ def main() -> None:
             proxy_key=proxy_key,
             concurrency=args.concurrency,
             task_names=set(args.task_names or []),
+            rerun_of_canonical_run=args.rerun_of_canonical_run,
         )
     )
     print(json.dumps(state, indent=2))

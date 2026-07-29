@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -10,8 +12,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from scripts.native_eval.harness_trajectories import (
+    load_openclaw_envelope,
+    write_hermes_trajectory,
+    write_openclaw_trajectory,
+)
 from scripts.native_eval.harnesses import TOOLCHAIN_ROOT, build_harness_command
 from scripts.native_eval.models import RunSpec
+from scripts.native_eval.proxy import JUDGE_PROXY_MODEL_NAME
 from scripts.native_eval.tasks import TaskSpec
 
 
@@ -31,12 +39,37 @@ class AgentSetupTimeoutError(NativeEvalError):
     pass
 
 
+class AgentSetupError(NativeEvalError):
+    pass
+
+
 class NonZeroAgentExitCodeError(NativeEvalError):
     pass
 
 
 class RewardFileNotFoundError(NativeEvalError):
     pass
+
+
+CODEX_DIAGNOSTIC_LINE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\S+\s+"
+    r"(?:TRACE|DEBUG|INFO|WARN|ERROR)\s+codex[\w:.-]*:"
+)
+CODEX_STREAM_READ_ATTEMPTS = 20
+CODEX_STREAM_READ_DELAY_SECONDS = 0.1
+
+
+def build_judge_env(proxy_url: str, proxy_key: str) -> dict[str, str]:
+    return {
+        "AGENT_JUDGE_API_URL": f"{proxy_url.rstrip('/')}/v1/chat/completions",
+        "AGENT_JUDGE_MODEL": JUDGE_PROXY_MODEL_NAME,
+        "AGENT_JUDGE_API_KEY": proxy_key,
+        "LLM_JUDGE_API_URL": f"{proxy_url.rstrip('/')}/v1",
+        "LLM_JUDGE_MODEL": JUDGE_PROXY_MODEL_NAME,
+        "LLM_JUDGE_API_KEY": proxy_key,
+        "OPENAI_BASE_URL": f"{proxy_url.rstrip('/')}/v1",
+        "OPENROUTER_API_KEY": proxy_key,
+    }
 
 
 @dataclass(frozen=True)
@@ -215,7 +248,26 @@ class DockerTaskEnvironment:
                 self.container_id,
             ]
         )
-        self.workdir = output.strip() or "/app"
+        configured = output.strip()
+        if configured:
+            self.workdir = configured
+            return
+        self.workdir = (
+            await capture_process(
+                [
+                    "docker",
+                    "exec",
+                    self.container_id,
+                    "sh",
+                    "-lc",
+                    (
+                        "if [ -d /app ]; then printf /app; "
+                        "elif [ -d /workspace ]; then printf /workspace; "
+                        "else pwd; fi"
+                    ),
+                ]
+            )
+        ).strip() or "/"
 
     async def copy_instruction(self, instruction: str) -> None:
         local = self.trial_dir / "instruction.md"
@@ -444,7 +496,7 @@ async def run_trial(
                 stderr_path=trial_dir / "agent" / "setup-stderr.txt",
             )
             if setup.returncode:
-                raise NativeEvalError(f"Agent setup exited {setup.returncode}")
+                raise AgentSetupError(f"Agent setup exited {setup.returncode}")
         except TimeoutError as exc:
             raise AgentSetupTimeoutError("Agent setup timed out after 300s") from exc
         finally:
@@ -500,18 +552,7 @@ async def run_trial(
         await environment.install_tests()
         verifier_started = utc_now()
         verifier_env = task.resolved_verifier_env()
-        judge_env = {
-            "AGENT_JUDGE_API_URL": (
-                f"{proxy_url.rstrip('/')}/v1/chat/completions"
-            ),
-            "AGENT_JUDGE_MODEL": "gpt-5.5",
-            "AGENT_JUDGE_API_KEY": proxy_key,
-            "LLM_JUDGE_API_URL": f"{proxy_url.rstrip('/')}/v1",
-            "LLM_JUDGE_MODEL": "gpt-5.5",
-            "LLM_JUDGE_API_KEY": proxy_key,
-            "OPENAI_BASE_URL": f"{proxy_url.rstrip('/')}/v1",
-            "OPENROUTER_API_KEY": proxy_key,
-        }
+        judge_env = build_judge_env(proxy_url, proxy_key)
         for key, value in judge_env.items():
             if not verifier_env.get(key):
                 verifier_env[key] = value
@@ -681,7 +722,11 @@ def collect_agent_metrics(harness: str, agent_dir: Path) -> dict[str, Any]:
     path = candidates.get(harness)
     if path is None or not path.is_file():
         return metrics
-    events = _load_json_events(path)
+    if harness == "openclaw":
+        envelope = load_openclaw_envelope(path)
+        events = [envelope] if envelope is not None else []
+    else:
+        events = _load_json_events(path)
     for event in events:
         usage = _find_usage(event)
         if usage:
@@ -713,9 +758,12 @@ def _load_json_events(path: Path) -> list[dict[str, Any]]:
     return events
 
 
-def _load_codex_stream(path: Path) -> tuple[list[dict[str, Any]], int, int]:
+def _load_codex_stream(
+    path: Path,
+) -> tuple[list[dict[str, Any]], int, int, int]:
     events: list[dict[str, Any]] = []
     preamble_lines = 0
+    diagnostic_lines = 0
     malformed_event_lines = 0
     stream_started = False
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -724,6 +772,9 @@ def _load_codex_stream(path: Path) -> tuple[list[dict[str, Any]], int, int]:
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
+            if CODEX_DIAGNOSTIC_LINE.match(line):
+                diagnostic_lines += 1
+                continue
             if stream_started:
                 malformed_event_lines += 1
             else:
@@ -734,7 +785,23 @@ def _load_codex_stream(path: Path) -> tuple[list[dict[str, Any]], int, int]:
             events.append(item)
         else:
             malformed_event_lines += 1
-    return events, preamble_lines, malformed_event_lines
+    return events, preamble_lines, diagnostic_lines, malformed_event_lines
+
+
+def _load_stable_codex_stream(
+    path: Path,
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
+    best = _load_codex_stream(path)
+    attempts = 1
+    while best[3] and attempts < CODEX_STREAM_READ_ATTEMPTS:
+        time.sleep(CODEX_STREAM_READ_DELAY_SECONDS)
+        candidate = _load_codex_stream(path)
+        attempts += 1
+        if (candidate[3], -len(candidate[0])) < (best[3], -len(best[0])):
+            best = candidate
+        if best[3] == 0:
+            break
+    return (*best, attempts)
 
 
 def _observed_codex_models(agent_dir: Path) -> set[str]:
@@ -752,6 +819,143 @@ def _observed_codex_models(agent_dir: Path) -> set[str]:
             if isinstance(message, dict) and message.get("model"):
                 models.add(str(message["model"]))
     return models
+
+
+def _codex_session_events(agent_dir: Path) -> tuple[Path | None, list[dict[str, Any]]]:
+    sessions_dir = agent_dir / "sessions"
+    if not sessions_dir.is_dir():
+        return None, []
+    candidates: list[tuple[Path, list[dict[str, Any]]]] = []
+    for path in sorted(sessions_dir.rglob("*.jsonl")):
+        events = _load_json_events(path)
+        if events:
+            candidates.append((path, events))
+    if not candidates:
+        return None, []
+    return max(candidates, key=lambda item: len(item[1]))
+
+
+def _codex_session_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(filter(None, (_codex_session_text(item) for item in value)))
+    if not isinstance(value, dict):
+        return ""
+    for key in ("text", "output_text", "input_text"):
+        text = value.get(key)
+        if isinstance(text, str):
+            return text
+    return _codex_session_text(value.get("content"))
+
+
+def _codex_session_arguments(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"value": value}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+    return {"value": value}
+
+
+def _codex_session_steps(
+    events: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str | None, bool]:
+    steps: list[dict[str, Any]] = []
+    session_id: str | None = None
+    terminal_event_seen = False
+    pending_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+
+    for event in events:
+        event_type = str(event.get("type") or "")
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if event_type == "session_meta":
+            candidate = payload.get("session_id") or payload.get("id")
+            if candidate:
+                session_id = str(candidate)
+            continue
+        if event_type == "event_msg":
+            terminal_event_seen = terminal_event_seen or payload.get("type") == "task_complete"
+            continue
+        if event_type != "response_item":
+            continue
+
+        item_type = str(payload.get("type") or "")
+        if item_type == "message" and payload.get("role") == "assistant":
+            text = _codex_session_text(payload.get("content"))
+            if text:
+                steps.append(
+                    {
+                        "source": "agent",
+                        "message": text,
+                        "llm_call_count": 1,
+                    }
+                )
+            continue
+        if item_type == "reasoning":
+            summary = _codex_session_text(payload.get("summary"))
+            if summary:
+                steps.append(
+                    {
+                        "source": "agent",
+                        "message": "",
+                        "reasoning_content": summary,
+                        "llm_call_count": 1,
+                    }
+                )
+            continue
+        if item_type in {"custom_tool_call", "function_call"}:
+            call_id = str(payload.get("call_id") or payload.get("id") or uuid.uuid4())
+            name = str(payload.get("name") or item_type)
+            arguments = _codex_session_arguments(
+                payload.get("input", payload.get("arguments"))
+            )
+            pending_calls[call_id] = (name, arguments)
+            continue
+        if item_type not in {"custom_tool_call_output", "function_call_output"}:
+            continue
+
+        call_id = str(payload.get("call_id") or "")
+        call = pending_calls.pop(call_id, None)
+        if call is None:
+            continue
+        name, arguments = call
+        output = payload.get("output")
+        output_text = (
+            output
+            if isinstance(output, str)
+            else json.dumps(output, ensure_ascii=True, default=str)
+        )
+        steps.append(
+            {
+                "source": "agent",
+                "message": "",
+                "tool_calls": [
+                    {
+                        "tool_call_id": call_id,
+                        "function_name": name,
+                        "arguments": arguments,
+                    }
+                ],
+                "observation": {
+                    "results": [
+                        {
+                            "source_call_id": call_id,
+                            "content": output_text,
+                        }
+                    ]
+                },
+                "llm_call_count": 1,
+            }
+        )
+    return steps, session_id, terminal_event_seen
 
 
 def _completed_codex_items(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -832,6 +1036,10 @@ def write_agent_trajectory(
     run: RunSpec,
     agent_dir: Path,
 ) -> dict[str, Any]:
+    if run.harness == "openclaw":
+        return write_openclaw_trajectory(task.instruction, run, agent_dir)
+    if run.harness == "hermes":
+        return write_hermes_trajectory(task.instruction, run, agent_dir)
     if run.harness != "codex":
         return {
             "trajectory_status": "unsupported",
@@ -843,9 +1051,21 @@ def write_agent_trajectory(
 
     source_path = agent_dir / "codex.txt"
     if source_path.is_file():
-        events, preamble_lines, malformed_event_lines = _load_codex_stream(source_path)
+        (
+            events,
+            preamble_lines,
+            diagnostic_lines,
+            malformed_event_lines,
+            stream_read_attempts,
+        ) = _load_stable_codex_stream(source_path)
     else:
-        events, preamble_lines, malformed_event_lines = [], 0, 0
+        (
+            events,
+            preamble_lines,
+            diagnostic_lines,
+            malformed_event_lines,
+            stream_read_attempts,
+        ) = ([], 0, 0, 0, 0)
     observed_models = _observed_codex_models(agent_dir)
     runtime_model_name = (
         next(iter(observed_models)) if len(observed_models) == 1 else None
@@ -870,6 +1090,30 @@ def write_agent_trajectory(
         step["step_id"] = len(steps) + 1
         steps.append(step)
 
+    session_fallback = False
+    if (
+        len(steps) == 1
+        or malformed_event_lines
+        or not terminal_event_seen
+        or runtime_model_name is None
+    ):
+        session_path, session_events = _codex_session_events(agent_dir)
+        session_steps, fallback_session_id, fallback_terminal = _codex_session_steps(
+            session_events
+        )
+        if session_steps and fallback_terminal and runtime_model_name is not None:
+            session_fallback = True
+            source_path = session_path or source_path
+            events = session_events
+            terminal_event_seen = True
+            malformed_event_lines = 0
+            if fallback_session_id:
+                session_id = fallback_session_id
+            steps = steps[:1]
+            for step in session_steps:
+                step["step_id"] = len(steps) + 1
+                steps.append(step)
+
     if (
         len(steps) == 1
         or malformed_event_lines
@@ -885,7 +1129,10 @@ def write_agent_trajectory(
             "trajectory_validation": {
                 "terminal_event_seen": terminal_event_seen,
                 "preamble_lines": preamble_lines,
+                "diagnostic_lines": diagnostic_lines,
                 "malformed_event_lines": malformed_event_lines,
+                "stream_read_attempts": stream_read_attempts,
+                "session_fallback": session_fallback,
                 "observed_models": sorted(observed_models),
             },
         }
@@ -917,7 +1164,9 @@ def write_agent_trajectory(
             "native_raw_trace_file": source_path.name,
             "native_raw_event_count": len(events),
             "native_raw_preamble_lines": preamble_lines,
+            "native_raw_diagnostic_lines": diagnostic_lines,
             "native_raw_malformed_event_lines": malformed_event_lines,
+            "native_session_fallback": session_fallback,
             "observed_models": sorted(observed_models),
             "terminal_event_seen": terminal_event_seen,
         },
@@ -932,7 +1181,10 @@ def write_agent_trajectory(
         "trajectory_validation": {
             "terminal_event_seen": terminal_event_seen,
             "preamble_lines": preamble_lines,
+            "diagnostic_lines": diagnostic_lines,
             "malformed_event_lines": malformed_event_lines,
+            "stream_read_attempts": stream_read_attempts,
+            "session_fallback": session_fallback,
             "observed_models": sorted(observed_models),
         },
     }

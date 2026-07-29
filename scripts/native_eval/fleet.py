@@ -47,6 +47,14 @@ RESUMABLE_STATUSES = {
 RERUN_STATUSES = {"failed", "lease_lost"}
 ACTIVE_RUN_STATUSES = {"leasing", "bootstrapping", "ready", "running"}
 CLEANUP_STATUSES = {"exported", "stop_pending"}
+REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+# Crabbox's coordinator release path retries five 60-second requests with
+# bounded backoff. Give it enough time to finish instead of leaking live AWS
+# leases after a verified export.
+CRABBOX_STOP_TIMEOUT_SECONDS = 6 * 60
+CRABBOX_READY_ATTEMPTS = 30
+CRABBOX_READY_BACKOFF_SECONDS = 10
+CRABBOX_INSPECT_ATTEMPTS = 4
 
 
 class CommandExecutor(Protocol):
@@ -73,12 +81,46 @@ class SubprocessExecutor:
             stderr=subprocess.PIPE if capture_output else None,
         )
 
+    def run_with_timeout(
+        self,
+        command: Sequence[str],
+        *,
+        capture_output: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                list(command),
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE if capture_output else None,
+                stderr=subprocess.PIPE if capture_output else None,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or f"timed out after {timeout:g}s"
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode(errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+            return subprocess.CompletedProcess(
+                list(command),
+                124,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
 
 class FleetError(RuntimeError):
     pass
 
 
 class LeaseUnavailableError(FleetError):
+    pass
+
+
+class LeaseNotReadyError(FleetError):
     pass
 
 
@@ -99,14 +141,17 @@ class Lease:
 
     @classmethod
     def from_inspect(cls, value: dict[str, Any], *, region: str) -> Lease:
+        state = str(value.get("state") or "")
+        if not value.get("ready") and state in {"active", "provisioning"}:
+            lease_id = value.get("id") or value.get("slug") or "unknown"
+            raise LeaseNotReadyError(f"lease {lease_id} is {state} but not ready")
+        if state != "active":
+            lease_id = value.get("id") or value.get("slug") or "unknown"
+            raise LeaseUnavailableError(f"lease {lease_id} is no longer active")
         required = ("id", "slug", "sshHost", "sshUser", "sshPort", "sshKey")
         missing = [field for field in required if not value.get(field)]
         if missing:
             raise FleetError(f"Crabbox inspect omitted fields: {', '.join(missing)}")
-        if value.get("state") != "active":
-            raise LeaseUnavailableError(f"lease {value['id']} is no longer active")
-        if not value.get("ready"):
-            raise FleetError(f"lease {value['id']} is active but not ready")
         return cls(
             lease_id=str(value["id"]),
             slug=str(value["slug"]),
@@ -116,6 +161,23 @@ class Lease:
             identity_file=Path(str(value["sshKey"])),
             instance_type=str(value.get("serverType") or ""),
             region=region,
+        )
+
+    @classmethod
+    def from_manifest(cls, value: dict[str, Any]) -> Lease:
+        required = ("id", "slug", "host", "ssh_user", "ssh_port", "identity_file")
+        missing = [field for field in required if not value.get(field)]
+        if missing:
+            raise FleetError(f"stored lease omitted fields: {', '.join(missing)}")
+        return cls(
+            lease_id=str(value["id"]),
+            slug=str(value["slug"]),
+            host=str(value["host"]),
+            user=str(value["ssh_user"]),
+            port=int(value["ssh_port"]),
+            identity_file=Path(str(value["identity_file"])),
+            instance_type=str(value.get("instance_type") or ""),
+            region=str(value.get("region") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -163,6 +225,8 @@ class FleetConfig:
     harbor_reference_commit: str = ""
     judge_model_id: str = ""
     execution_mode: str = "native"
+    parity_validated: bool = False
+    parity_validated_routes: frozenset[tuple[str, str]] = frozenset()
 
 
 class RunIndexStore:
@@ -263,6 +327,8 @@ class FleetController:
         self.runner_archive_sha256 = ""
         self.task_archive_sha256 = ""
         self.crabbox_cli_version = ""
+        self._dispatch_lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
 
     def run(self) -> int:
         self._prepare_local_layout()
@@ -317,12 +383,45 @@ class FleetController:
             (self.config.local_root / relative).mkdir(parents=True, exist_ok=True)
 
     def _validate_plan(self) -> None:
-        expected = int(self._store.data["expected_task_count"])
+        suite_expected = int(self._store.data["expected_task_count"])
         for entry in self._store.all_entries():
             run = self._run_spec(entry)
+            task_names = entry.get("task_names")
+            if task_names is None:
+                expected = suite_expected
+            elif not isinstance(task_names, list) or not all(
+                isinstance(name, str) and name for name in task_names
+            ):
+                raise FleetError(
+                    f"{run.run_label} task_names must be a list of non-empty strings"
+                )
+            elif len(set(task_names)) != len(task_names):
+                raise FleetError(f"{run.run_label} task_names contains duplicates")
+            else:
+                expected = len(task_names)
+                if not entry.get("rerun_of_canonical_run"):
+                    raise FleetError(
+                        f"{run.run_label} task subset lacks rerun_of_canonical_run"
+                    )
             if run.expected_task_count != expected:
                 raise FleetError(
-                    f"{run.run_label} expects {run.expected_task_count}, index expects {expected}"
+                    f"{run.run_label} expects {run.expected_task_count} tasks, "
+                    f"plan selects {expected}"
+                )
+            if run.provider == "openai":
+                reasoning_effort = str(entry.get("reasoning_effort") or "")
+                if reasoning_effort not in REASONING_EFFORTS:
+                    raise FleetError(
+                        f"{run.run_label} must set reasoning_effort to "
+                        "low, medium, high, or xhigh"
+                    )
+            judge_reasoning_effort = str(
+                entry.get("judge_reasoning_effort") or ""
+            )
+            if judge_reasoning_effort not in REASONING_EFFORTS:
+                raise FleetError(
+                    f"{run.run_label} must set judge_reasoning_effort to "
+                    "low, medium, high, or xhigh"
                 )
 
     def _prepare_inputs(self) -> None:
@@ -446,7 +545,8 @@ class FleetController:
             if remote_state == "missing":
                 if self._local_artifacts(run.run_label):
                     raise FleetError("local artifacts exist but the remote run state is missing")
-                self._hydrate_lease(lease)
+                if not entry.get("bootstrapped_at_utc"):
+                    self._hydrate_lease(lease)
                 self._dispatch(lease, run)
             elif remote_state == "stale":
                 raise FleetError("remote run state is stale and cannot be overwritten")
@@ -501,12 +601,27 @@ class FleetController:
     def _ensure_lease(self, entry: dict[str, Any]) -> Lease:
         lease_value = entry.get("lease")
         if lease_value:
+            try:
+                stored = Lease.from_manifest(lease_value)
+            except FleetError:
+                stored = None
+            if stored is not None and self._ssh_reachable(stored):
+                return self._detect_region(stored)
             identifier = str(lease_value["id"])
-            return self._inspect_lease(
-                identifier,
-                required=True,
-                region_hint=str(lease_value.get("region") or ""),
-            )
+            try:
+                return self._inspect_lease(
+                    identifier,
+                    required=True,
+                    region_hint=str(lease_value.get("region") or ""),
+                )
+            except LeaseNotReadyError as exc:
+                if stored is None:
+                    stored = Lease.from_manifest(lease_value)
+                if self._ssh_reachable(stored):
+                    return self._detect_region(stored)
+                raise LeaseUnavailableError(
+                    f"stored lease {identifier} lost readiness and SSH access"
+                ) from exc
 
         slug = str(entry.get("requested_lease_slug") or self._lease_slug(entry["run_label"]))
         self._store.update(
@@ -514,7 +629,10 @@ class FleetController:
             status="leasing",
             requested_lease_slug=slug,
         )
-        existing = self._inspect_lease(slug, required=False)
+        try:
+            existing = self._inspect_lease(slug, required=False)
+        except LeaseNotReadyError:
+            existing = self._wait_for_lease_ready(slug)
         if existing is None:
             command = [
                 "env",
@@ -535,13 +653,26 @@ class FleetController:
             if self.config.instance_type:
                 command.extend(["--type", self.config.instance_type])
             self._warmup_lease(command, slug)
-            existing = self._inspect_lease(slug, required=True)
+            existing = self._wait_for_lease_ready(slug)
         self._store.update(
             entry["run_label"],
             status="bootstrapping",
             lease={**existing.to_dict(), "started_at_utc": utc_now()},
         )
         return existing
+
+    def _wait_for_lease_ready(self, identifier: str) -> Lease:
+        for attempt in range(1, CRABBOX_READY_ATTEMPTS + 1):
+            try:
+                lease = self._inspect_lease(identifier, required=True)
+            except LeaseNotReadyError:
+                if attempt == CRABBOX_READY_ATTEMPTS:
+                    raise
+                time.sleep(CRABBOX_READY_BACKOFF_SECONDS)
+                continue
+            assert lease is not None
+            return lease
+        raise AssertionError("unreachable")
 
     def _warmup_lease(self, command: Sequence[str], slug: str) -> None:
         for attempt in range(1, self.config.warmup_capacity_attempts + 1):
@@ -568,18 +699,36 @@ class FleetController:
         required: bool,
         region_hint: str = "",
     ) -> Lease | None:
-        result = self.executor.run(
-            [
-                self.config.crabbox_bin,
-                "inspect",
-                "--provider",
-                "aws",
-                "--id",
-                identifier,
-                "--json",
-            ],
-            capture_output=True,
-        )
+        command = [
+            self.config.crabbox_bin,
+            "inspect",
+            "--provider",
+            "aws",
+            "--id",
+            identifier,
+            "--json",
+        ]
+        for attempt in range(1, CRABBOX_INSPECT_ATTEMPTS + 1):
+            result = self.executor.run(command, capture_output=True)
+            if result.returncode == 0:
+                break
+            detail = (result.stderr or result.stdout or "").strip()
+            transient = any(
+                marker in detail.lower()
+                for marker in (
+                    "http 500",
+                    "http 502",
+                    "http 503",
+                    "http 504",
+                    "error code: 1101",
+                    "context deadline exceeded",
+                    "connection timed out",
+                    "connection reset",
+                )
+            )
+            if not transient or attempt == CRABBOX_INSPECT_ATTEMPTS:
+                break
+            time.sleep(attempt * 5)
         if result.returncode:
             detail = (result.stderr or result.stdout or "").strip()
             missing = any(
@@ -598,11 +747,29 @@ class FleetController:
             value = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise FleetError(f"invalid Crabbox inspect JSON for {identifier}") from exc
-        lease = Lease.from_inspect(
-            value,
-            region=region_hint or self.config.region,
-        )
+        try:
+            lease = Lease.from_inspect(
+                value,
+                region=region_hint or self.config.region,
+            )
+        except LeaseUnavailableError:
+            if required:
+                raise
+            return None
         return self._detect_region(lease)
+
+    def _ssh_reachable(self, lease: Lease) -> bool:
+        with self._dispatch_lock:
+            for attempt in range(1, 5):
+                result = self.executor.run(
+                    self._ssh_command(lease, ["true"]),
+                    capture_output=True,
+                )
+                if result.returncode == 0:
+                    return True
+                if attempt < 4:
+                    time.sleep(attempt * 5)
+        return False
 
     def _detect_region(self, lease: Lease) -> Lease:
         script = """
@@ -764,7 +931,11 @@ shift 9
 harbor_reference_commit=$1
 judge_model_id=$2
 execution_mode=$3
-shift 3
+reasoning_effort=$4
+judge_reasoning_effort=$5
+parity_validated=$6
+parity_validation_json=$7
+shift 7
 mkdir -p "$root/run-logs"
 stdout="$root/run-logs/$label.stdout.log"
 stderr="$root/run-logs/$label.stderr.log"
@@ -779,6 +950,10 @@ nohup env \
   "SHELLBENCH_HARBOR_REFERENCE_COMMIT=$harbor_reference_commit" \
   "SHELLBENCH_JUDGE_MODEL_ID=$judge_model_id" \
   "SHELLBENCH_EXECUTION_MODE=$execution_mode" \
+  "SHELLBENCH_REASONING_EFFORT=$reasoning_effort" \
+  "SHELLBENCH_JUDGE_REASONING_EFFORT=$judge_reasoning_effort" \
+  "SHELLBENCH_PARITY_VALIDATED=$parity_validated" \
+  "SHELLBENCH_PARITY_VALIDATION_JSON=$parity_validation_json" \
   "$root/runner/scripts/native_eval/remote_run.sh" "$@" \
   >"$stdout" 2>"$stderr" </dev/null &
 pid=$!
@@ -786,6 +961,7 @@ sleep 1
 kill -0 "$pid"
 printf '%s\n' "$pid"
 """
+        entry = self._store.get(run.run_label)
         args = [
             self.config.remote_root,
             f"{self.config.remote_root}/public-tasks/combined tasks/tasks",
@@ -802,33 +978,75 @@ printf '%s\n' "$pid"
             run.model_id,
             run.provider,
             run.proxy_model_name,
+            str(entry.get("rerun_of_canonical_run") or ""),
+            *[str(name) for name in entry.get("task_names") or []],
         ]
-        self._checked(
-            self._ssh_command(
-                lease,
-                [
-                    "bash",
-                    "-c",
-                    script,
-                    "fleet-dispatch",
-                    self.config.remote_root,
-                    run.run_label,
-                    self.crabbox_cli_version,
-                    lease.slug,
-                    lease.lease_id,
-                    lease.instance_type,
-                    lease.host,
-                    lease.region,
-                    self.runner_commit,
-                    self.config.harbor_reference_commit,
-                    self.config.judge_model_id,
-                    self.config.execution_mode,
-                    *args,
-                ],
-            ),
-            capture_output=True,
-            description=f"dispatch {run.run_label}",
+        reasoning_effort = str(entry.get("reasoning_effort") or "")
+        judge_reasoning_effort = str(
+            entry.get("judge_reasoning_effort") or reasoning_effort
         )
+        parity_validation = ""
+        if (run.harness, run.model_slug) in self.config.parity_validated_routes:
+            parity_validation = json.dumps(
+                {
+                    "scope": {
+                        "harness": run.harness,
+                        "model_slug": run.model_slug,
+                    },
+                    "validated": True,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        command = self._ssh_command(
+            lease,
+            [
+                "bash",
+                "-c",
+                script,
+                "fleet-dispatch",
+                self.config.remote_root,
+                run.run_label,
+                self.crabbox_cli_version,
+                lease.slug,
+                lease.lease_id,
+                lease.instance_type,
+                lease.host,
+                lease.region,
+                self.runner_commit,
+                self.config.harbor_reference_commit,
+                self.config.judge_model_id,
+                self.config.execution_mode,
+                reasoning_effort,
+                judge_reasoning_effort,
+                str(self.config.parity_validated).lower(),
+                parity_validation,
+                *args,
+            ],
+        )
+        with self._dispatch_lock:
+            for attempt in range(1, 5):
+                result = self.executor.run(command, capture_output=True)
+                if result.returncode == 0:
+                    break
+                detail = (result.stderr or result.stdout or "").strip()
+                retryable = result.returncode == 255 and any(
+                    marker in detail.lower()
+                    for marker in (
+                        "operation timed out",
+                        "connection timed out",
+                        "connection refused",
+                        "connection closed",
+                        "banner exchange",
+                    )
+                )
+                if not retryable or attempt == 4:
+                    suffix = f": {detail[:500]}" if detail else ""
+                    raise FleetError(
+                        f"dispatch {run.run_label} failed with exit "
+                        f"{result.returncode}{suffix}"
+                    )
+                time.sleep(attempt * 5)
         self._store.update(
             run.run_label,
             dispatched_at_utc=utc_now(),
@@ -1040,18 +1258,62 @@ printf '%s\n' "$pid"
                         "checkpoint final event after remote done"
                     ),
                 }
-        stop = self.executor.run(
-            [
-                self.config.crabbox_bin,
-                "stop",
-                "--provider",
-                "aws",
-                "--id",
-                str(lease_value["id"]),
-            ],
-            capture_output=True,
-        )
+        stop_command = [
+            self.config.crabbox_bin,
+            "stop",
+            "--provider",
+            "aws",
+            "--id",
+            str(lease_value["id"]),
+        ]
+        try:
+            lease_still_exists = (
+                self._inspect_lease(
+                    str(lease_value["id"]),
+                    required=False,
+                    region_hint=str(lease_value.get("region") or ""),
+                )
+                is not None
+            )
+        except FleetError:
+            lease_still_exists = True
+        if lease_still_exists:
+            with self._cleanup_lock:
+                if isinstance(self.executor, SubprocessExecutor):
+                    stop = self.executor.run_with_timeout(
+                        stop_command,
+                        capture_output=True,
+                        timeout=CRABBOX_STOP_TIMEOUT_SECONDS,
+                    )
+                else:
+                    stop = self.executor.run(stop_command, capture_output=True)
+        else:
+            stop = subprocess.CompletedProcess(stop_command, 0, stdout="", stderr="")
         if stop.returncode:
+            try:
+                stopped_after_error = (
+                    self._inspect_lease(
+                        str(lease_value["id"]),
+                        required=False,
+                        region_hint=str(lease_value.get("region") or ""),
+                    )
+                    is None
+                )
+            except FleetError:
+                stopped_after_error = False
+            if stopped_after_error:
+                stop = subprocess.CompletedProcess(
+                    stop_command,
+                    0,
+                    stdout=stop.stdout,
+                    stderr=stop.stderr,
+                )
+        stop_detail = (stop.stderr or stop.stdout or "").strip().lower()
+        already_stopped = any(
+            marker in stop_detail
+            for marker in ("not found", "not_found", "http 404", "already stopped")
+        )
+        if stop.returncode and not already_stopped:
             self._store.update(
                 run.run_label,
                 status="stop_pending",
@@ -1162,6 +1424,8 @@ printf '%s\n' "$pid"
         rerun = {
             **run.to_dict(),
             "run_label": label,
+            "reasoning_effort": entry.get("reasoning_effort"),
+            "judge_reasoning_effort": entry.get("judge_reasoning_effort"),
             "attempt": next_attempt,
             "status": "planned",
             "leaderboard_eligible": None,
@@ -1170,6 +1434,13 @@ printf '%s\n' "$pid"
             "artifacts": [],
             "created_at_utc": utc_now(),
         }
+        for metadata_field in (
+            "task_names",
+            "rerun_of_canonical_run",
+            "repair_classifications",
+        ):
+            if metadata_field in entry:
+                rerun[metadata_field] = copy.deepcopy(entry[metadata_field])
         self._store.append(rerun)
         return label
 
@@ -1304,6 +1575,24 @@ def _parse_model_values(
     return parsed
 
 
+def _parse_parity_routes(
+    parser: argparse.ArgumentParser,
+    values: list[str],
+) -> frozenset[tuple[str, str]]:
+    parsed: set[tuple[str, str]] = set()
+    for raw in values:
+        harness, separator, model_slug = raw.partition("=")
+        if not separator or not harness or not model_slug:
+            parser.error(
+                f"--parity-validated-route must use HARNESS=MODEL: {raw!r}"
+            )
+        route = (harness, model_slug)
+        if route in parsed:
+            parser.error(f"--parity-validated-route repeats {raw!r}")
+        parsed.add(route)
+    return frozenset(parsed)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-index", type=Path, required=True)
@@ -1347,6 +1636,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--harbor-reference-commit", default="")
     parser.add_argument("--judge-model-id", default="")
     parser.add_argument("--execution-mode", default="native")
+    parser.add_argument("--parity-validated", action="store_true")
+    parser.add_argument(
+        "--parity-validated-route",
+        action="append",
+        default=[],
+        metavar="HARNESS=MODEL",
+    )
     args = parser.parse_args(argv)
     args.model_max_runs = _parse_model_values(
         parser,
@@ -1362,6 +1658,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser,
         args.model_task_concurrency,
         "--model-task-concurrency",
+    )
+    args.parity_validated_routes = _parse_parity_routes(
+        parser,
+        args.parity_validated_route,
     )
     return args
 
@@ -1397,6 +1697,8 @@ def main(argv: list[str] | None = None) -> int:
         harbor_reference_commit=args.harbor_reference_commit,
         judge_model_id=args.judge_model_id,
         execution_mode=args.execution_mode,
+        parity_validated=args.parity_validated,
+        parity_validated_routes=args.parity_validated_routes,
     )
     try:
         return FleetController(config).run()

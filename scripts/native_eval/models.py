@@ -47,6 +47,20 @@ MODELS: tuple[ModelSpec, ...] = (
         "gpt-5.6-sol",
     ),
     ModelSpec(
+        "gpt56-luna",
+        "gpt-5.6-luna",
+        "openai",
+        "gpt-5.6-luna",
+        "gpt-5.6-luna",
+    ),
+    ModelSpec(
+        "gpt56-terra",
+        "gpt-5.6-terra",
+        "openai",
+        "gpt-5.6-terra",
+        "gpt-5.6-terra",
+    ),
+    ModelSpec(
         "fable5",
         "fable-5",
         "anthropic",
@@ -85,7 +99,7 @@ HARNESSES: tuple[HarnessSpec, ...] = (
 
 NODE_VERSION = "22.23.1"
 LITELLM_VERSION = "1.93.0"
-REAL_TRAJECTORY_HARNESSES = frozenset({"codex"})
+REAL_TRAJECTORY_HARNESSES = frozenset({"openclaw", "hermes", "codex"})
 
 
 def model_by_slug(slug: str) -> ModelSpec:
