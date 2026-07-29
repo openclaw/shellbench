@@ -308,7 +308,7 @@ def test_pair_label_uses_manifest_harness_and_model(tmp_path: Path):
     assert len(rerun["runs"]) == 2
 
 
-def test_native_run_requires_parity_validation_for_leaderboard(tmp_path: Path):
+def test_native_run_reports_missing_parity_without_excluding_score(tmp_path: Path):
     jobs_root = tmp_path / "native"
     summaries_dir = tmp_path / "summaries"
     _write_run(
@@ -323,8 +323,15 @@ def test_native_run_requires_parity_validation_for_leaderboard(tmp_path: Path):
 
     report = aggregate(jobs_root, summaries_dir)
 
-    assert report["runs"][0]["eligible"] is False
-    assert report["runs"][0]["exclusion_reason"] == "parity_not_validated"
+    run = report["runs"][0]
+    assert run["parity_validated"] is False
+    assert run["parity_validation_status"] == "not_validated"
+    assert run["eligible"] is True
+    assert run["exclusion_reason"] == ""
+    assert report["pairs"][0]["parity_validated_repetitions"] == 0
+    assert report["pairs"][0]["parity_unvalidated_run_labels"] == [
+        "codex-gpt55-calibration"
+    ]
 
 
 def test_native_run_rejects_legacy_unscoped_parity_claim(tmp_path: Path):
@@ -347,7 +354,7 @@ def test_native_run_rejects_legacy_unscoped_parity_claim(tmp_path: Path):
     run = report["runs"][0]
     assert run["parity_validated"] is False
     assert run["parity_validation_status"] == "legacy_unscoped"
-    assert run["eligible"] is False
+    assert run["eligible"] is True
 
 
 def test_native_run_accepts_known_legacy_codex_gpt55_route(tmp_path: Path):
@@ -393,8 +400,8 @@ def test_native_run_rejects_legacy_codex_gpt55_full_suite(tmp_path: Path):
     run = report["runs"][0]
     assert run["parity_validated"] is False
     assert run["parity_validation_status"] == "legacy_scope_mismatch"
-    assert run["eligible"] is False
-    assert run["exclusion_reason"] == "parity_not_validated"
+    assert run["eligible"] is True
+    assert run["exclusion_reason"] == ""
 
 
 def test_native_run_rejects_mismatched_parity_scope(tmp_path: Path):
@@ -420,7 +427,7 @@ def test_native_run_rejects_mismatched_parity_scope(tmp_path: Path):
     run = report["runs"][0]
     assert run["parity_validated"] is False
     assert run["parity_validation_status"] == "scope_mismatch"
-    assert run["eligible"] is False
+    assert run["eligible"] is True
 
 
 def test_native_identity_checks_ignore_pre_agent_infra_failures(tmp_path: Path):

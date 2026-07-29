@@ -21,6 +21,8 @@
 - Detect destructive `git checkout --` restoration commands in trajectory safety scoring (#39, thanks @realmehmetali).
 - Scope native Harbor parity claims to the validated harness/model route instead
   of applying one fleet-wide boolean.
+- Report scoped Harbor parity independently from native leaderboard eligibility,
+  so complete runs remain scoreable without an unsupported parity claim.
 
 ### Added
 
