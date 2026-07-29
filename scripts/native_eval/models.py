@@ -99,7 +99,7 @@ HARNESSES: tuple[HarnessSpec, ...] = (
 
 NODE_VERSION = "22.23.1"
 LITELLM_VERSION = "1.93.0"
-REAL_TRAJECTORY_HARNESSES = frozenset({"openclaw", "hermes", "codex"})
+REAL_TRAJECTORY_HARNESSES = frozenset({"openclaw", "hermes", "codex", "claude-code"})
 
 
 def model_by_slug(slug: str) -> ModelSpec:
