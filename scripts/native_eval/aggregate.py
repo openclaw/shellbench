@@ -921,7 +921,6 @@ def _summarize_run(
         and not harness_wide_failure
         and canonical_model_identity
         and trajectory_complete
-        and parity_validated
     )
     if incomplete:
         exclusion_reason = "incomplete"
@@ -933,8 +932,6 @@ def _summarize_run(
         exclusion_reason = "canonical_model_identity_not_preserved"
     elif not trajectory_complete:
         exclusion_reason = "trajectory_unavailable"
-    elif not parity_validated:
-        exclusion_reason = "parity_not_validated"
     else:
         exclusion_reason = ""
     if manifest.get("leaderboard_eligible") is False:
@@ -999,6 +996,9 @@ def _pair_summaries(runs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             ),
         )
         eligible = [run for run in ordered if run["eligible"]]
+        parity_validated_runs = [
+            run for run in ordered if run["parity_validated"] is True
+        ]
         scores = [float(run["score"]) for run in eligible]
         exact_passes = [int(run["exact_passes"]) for run in eligible]
         total_expected = sum(int(run["expected_task_count"]) for run in eligible)
@@ -1014,6 +1014,12 @@ def _pair_summaries(runs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
                 "excluded_repetitions": len(ordered) - len(eligible),
                 "excluded_run_labels": [
                     str(run["run_label"]) for run in ordered if not run["eligible"]
+                ],
+                "parity_validated_repetitions": len(parity_validated_runs),
+                "parity_unvalidated_run_labels": [
+                    str(run["run_label"])
+                    for run in ordered
+                    if run["parity_validated"] is not True
                 ],
                 "mean_score": mean_score,
                 "score_stdev": score_stdev,
@@ -1178,19 +1184,22 @@ def _write_leaderboard(path: Path, pairs: Sequence[dict[str, Any]]) -> None:
     lines = [
         "# Cleaned Native ShellBench Leaderboard",
         "",
-        "Incomplete, infra-dominated, and harness-wide failure repetitions are excluded.",
+        "Incomplete, infra-dominated, harness-wide failure, identity-invalid, and "
+        "trajectory-incomplete repetitions are excluded. Harbor parity validation is "
+        "reported separately and is not an eligibility gate.",
         "",
-        "| Rank | Pair | Repetitions | Mean | Stdev | Min | Max | Mean exact passes | Pass rate | Clean complete |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Rank | Pair | Repetitions | Parity validated | Mean | Stdev | Min | Max | Mean exact passes | Pass rate | Clean complete |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for rank, pair in enumerate(ranked, start=1):
         lines.append(
-            "| {rank} | {label} | {eligible}/{total} | {mean} | {stdev} | "
+            "| {rank} | {label} | {eligible}/{total} | {parity}/{total} | {mean} | {stdev} | "
             "{minimum} | {maximum} | {passes} | {pass_rate} | {clean} |".format(
                 rank=rank,
                 label=_markdown_label(pair["pair_label"]),
                 eligible=pair["eligible_repetitions"],
                 total=pair["total_repetitions"],
+                parity=pair["parity_validated_repetitions"],
                 mean=_format_metric(pair["mean_score"]),
                 stdev=_format_metric(pair["score_stdev"]),
                 minimum=_format_metric(pair["min_score"]),
@@ -1201,7 +1210,9 @@ def _write_leaderboard(path: Path, pairs: Sequence[dict[str, Any]]) -> None:
             )
         )
     if not ranked:
-        lines.append("| - | No eligible repetitions | 0/0 | - | - | - | - | - | - | 0 |")
+        lines.append(
+            "| - | No eligible repetitions | 0/0 | 0/0 | - | - | - | - | - | - | 0 |"
+        )
     path.write_text("\n".join(lines) + "\n")
 
 
