@@ -20,8 +20,10 @@ def _write_run(
     model_slug: str = "model",
     native: bool = False,
     parity_validated: bool = False,
+    parity_validation: dict | None = None,
     leaderboard_eligible: bool | None = None,
     exclusion_reason: str = "",
+    manifest_extra: dict | None = None,
 ) -> None:
     run_dir = jobs_root / "jobs" / run_label
     run_dir.mkdir(parents=True)
@@ -33,12 +35,22 @@ def _write_run(
         "expected_task_count": expected_task_count,
     }
     if native:
+        scoped_validation = parity_validation
+        if parity_validated and scoped_validation is None:
+            scoped_validation = {
+                "validated": True,
+                "scope": {
+                    "harness": harness,
+                    "model_slug": model_slug,
+                },
+            }
         manifest.update(
             {
                 "runner": "shellbench-native",
                 "canonical_model_identity": True,
                 "trajectory_mode": "real_harness_events",
                 "parity_validated": parity_validated,
+                "parity_validation": scoped_validation,
             }
         )
     if pair_label is not None:
@@ -48,6 +60,8 @@ def _write_run(
         manifest["exclusion_reason"] = exclusion_reason
     if tasks is not None:
         manifest["tasks"] = tasks
+    if manifest_extra is not None:
+        manifest.update(manifest_extra)
     (run_dir / "run_manifest.json").write_text(json.dumps(manifest))
 
     for index, result in enumerate(results, start=1):
@@ -311,6 +325,102 @@ def test_native_run_requires_parity_validation_for_leaderboard(tmp_path: Path):
 
     assert report["runs"][0]["eligible"] is False
     assert report["runs"][0]["exclusion_reason"] == "parity_not_validated"
+
+
+def test_native_run_rejects_legacy_unscoped_parity_claim(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "hermes-gpt56-terra",
+        expected_task_count=1,
+        results=[_native_result("a")],
+        harness="hermes",
+        model_slug="gpt56-terra",
+        native=True,
+        parity_validated=True,
+        manifest_extra={"parity_validation": None},
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    run = report["runs"][0]
+    assert run["parity_validated"] is False
+    assert run["parity_validation_status"] == "legacy_unscoped"
+    assert run["eligible"] is False
+
+
+def test_native_run_accepts_known_legacy_codex_gpt55_route(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "codex-gpt55-calibration",
+        expected_task_count=20,
+        results=[_native_result(f"task-{index}") for index in range(20)],
+        harness="codex",
+        model_slug="gpt55",
+        native=True,
+        parity_validated=True,
+        manifest_extra={"parity_validation": None},
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    run = report["runs"][0]
+    assert run["parity_validated"] is True
+    assert run["parity_validation_status"] == "legacy_route_compatible"
+    assert run["eligible"] is True
+
+
+def test_native_run_rejects_legacy_codex_gpt55_full_suite(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "codex-gpt55-full-116",
+        expected_task_count=116,
+        results=[_native_result(f"task-{index}") for index in range(116)],
+        harness="codex",
+        model_slug="gpt55",
+        native=True,
+        parity_validated=True,
+        manifest_extra={"parity_validation": None},
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    run = report["runs"][0]
+    assert run["parity_validated"] is False
+    assert run["parity_validation_status"] == "legacy_scope_mismatch"
+    assert run["eligible"] is False
+    assert run["exclusion_reason"] == "parity_not_validated"
+
+
+def test_native_run_rejects_mismatched_parity_scope(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "hermes-gpt55",
+        expected_task_count=1,
+        results=[_native_result("a")],
+        harness="hermes",
+        model_slug="gpt55",
+        native=True,
+        parity_validated=True,
+        parity_validation={
+            "validated": True,
+            "scope": {"harness": "codex", "model_slug": "gpt55"},
+        },
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    run = report["runs"][0]
+    assert run["parity_validated"] is False
+    assert run["parity_validation_status"] == "scope_mismatch"
+    assert run["eligible"] is False
 
 
 def test_native_identity_checks_ignore_pre_agent_infra_failures(tmp_path: Path):
@@ -606,3 +716,84 @@ def test_unexpected_task_result_is_excluded_from_reward_sum(tmp_path: Path):
     assert run["score"] == 0.5
     assert run["eligible"] is False
     assert run["infra"] == 1
+
+
+def test_repair_overlay_sensitivity_reports_available_score_delta(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    original_label = "codex-gpt55-r1"
+    repaired_label = f"{original_label}-repair-abc"
+    _write_run(
+        jobs_root,
+        original_label,
+        expected_task_count=2,
+        results=[_result("a", reward=0.0), _result("b", reward=0.0)],
+    )
+    _write_run(
+        jobs_root,
+        repaired_label,
+        expected_task_count=2,
+        results=[_result("a", reward=1.0), _result("b", reward=0.0)],
+        manifest_extra={
+            "rerun_of_canonical_run": original_label,
+            "repair_task_names": ["a"],
+            "repair_overlay": {
+                "rerun_of_canonical_run": original_label,
+                "repair_task_names": ["a"],
+                "task_lineage": [
+                    {"task_name": "a", "source_kind": "repair"},
+                    {"task_name": "b", "source_kind": "canonical"},
+                ],
+            },
+        },
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    sensitivity = report["repair_overlay_sensitivity"]
+    assert sensitivity["overlay_run_count"] == 1
+    row = sensitivity["runs"][0]
+    assert row["run_label"] == repaired_label
+    assert row["original_task_count"] == 1
+    assert row["repaired_task_count"] == 1
+    assert row["original_result_count"] == 2
+    assert row["repaired_result_count"] == 2
+    assert row["original_score"] == 0.0
+    assert row["repaired_score"] == 0.5
+    assert row["score_delta"] == 0.5
+    assert row["delta_status"] == "available"
+
+    written = json.loads(
+        (summaries_dir / "repair_overlay_sensitivity.json").read_text()
+    )
+    assert written == sensitivity
+    with (summaries_dir / "repair_overlay_sensitivity.csv").open(
+        newline=""
+    ) as handle:
+        csv_row = next(csv.DictReader(handle))
+    assert csv_row["delta_status"] == "available"
+    assert csv_row["score_delta"] == "0.5"
+
+
+def test_repair_overlay_sensitivity_marks_missing_original(tmp_path: Path):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "openclaw-gpt55-r1-repair-abc",
+        expected_task_count=2,
+        results=[_result("a", reward=1.0), _result("b", reward=0.0)],
+        manifest_extra={
+            "rerun_of_canonical_run": "openclaw-gpt55-r1",
+            "repair_task_names": ["a"],
+        },
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    row = report["repair_overlay_sensitivity"]["runs"][0]
+    assert row["original_task_count"] == 1
+    assert row["repaired_task_count"] == 1
+    assert row["original_score"] is None
+    assert row["score_delta"] is None
+    assert row["delta_status"] == "original_unavailable"

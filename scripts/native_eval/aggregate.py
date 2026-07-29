@@ -69,6 +69,12 @@ MISSING_REWARD_EXCEPTION_TYPES = {
     "RewardFileNotFoundError",
 }
 
+# Compatibility for manifests created before parity scopes were recorded.
+# The pinned calibration validated only this exact native route and task count.
+LEGACY_PARITY_VALIDATED_SCOPES = {
+    ("codex", "gpt55", 20),
+}
+
 TIMING_FIELDS = (
     "environment_setup",
     "agent_setup",
@@ -139,12 +145,31 @@ RUN_FIELDS = (
     "canonical_model_identity",
     "trajectory_complete",
     "parity_validated",
+    "parity_validation_status",
+    "parity_validation_scope",
     "eligible",
     "exclusion_reason",
     "n_input_tokens",
     "n_cache_tokens",
     "n_output_tokens",
     "cost_usd",
+)
+
+REPAIR_SENSITIVITY_FIELDS = (
+    "run_label",
+    "pair_label",
+    "repetition",
+    "original_run_label",
+    "expected_task_count",
+    "original_task_count",
+    "repaired_task_count",
+    "unknown_source_task_count",
+    "original_result_count",
+    "repaired_result_count",
+    "original_score",
+    "repaired_score",
+    "score_delta",
+    "delta_status",
 )
 
 INFRA_FIELDS = (
@@ -298,6 +323,88 @@ def _manifest_value(manifest: dict[str, Any], *keys: str) -> Any:
         if value is not None and value != "":
             return value
     return None
+
+
+def _compact_json(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _scope_matches_value(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, list):
+        return any(_scope_matches_value(actual, item) for item in expected)
+    if isinstance(actual, int) or isinstance(expected, int):
+        return _integer(actual) == _integer(expected)
+    return str(actual or "") == str(expected or "")
+
+
+def _parity_validation(
+    manifest: dict[str, Any],
+    *,
+    native_run: bool,
+) -> tuple[bool, str, str]:
+    if not native_run:
+        return True, "not_required", ""
+
+    validation = manifest.get("parity_validation")
+    legacy_scope = manifest.get("parity_validation_scope")
+    if isinstance(validation, dict):
+        validated = validation.get("validated") is True
+        scope = validation.get("scope")
+        if scope is None:
+            scope = {
+                key: value
+                for key, value in validation.items()
+                if key not in {"validated", "evidence", "notes"}
+            }
+    elif isinstance(legacy_scope, dict):
+        validated = manifest.get("parity_validated") is True
+        scope = legacy_scope
+    elif manifest.get("parity_validated") is True:
+        legacy_scope = (
+            str(manifest.get("harness") or ""),
+            str(manifest.get("model_slug") or ""),
+            _integer(manifest.get("expected_task_count")),
+        )
+        scope = {
+            "expected_task_count": legacy_scope[2],
+            "harness": legacy_scope[0],
+            "model_slug": legacy_scope[1],
+        }
+        scope_text = _compact_json(scope)
+        if legacy_scope in LEGACY_PARITY_VALIDATED_SCOPES:
+            return True, "legacy_route_compatible", scope_text
+        if legacy_scope[:2] == ("codex", "gpt55"):
+            return False, "legacy_scope_mismatch", scope_text
+        return False, "legacy_unscoped", ""
+    else:
+        return False, "not_validated", ""
+
+    if not isinstance(scope, dict):
+        return False, "scope_invalid", ""
+    scope_text = _compact_json(scope)
+    if not validated:
+        return False, "not_validated", scope_text
+
+    model_keys = ("model_slug", "model_id", "provider_model_id")
+    if "harness" not in scope or not any(key in scope for key in model_keys):
+        return False, "scope_incomplete", scope_text
+
+    comparable = {
+        "harness": manifest.get("harness"),
+        "model_slug": manifest.get("model_slug"),
+        "model_id": manifest.get("model_id"),
+        "provider_model_id": manifest.get("provider_model_id"),
+        "execution_mode": manifest.get("execution_mode"),
+        "task_suite": manifest.get("task_suite"),
+        "expected_task_count": manifest.get("expected_task_count"),
+    }
+    unsupported_keys = set(scope) - set(comparable)
+    if unsupported_keys:
+        return False, "scope_unsupported", scope_text
+    for key, expected in scope.items():
+        if not _scope_matches_value(comparable[key], expected):
+            return False, "scope_mismatch", scope_text
+    return True, "validated", scope_text
 
 
 def _derive_repetition(run_label: str) -> int | None:
@@ -537,7 +644,9 @@ def _matches_expected(row: dict[str, Any], task_name: str, task_path: str) -> bo
     return bool({task_name, task_path, Path(task_path).name if task_path else ""} & candidates)
 
 
-def _load_run(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _load_run(
+    run_dir: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     run_label = run_dir.name
     manifest_path = run_dir / "run_manifest.json"
     manifest, manifest_error = _read_json(manifest_path)
@@ -682,7 +791,7 @@ def _load_run(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         rows=rows,
         manifest=manifest,
     )
-    return summary, rows
+    return summary, rows, manifest
 
 
 def _sum_present(rows: Iterable[dict[str, Any]], key: str) -> int | float | None:
@@ -801,7 +910,11 @@ def _summarize_run(
             for row in trajectory_required_rows
         )
     )
-    parity_validated = not native_run or manifest.get("parity_validated") is True
+    (
+        parity_validated,
+        parity_validation_status,
+        parity_validation_scope,
+    ) = _parity_validation(manifest, native_run=native_run)
     eligible = (
         not incomplete
         and not infra_dominated
@@ -855,6 +968,8 @@ def _summarize_run(
         "canonical_model_identity": canonical_model_identity,
         "trajectory_complete": trajectory_complete,
         "parity_validated": parity_validated,
+        "parity_validation_status": parity_validation_status,
+        "parity_validation_scope": parity_validation_scope,
         "eligible": eligible,
         "exclusion_reason": exclusion_reason,
         "n_input_tokens": _sum_present(scored_rows, "n_input_tokens"),
@@ -929,6 +1044,114 @@ def _public_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _repair_source_counts(
+    manifest: dict[str, Any],
+    expected_task_count: int,
+) -> tuple[int, int, int] | None:
+    overlay = manifest.get("repair_overlay")
+    repair_names = manifest.get("repair_task_names")
+    if not isinstance(overlay, dict):
+        if not isinstance(repair_names, list) or not repair_names:
+            return None
+        repaired = len({str(name) for name in repair_names if name})
+        return max(expected_task_count - repaired, 0), repaired, 0
+
+    lineage = overlay.get("task_lineage")
+    if isinstance(lineage, list):
+        source_kinds = [
+            str(item.get("source_kind") or "")
+            for item in lineage
+            if isinstance(item, dict)
+        ]
+        if source_kinds:
+            original = source_kinds.count("canonical")
+            repaired = source_kinds.count("repair")
+            unknown = len(source_kinds) - original - repaired
+            return original, repaired, unknown
+
+    repair_names = overlay.get("repair_task_names", repair_names)
+    if isinstance(repair_names, list):
+        repaired = len({str(name) for name in repair_names if name})
+        return max(expected_task_count - repaired, 0), repaired, 0
+    return 0, 0, expected_task_count
+
+
+def _repair_overlay_sensitivity(
+    records: Sequence[tuple[dict[str, Any], dict[str, Any]]],
+) -> dict[str, Any]:
+    summaries = {
+        str(summary["run_label"]): summary
+        for summary, _manifest in records
+    }
+    runs: list[dict[str, Any]] = []
+    for summary, manifest in sorted(
+        records,
+        key=lambda record: str(record[0]["run_label"]),
+    ):
+        expected_task_count = int(summary["expected_task_count"])
+        source_counts = _repair_source_counts(manifest, expected_task_count)
+        if source_counts is None:
+            continue
+        original_tasks, repaired_tasks, unknown_tasks = source_counts
+        overlay = manifest.get("repair_overlay")
+        overlay = overlay if isinstance(overlay, dict) else {}
+        original_run_label = str(
+            overlay.get("rerun_of_canonical_run")
+            or manifest.get("rerun_of_canonical_run")
+            or ""
+        )
+        original_summary = summaries.get(original_run_label)
+        original_score = (
+            float(original_summary["score"])
+            if original_summary is not None
+            else None
+        )
+        repaired_score = float(summary["score"])
+        if not original_run_label:
+            delta_status = "original_label_unavailable"
+        elif original_summary is None:
+            delta_status = "original_unavailable"
+        elif (
+            int(original_summary["expected_task_count"])
+            != expected_task_count
+        ):
+            delta_status = "task_count_mismatch"
+            original_score = None
+        else:
+            delta_status = "available"
+        runs.append(
+            {
+                "run_label": summary["run_label"],
+                "pair_label": summary["pair_label"],
+                "repetition": summary["repetition"],
+                "original_run_label": original_run_label,
+                "expected_task_count": expected_task_count,
+                "original_task_count": original_tasks,
+                "repaired_task_count": repaired_tasks,
+                "unknown_source_task_count": unknown_tasks,
+                "original_result_count": (
+                    original_summary["result_file_count"]
+                    if original_summary is not None
+                    else None
+                ),
+                "repaired_result_count": summary["result_file_count"],
+                "original_score": original_score,
+                "repaired_score": repaired_score,
+                "score_delta": (
+                    repaired_score - original_score
+                    if delta_status == "available" and original_score is not None
+                    else None
+                ),
+                "delta_status": delta_status,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "overlay_run_count": len(runs),
+        "runs": runs,
+    }
+
+
 def _write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[dict[str, Any]]) -> None:
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -998,6 +1221,7 @@ def aggregate(jobs_root: str | Path, summaries_dir: str | Path) -> dict[str, Any
 
     run_summaries: list[dict[str, Any]] = []
     task_rows: list[dict[str, Any]] = []
+    run_records: list[tuple[dict[str, Any], dict[str, Any]]] = []
     run_dirs = sorted(
         path
         for path in jobs_dir.iterdir()
@@ -1006,9 +1230,10 @@ def aggregate(jobs_root: str | Path, summaries_dir: str | Path) -> dict[str, Any
         and (path / "run_manifest.json").is_file()
     )
     for run_dir in run_dirs:
-        summary, rows = _load_run(run_dir)
+        summary, rows, manifest = _load_run(run_dir)
         run_summaries.append(summary)
         task_rows.extend(rows)
+        run_records.append((summary, manifest))
 
     run_summaries.sort(key=lambda run: str(run["run_label"]))
     task_rows.sort(
@@ -1019,6 +1244,7 @@ def aggregate(jobs_root: str | Path, summaries_dir: str | Path) -> dict[str, Any
         )
     )
     pair_summaries = _pair_summaries(run_summaries)
+    repair_sensitivity = _repair_overlay_sensitivity(run_records)
     public_task_rows = _public_rows(task_rows)
     infra_rows = [row for row in public_task_rows if row["classification"] == "infra"]
 
@@ -1035,6 +1261,7 @@ def aggregate(jobs_root: str | Path, summaries_dir: str | Path) -> dict[str, Any
         },
         "runs": run_summaries,
         "pairs": pair_summaries,
+        "repair_overlay_sensitivity": repair_sensitivity,
     }
 
     _write_csv(output_dir / "aggregate_results.csv", RUN_FIELDS, run_summaries)
@@ -1043,6 +1270,14 @@ def aggregate(jobs_root: str | Path, summaries_dir: str | Path) -> dict[str, Any
     )
     _write_csv(output_dir / "per_task_results.csv", PER_TASK_FIELDS, public_task_rows)
     _write_csv(output_dir / "infra_failures.csv", INFRA_FIELDS, infra_rows)
+    _write_csv(
+        output_dir / "repair_overlay_sensitivity.csv",
+        REPAIR_SENSITIVITY_FIELDS,
+        repair_sensitivity["runs"],
+    )
+    (output_dir / "repair_overlay_sensitivity.json").write_text(
+        json.dumps(repair_sensitivity, indent=2, sort_keys=True) + "\n"
+    )
     _write_leaderboard(output_dir / "cleaned_leaderboard.md", pair_summaries)
     return report
 

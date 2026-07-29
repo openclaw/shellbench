@@ -303,6 +303,7 @@ class FakeExecutor:
         self.dispatches: list[str] = []
         self.dispatch_concurrency: dict[str, int] = {}
         self.dispatch_arguments: dict[str, list[str]] = {}
+        self.dispatch_parity_validation: dict[str, str] = {}
         self.stops: list[str] = []
         self._lock = threading.Lock()
         self._dispatch_condition = threading.Condition(self._lock)
@@ -428,7 +429,8 @@ class FakeExecutor:
             )
             remote_command = shlex.split(argv[-1])
             dispatch_marker = remote_command.index("fleet-dispatch")
-            remote_run_args = remote_command[dispatch_marker + 16 :]
+            parity_validation = remote_command[dispatch_marker + 16]
+            remote_run_args = remote_command[dispatch_marker + 17 :]
             with self._dispatch_condition:
                 attempt = self.dispatch_attempts.get(label, 0) + 1
                 self.dispatch_attempts[label] = attempt
@@ -441,6 +443,7 @@ class FakeExecutor:
                 self.dispatches.append(label)
                 self.dispatch_concurrency[label] = int(remote_run_args[10])
                 self.dispatch_arguments[label] = remote_run_args
+                self.dispatch_parity_validation[label] = parity_validation
                 self.events.append(("dispatch", label))
                 self.remote_states[label] = "running"
                 self._dispatch_condition.notify_all()
@@ -483,6 +486,7 @@ def _config(
     model_task_concurrency: dict[str, int] | None = None,
     warmup_capacity_attempts: int = 12,
     warmup_capacity_backoff_seconds: float = 0,
+    parity_validated_routes: frozenset[tuple[str, str]] = frozenset(),
 ) -> FleetConfig:
     runner_archive = tmp_path / "runner.tar.gz"
     task_archive = tmp_path / "tasks.tar.gz"
@@ -507,6 +511,7 @@ def _config(
         checkpoint_poll_seconds=1,
         warmup_capacity_attempts=warmup_capacity_attempts,
         warmup_capacity_backoff_seconds=warmup_capacity_backoff_seconds,
+        parity_validated_routes=parity_validated_routes,
     )
 
 
@@ -544,6 +549,25 @@ def test_controller_runs_bounded_wave_and_stops_after_verified_export(
         stop_at = executor.events.index(("stop", lease_id))
         assert checkpoint_at < stop_at
     assert "TOPSECRET" not in "\n".join(" ".join(command) for command in executor.commands)
+
+
+def test_controller_dispatches_only_matching_parity_scope(tmp_path: Path) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [_planned(_run_spec(label))])
+    config = _config(
+        tmp_path,
+        run_index,
+        parity_validated_routes=frozenset({("openclaw", "gpt55")}),
+    )
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    assert json.loads(executor.dispatch_parity_validation[label]) == {
+        "scope": {"harness": "openclaw", "model_slug": "gpt55"},
+        "validated": True,
+    }
 
 
 def test_controller_accepts_xhigh_reasoning_effort(tmp_path: Path) -> None:
@@ -1014,6 +1038,8 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
             "--execution-mode",
             "native",
             "--parity-validated",
+            "--parity-validated-route",
+            "codex=gpt55",
             "--model-task-concurrency",
             "fable5=2",
         ]
@@ -1025,6 +1051,7 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
     assert args.judge_model_id == "gpt-5.5"
     assert args.execution_mode == "native"
     assert args.parity_validated is True
+    assert args.parity_validated_routes == frozenset({("codex", "gpt55")})
     assert args.model_task_concurrency == {"fable5": 2}
 
 
@@ -1038,6 +1065,8 @@ def test_parse_args_accepts_repeatable_model_limits(tmp_path: Path) -> None:
         ("--provider-max-runs", ["anthropic=0"]),
         ("--model-task-concurrency", ["fable5=-1"]),
         ("--model-task-concurrency", ["fable5=1", "fable5=2"]),
+        ("--parity-validated-route", ["codex"]),
+        ("--parity-validated-route", ["codex=gpt55", "codex=gpt55"]),
     ],
 )
 def test_parse_args_rejects_invalid_model_values(

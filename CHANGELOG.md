@@ -19,7 +19,11 @@
   readiness probing is stale.
 - Preserve Hermes JSONL sessions containing literal Unicode line separators.
 - Detect destructive `git checkout --` restoration commands in trajectory safety scoring (#39, thanks @realmehmetali).
+- Scope native Harbor parity claims to the validated harness/model route instead
+  of applying one fleet-wide boolean.
 
 ### Added
 
 - Add `gpt-5.6-luna` and `gpt-5.6-terra` to the native evaluation catalog.
+- Report repair-overlay task provenance and original-versus-repaired score
+  sensitivity when the original job is available.

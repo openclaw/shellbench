@@ -174,6 +174,8 @@ def test_run_manifest_records_native_audit_metadata(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.delenv("SHELLBENCH_PARITY_VALIDATED", raising=False)
+    monkeypatch.delenv("SHELLBENCH_PARITY_VALIDATION_JSON", raising=False)
     monkeypatch.setenv("SHELLBENCH_EXECUTION_MODE", "native")
     monkeypatch.setenv("SHELLBENCH_HARBOR_REFERENCE_COMMIT", "harbor-commit")
     monkeypatch.setenv("SHELLBENCH_JUDGE_MODEL_ID", "gpt-5.5")
@@ -213,6 +215,108 @@ def test_run_manifest_records_native_audit_metadata(
     assert manifest["repair_mode"] is False
     assert manifest["rerun_of_canonical_run"] is None
     assert manifest["repair_task_names"] == []
+    assert manifest["parity_validated"] is False
+    assert manifest["parity_validation"] is None
+    assert manifest["legacy_parity_validated_claim"] is False
+
+
+def test_run_manifest_scopes_parity_to_matching_route(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    validation = {
+        "validated": True,
+        "scope": {"harness": "codex", "model_slug": "gpt55"},
+        "evidence": {"task_count": 20},
+    }
+    monkeypatch.setenv(
+        "SHELLBENCH_PARITY_VALIDATION_JSON",
+        json.dumps(validation),
+    )
+    monkeypatch.setenv("SHELLBENCH_PARITY_VALIDATED", "true")
+    codex_run = RunSpec(
+        run_label="codex-gpt55-cal20-native-r1",
+        harness="codex",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=20,
+        run_date="20260727",
+    )
+    hermes_run = RunSpec(
+        run_label="hermes-gpt55-cal20-native-r1",
+        harness="hermes",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=20,
+        run_date="20260727",
+    )
+
+    codex_manifest = _run_manifest(
+        codex_run,
+        public_tasks_commit="tasks-commit",
+        task_suite_path="combined tasks/tasks",
+        concurrency=4,
+        started_at="2026-07-27T00:00:00Z",
+        tasks_root=tmp_path,
+        tasks=[],
+    )
+    hermes_manifest = _run_manifest(
+        hermes_run,
+        public_tasks_commit="tasks-commit",
+        task_suite_path="combined tasks/tasks",
+        concurrency=4,
+        started_at="2026-07-27T00:00:00Z",
+        tasks_root=tmp_path,
+        tasks=[],
+    )
+
+    assert codex_manifest["parity_validated"] is True
+    assert codex_manifest["parity_validation"] == validation
+    assert codex_manifest["legacy_parity_validated_claim"] is True
+    assert hermes_manifest["parity_validated"] is False
+    assert hermes_manifest["parity_validation"] == validation
+
+
+def test_legacy_global_parity_flag_does_not_publish_validated(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SHELLBENCH_PARITY_VALIDATED", "true")
+    monkeypatch.delenv("SHELLBENCH_PARITY_VALIDATION_JSON", raising=False)
+    run = RunSpec(
+        run_label="openclaw-gpt55-full-116-r1",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="sb-gpt55",
+        repetition=1,
+        expected_task_count=116,
+        run_date="20260728",
+    )
+
+    manifest = _run_manifest(
+        run,
+        public_tasks_commit="tasks-commit",
+        task_suite_path="combined tasks/tasks",
+        concurrency=16,
+        started_at="2026-07-28T00:00:00Z",
+        tasks_root=tmp_path,
+        tasks=[],
+    )
+
+    assert manifest["parity_validated"] is False
+    assert manifest["parity_validation"] is None
+    assert manifest["legacy_parity_validated_claim"] is True
 
 
 def test_run_manifest_records_targeted_repair_lineage(tmp_path: Path) -> None:
