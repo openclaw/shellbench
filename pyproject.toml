@@ -37,6 +37,9 @@ dev = [
 mlflow = [
     "mlflow>=3.14.0,<4",
 ]
+analysis = [
+    "matplotlib>=3.9,<4",
+]
 hermes = [
     "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main",
 ]

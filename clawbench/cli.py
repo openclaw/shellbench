@@ -254,6 +254,45 @@ def dynamics_report(
     click.echo(f"Saved {len(plots)} plots to {output_dir}/")
 
 
+@cli.command("task-analysis")
+@click.option(
+    "--summaries-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help="Directory containing native aggregate_results.csv and per_task_results.csv.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    default=Path("results/task_analysis"),
+    show_default=True,
+    help="Directory where task diagnostics, Markdown, and plots will be written.",
+)
+@click.option(
+    "--no-plots",
+    is_flag=True,
+    help="Write CSV, JSON, and Markdown outputs without rendering SVG plots.",
+)
+def task_analysis(summaries_dir: Path, output_dir: Path, no_plots: bool) -> None:
+    """Analyze task variance across harness, model, and reasoning cells."""
+    from clawbench.task_analysis import analyze_task_matrix
+
+    try:
+        report = analyze_task_matrix(
+            summaries_dir,
+            output_dir,
+            generate_plots=not no_plots,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(
+        f"Analyzed {report['source']['eligible_run_count']} eligible runs "
+        f"across {len(report['datasets'])} task dataset(s)"
+    )
+    click.echo(f"Task analysis saved to {output_dir}")
+
+
 def _write_dynamics_report(
     task_runs: dict[str, list],
     output_dir: Path,

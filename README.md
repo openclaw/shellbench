@@ -435,6 +435,27 @@ clawbench dynamics-report \
 #   results/gptoss_dynamics/dynamics.json
 ```
 
+### Analyzing a native ShellBench matrix
+
+Native aggregation now preserves the task revision, harness, provider model,
+reasoning effort, and parent-run score/eligibility on every task row. Build
+task-level variance diagnostics from those normalized exports:
+
+```bash
+python scripts/native_eval/aggregate.py runs-full-YYYYMMDD results/native_summaries
+
+# Install the optional plotting dependency, or pass --no-plots.
+pip install -e '.[analysis]'
+clawbench task-analysis \
+  --summaries-dir results/native_summaries \
+  --output-dir results/task_analysis
+```
+
+The report writes task-cell summaries, paired harness and reasoning deltas,
+task variance rankings, a machine-readable JSON summary, `ANALYSIS.md`, and
+SVG box plots. Different task revisions and task counts remain separate
+datasets and are never silently pooled.
+
 ### Running locally with small models (Ollama)
 
 A single consumer GPU running an open-weight model is enough to develop plugin profiles and validate algorithmic ideas — no API keys or cloud spend required.
@@ -518,6 +539,7 @@ clawbench/
 │   ├── dynamics.py                 # Trajectory metrics + sensitivity analysis
 │   ├── dynamics_archive.py         # Cached-run loading + offline report assembly
 │   ├── dynamics_plots.py           # Offline dynamics visualizations
+│   ├── task_analysis.py            # Native matrix task variance + paired deltas
 │   └── cli.py                      # CLI entry points
 │
 ├── tasks-public/                   # Core v1 PUBLIC release (19 tasks)

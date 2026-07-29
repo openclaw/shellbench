@@ -29,3 +29,5 @@
 - Add `gpt-5.6-luna` and `gpt-5.6-terra` to the native evaluation catalog.
 - Report repair-overlay task provenance and original-versus-repaired score
   sensitivity when the original job is available.
+- Export native run metadata into aggregate task rows and add task-matrix
+  variance analysis with paired harness/reasoning diagnostics and SVG plots.
