@@ -31,6 +31,7 @@ from scripts.native_eval.models import (
     MODELS,
     RunSpec,
     build_matrix_plan,
+    trajectory_mode_for_harness,
 )
 from scripts.native_eval import plan as native_plan
 from scripts.native_eval.proxy import JUDGE_PROXY_MODEL_NAME, write_proxy_config
@@ -108,6 +109,17 @@ def test_all_harness_errors_reject_run_but_agent_errors_do_not() -> None:
         "accepted": True,
         "reason": None,
         "outcome_counts": {"agent_error": 1, "clean": 1},
+    }
+
+
+def test_all_native_harnesses_emit_real_trajectories() -> None:
+    assert {
+        harness.name: trajectory_mode_for_harness(harness.name) for harness in HARNESSES
+    } == {
+        "openclaw": "real_harness_events",
+        "hermes": "real_harness_events",
+        "codex": "real_harness_events",
+        "claude-code": "real_harness_events",
     }
 
 
