@@ -1273,6 +1273,35 @@ def test_recovery_required_resumes_existing_remote_run(tmp_path: Path) -> None:
     assert final["status"] == "completed"
 
 
+def test_recovery_rehydrates_replacement_lease_despite_old_bootstrap_timestamp(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = _planned(_run_spec(label))
+    run.update(
+        {
+            "status": "recovery_required",
+            "requested_lease_slug": "replacement",
+            "bootstrapped_at_utc": "2026-07-27T00:00:00Z",
+        }
+    )
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    final = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
+    assert final["status"] == "completed"
+    assert final["bootstrapped_lease_id"] == "cbx_1"
+    assert any(
+        command and command[0] == "ssh" and "fleet-hydrate" in " ".join(command)
+        for command in executor.commands
+    )
+    assert executor.dispatches == [label]
+
+
 def test_recovery_infers_success_from_verified_full_archive_and_done_log(
     tmp_path: Path,
 ) -> None:
