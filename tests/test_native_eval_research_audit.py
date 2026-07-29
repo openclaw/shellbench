@@ -180,3 +180,81 @@ def test_research_audit_fails_identity_when_trace_is_missing(tmp_path: Path) -> 
 
     assert summary["identity_audit_pass_count"] == 0
     assert summary["identity_audit_fail_count"] == 1
+
+
+def test_research_audit_requires_matching_openclaw_candidate_provenance(
+    tmp_path: Path,
+) -> None:
+    candidate = {
+        "source_kind": "npm_tarball",
+        "package_name": "openclaw",
+        "package_version": "2026.7.29-candidate.1",
+        "sha256": "candidate-sha",
+        "artifact_filename": "openclaw-candidate.tgz",
+    }
+    statuses = {
+        "match": candidate,
+        "mismatch": {**candidate, "sha256": "different"},
+        "missing": None,
+    }
+    for status, installed in statuses.items():
+        run_label = f"openclaw-candidate-{status}"
+        root = tmp_path / status
+        extracted = root / "extracted"
+        job_dir = extracted / run_label
+        trial_dir = job_dir / "task__abc"
+        run_entry = {
+            "run_label": run_label,
+            "harness": "openclaw",
+            "harness_version": "2026.7.29-candidate.1",
+            "model_slug": "gpt56-sol",
+            "model_id": "gpt-5.6-sol",
+            "repetition": 1,
+            "expected_task_count": 1,
+            "openclaw_package": candidate,
+        }
+        _write_json(root / "run-index.json", {"runs": [run_entry]})
+        run_manifest = {"run_label": run_label}
+        toolchain = {"openclaw": "openclaw 2026.7.29-candidate.1"}
+        if installed is not None:
+            run_manifest["openclaw_package"] = installed
+            toolchain["openclaw_package"] = installed
+        _write_json(job_dir / "run_manifest.json", run_manifest)
+        _write_json(
+            extracted / f"shellbench_meta-{run_label}" / "toolchain_manifest.json",
+            toolchain,
+        )
+        _write_json(
+            trial_dir / "result.json",
+            {
+                "task_id": {"path": "/tasks/example-task"},
+                "agent_result": {
+                    "trajectory_status": "real",
+                    "runtime_model_name": "gpt-5.6-sol",
+                    "canonical_model_identity": True,
+                },
+            },
+        )
+        _write_json(
+            trial_dir / "agent" / "trajectory.json",
+            {
+                "agent": {"model_name": "openai/gpt-5.6-sol"},
+                "steps": [],
+                "extra": {"observed_models": ["gpt-5.6-sol"]},
+            },
+        )
+
+        summary = export_research_tables(
+            run_index_path=root / "run-index.json",
+            extracted_root=extracted,
+            output_dir=root / "analysis",
+        )
+        with (root / "analysis" / "model_identity_audit.csv").open(
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            row = next(csv.DictReader(handle))
+
+        assert row["openclaw_candidate_status"] == status
+        assert row["model_identity_audit_passed"] == str(status == "match")
+        assert summary[f"openclaw_candidate_{status}_count"] == 1

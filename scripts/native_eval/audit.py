@@ -23,6 +23,17 @@ def _read_object(path: Path) -> dict[str, Any]:
     return value
 
 
+def _candidate_status(
+    expected: dict[str, Any] | None,
+    observed: Any,
+) -> str:
+    if expected is None:
+        return "not_applicable"
+    if not isinstance(observed, dict):
+        return "missing"
+    return "match" if observed == expected else "mismatch"
+
+
 def build_metadata_supplements(
     run_index_path: Path,
     extracted_root: Path,
@@ -36,8 +47,12 @@ def build_metadata_supplements(
     missing = [field for field, value in provenance.items() if value in (None, "")]
     if missing:
         raise ValueError(f"fleet metadata is missing: {', '.join(missing)}")
+    expected_candidate = fleet.get("openclaw_package")
+    if expected_candidate is not None and not isinstance(expected_candidate, dict):
+        raise ValueError("fleet openclaw_package must be an object")
 
     supplements = []
+    candidate_counts = {"match": 0, "mismatch": 0, "missing": 0}
     for manifest_path in sorted(extracted_root.glob("*/shellbench_meta-*/run_manifest.json")):
         manifest = _read_object(manifest_path)
         run_label = str(manifest.get("run_label") or "")
@@ -54,22 +69,31 @@ def build_metadata_supplements(
                     f"{run_label} has conflicting {field}: "
                     f"archive={archived!r}, fleet={expected!r}"
                 )
-        if additions:
-            supplements.append(
-                {
-                    "run_label": run_label,
-                    "archived_manifest": str(manifest_path.relative_to(extracted_root)),
-                    "supplements": additions,
-                }
-            )
+        candidate_status = _candidate_status(
+            expected_candidate,
+            manifest.get("openclaw_package"),
+        )
+        if candidate_status != "not_applicable":
+            candidate_counts[candidate_status] += 1
+        if additions or candidate_status != "not_applicable":
+            supplement = {
+                "run_label": run_label,
+                "archived_manifest": str(manifest_path.relative_to(extracted_root)),
+                "supplements": additions,
+            }
+            if candidate_status != "not_applicable":
+                supplement["openclaw_candidate_status"] = candidate_status
+            supplements.append(supplement)
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at_utc": datetime.now(UTC).isoformat(),
         "source_run_index": str(run_index_path),
         "extracted_root": str(extracted_root),
         "raw_archives_mutated": False,
         "provenance": provenance,
+        "openclaw_package": expected_candidate,
+        "openclaw_candidate_counts": candidate_counts,
         "runs": supplements,
     }
 

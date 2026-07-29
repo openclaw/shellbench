@@ -50,6 +50,7 @@ async def run_job(
         raise FileNotFoundError(f"Toolchain not found: {toolchain_root}")
     if not proxy_key:
         raise ValueError("SHELLBENCH_PROXY_KEY is required")
+    openclaw_package = _toolchain_openclaw_package(toolchain_root)
 
     job_dir = jobs_dir / run.run_label
     job_dir.mkdir(parents=True, exist_ok=False)
@@ -64,6 +65,7 @@ async def run_job(
         tasks_root=tasks_root,
         tasks=tasks,
         rerun_of_canonical_run=rerun_of_canonical_run,
+        openclaw_package=openclaw_package,
     )
     atomic_write_json(job_dir / "run_manifest.json", manifest)
     atomic_write_json(
@@ -243,12 +245,14 @@ def _run_manifest(
     tasks_root: Path,
     tasks: list[TaskSpec],
     rerun_of_canonical_run: str | None = None,
+    openclaw_package: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     parity_validation, parity_validated = _parity_metadata(run)
     return {
         "run_label": run.run_label,
         "harness": run.harness,
         "harness_version": run.harness_version,
+        "openclaw_package": openclaw_package if run.harness == "openclaw" else None,
         "model_slug": run.model_slug,
         "model_id": run.model_id,
         "provider_model_id": run.model_id,
@@ -336,6 +340,16 @@ def _run_manifest(
             "outcome_counts": {},
         },
     }
+
+
+def _toolchain_openclaw_package(toolchain_root: Path) -> dict[str, Any] | None:
+    manifest_path = toolchain_root / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    package = manifest.get("openclaw_package") if isinstance(manifest, dict) else None
+    return package if isinstance(package, dict) else None
 
 
 def _parity_metadata(run: RunSpec) -> tuple[dict[str, Any] | None, bool]:

@@ -5,7 +5,10 @@ import copy
 import fcntl
 import hashlib
 import json
+import os
+import shutil
 import shlex
+import stat
 import subprocess
 import sys
 import tarfile
@@ -58,6 +61,7 @@ CRABBOX_STOP_TIMEOUT_SECONDS = 6 * 60
 CRABBOX_READY_ATTEMPTS = 30
 CRABBOX_READY_BACKOFF_SECONDS = 10
 CRABBOX_INSPECT_ATTEMPTS = 4
+OPENCLAW_CANDIDATE_FILENAME = "openclaw-candidate.tgz"
 
 
 class CommandExecutor(Protocol):
@@ -205,6 +209,7 @@ class FleetConfig:
     runner_root: Path
     task_archive: Path
     env_file: Path
+    openclaw_package_tarball: Path | None = None
     max_leases: int = 10
     max_attempts: int = 2
     task_concurrency: int = 16
@@ -264,6 +269,21 @@ class RunIndexStore:
     def update_root(self, **changes: Any) -> None:
         with self._thread_lock:
             self.data.update(changes)
+            self.save()
+
+    def update_fleet_and_runs(
+        self,
+        *,
+        fleet: dict[str, Any],
+        run_changes: dict[str, Any] | None = None,
+    ) -> None:
+        with self._thread_lock:
+            self.data["fleet"] = fleet
+            if run_changes:
+                updated_at = utc_now()
+                for entry in self.data["runs"]:
+                    entry.update(run_changes)
+                    entry["updated_at_utc"] = updated_at
             self.save()
 
     def get(self, run_label: str) -> dict[str, Any]:
@@ -329,6 +349,8 @@ class FleetController:
         self.runner_commit = ""
         self.runner_archive_sha256 = ""
         self.task_archive_sha256 = ""
+        self.openclaw_package: dict[str, str] | None = None
+        self.openclaw_package_tarball: Path | None = None
         self.crabbox_cli_version = ""
         self._dispatch_lock = threading.Lock()
         self._cleanup_lock = threading.Lock()
@@ -387,8 +409,10 @@ class FleetController:
 
     def _validate_plan(self) -> None:
         suite_expected = int(self._store.data["expected_task_count"])
+        harnesses: set[str] = set()
         for entry in self._store.all_entries():
             run = self._run_spec(entry)
+            harnesses.add(run.harness)
             task_names = entry.get("task_names")
             phase = str(entry.get("phase") or "full")
             if task_names is None:
@@ -461,6 +485,10 @@ class FleetController:
                         f"{run.run_label} must set openclaw_tool_mode to "
                         f"one of {sorted(OPENCLAW_TOOL_MODES)}"
                     )
+        if self.config.openclaw_package_tarball and harnesses != {"openclaw"}:
+            raise FleetError(
+                "--openclaw-package-tarball requires an OpenClaw-only run index"
+            )
 
     def _prepare_inputs(self) -> None:
         for path, description in (
@@ -520,12 +548,78 @@ class FleetController:
                 raise FleetError(f"invalid archive: {archive}") from exc
         self.runner_archive_sha256 = _sha256(self.runner_archive)
         self.task_archive_sha256 = _sha256(self.config.task_archive)
+        self._prepare_openclaw_package()
         version = self._checked(
             [self.config.crabbox_bin, "--version"],
             capture_output=True,
             description="resolve Crabbox CLI version",
         )
         self.crabbox_cli_version = version.stdout.strip()
+
+    def _prepare_openclaw_package(self) -> None:
+        configured = self.config.openclaw_package_tarball
+        candidate = (
+            _inspect_openclaw_package_tarball(configured)
+            if configured is not None
+            else None
+        )
+        if candidate is not None:
+            mismatched_runs = [
+                str(entry["run_label"])
+                for entry in self._store.all_entries()
+                if entry.get("harness_version") != candidate["package_version"]
+            ]
+            if mismatched_runs:
+                raise FleetError(
+                    "OpenClaw candidate package version does not match planned "
+                    f"harness_version for: {', '.join(mismatched_runs)}"
+                )
+        fleet = self._store.data.get("fleet")
+        existing_fleet = fleet if isinstance(fleet, dict) else {}
+        existing = existing_fleet.get("openclaw_package")
+        run_identities = [
+            entry.get("openclaw_package") for entry in self._store.all_entries()
+        ]
+
+        if existing is not None:
+            if candidate is None:
+                raise FleetError(
+                    "existing campaign requires --openclaw-package-tarball"
+                )
+            if existing != candidate:
+                raise FleetError("OpenClaw candidate identity changed on resume")
+            if any(
+                identity is not None and identity != existing
+                for identity in run_identities
+            ):
+                raise FleetError(
+                    "existing campaign run mismatches OpenClaw candidate identity"
+                )
+        elif candidate is not None and existing_fleet:
+            raise FleetError(
+                "existing campaign is missing OpenClaw candidate identity"
+            )
+        elif any(identity is not None for identity in run_identities):
+            raise FleetError(
+                "run index has OpenClaw candidate identity without campaign identity"
+            )
+
+        self.openclaw_package = candidate
+        if candidate is None:
+            return
+
+        manifests = self.config.local_root / "manifests"
+        staged = manifests / OPENCLAW_CANDIDATE_FILENAME
+        source = configured.resolve()
+        if staged.exists() and _sha256(staged) != candidate["sha256"]:
+            raise FleetError(f"staged OpenClaw candidate has changed: {staged}")
+        if not staged.exists():
+            shutil.copyfile(source, staged)
+        staged.chmod(0o600)
+        if _sha256(staged) != candidate["sha256"]:
+            raise FleetError("staged OpenClaw candidate failed SHA-256 verification")
+        atomic_write_json(manifests / "openclaw_package.json", candidate)
+        self.openclaw_package_tarball = staged
 
     def _record_fleet_metadata(self) -> None:
         assert self.runner_archive is not None
@@ -556,7 +650,17 @@ class FleetController:
                 "controller_started_at_utc": utc_now(),
             }
         )
-        self._store.update_root(fleet=metadata)
+        if self.openclaw_package is not None:
+            metadata["openclaw_package"] = self.openclaw_package
+        run_changes = (
+            {"openclaw_package": self.openclaw_package}
+            if self.openclaw_package is not None
+            else None
+        )
+        self._store.update_fleet_and_runs(
+            fleet=metadata,
+            run_changes=run_changes,
+        )
 
     def _execute_entry(self, run_label: str) -> bool:
         entry = self._store.get(run_label)
@@ -848,10 +952,20 @@ curl -fsS --max-time 3 \
         remote_runner_archive = f"/tmp/{lease.slug}-runner.tar.gz"
         remote_task_archive = f"/tmp/{lease.slug}-tasks.tar.gz"
         remote_env = f"/tmp/{lease.slug}-provider.env"
+        remote_openclaw_package = (
+            f"{self.config.remote_root}/artifacts/{OPENCLAW_CANDIDATE_FILENAME}"
+            if self.openclaw_package_tarball is not None
+            else ""
+        )
         self._checked(
             self._ssh_command(
                 lease,
-                ["mkdir", "-p", self.config.remote_root],
+                [
+                    "mkdir",
+                    "-p",
+                    self.config.remote_root,
+                    f"{self.config.remote_root}/artifacts",
+                ],
             ),
             capture_output=True,
             description=f"prepare {lease.slug}",
@@ -859,7 +973,11 @@ curl -fsS --max-time 3 \
         for local_path, remote_path in (
             (self.runner_archive, remote_runner_archive),
             (self.config.task_archive, remote_task_archive),
-            (self.config.env_file, remote_env),
+            *(
+                ((self.openclaw_package_tarball, remote_openclaw_package),)
+                if self.openclaw_package_tarball is not None
+                else ()
+            ),
         ):
             self._checked(
                 self._scp_command(lease, local_path, remote_path),
@@ -872,24 +990,45 @@ set -euo pipefail
 root=$1
 runner_archive=$2
 task_archive=$3
-source_env=$4
-runner_commit=$5
-runner_sha256=$6
-task_sha256=$7
+runner_commit=$4
+runner_sha256=$5
+task_sha256=$6
+candidate_archive=$7
+candidate_sha256=$8
+candidate_version=$9
+shift 9
 printf '%s  %s\n' "$runner_sha256" "$runner_archive" | sha256sum -c -
 printf '%s  %s\n' "$task_sha256" "$task_archive" | sha256sum -c -
+if [ -n "$candidate_archive" ]; then
+  printf '%s  %s\n' "$candidate_sha256" "$candidate_archive" | sha256sum -c -
+fi
 rm -rf "$root/runner.new" "$root/public-tasks.new"
 mkdir -p "$root/runner.new" "$root/public-tasks.new" "$root/secrets"
 tar -xzf "$runner_archive" -C "$root/runner.new"
 tar -xzf "$task_archive" -C "$root/public-tasks.new"
-install -m 0600 "$source_env" "$root/secrets/provider.env"
 rm -rf "$root/runner" "$root/public-tasks"
 mv "$root/runner.new" "$root/runner"
 mv "$root/public-tasks.new" "$root/public-tasks"
 printf '%s\n' "$runner_commit" > "$root/runner.commit"
-rm -f "$runner_archive" "$task_archive" "$source_env"
-bash "$root/runner/scripts/native_eval/bootstrap_beast.sh"
+rm -f "$runner_archive" "$task_archive"
+if [ -n "$candidate_archive" ]; then
+  env \
+    OPENCLAW_PACKAGE_TARBALL="$candidate_archive" \
+    OPENCLAW_PACKAGE_SHA256="$candidate_sha256" \
+    OPENCLAW_PACKAGE_VERSION="$candidate_version" \
+    bash "$root/runner/scripts/native_eval/bootstrap_beast.sh"
+else
+  bash "$root/runner/scripts/native_eval/bootstrap_beast.sh"
+fi
 """
+        candidate_sha256 = (
+            self.openclaw_package["sha256"] if self.openclaw_package else ""
+        )
+        candidate_version = (
+            self.openclaw_package["package_version"]
+            if self.openclaw_package
+            else ""
+        )
         self._checked(
             self._ssh_command(
                 lease,
@@ -901,14 +1040,40 @@ bash "$root/runner/scripts/native_eval/bootstrap_beast.sh"
                     self.config.remote_root,
                     remote_runner_archive,
                     remote_task_archive,
-                    remote_env,
                     self.runner_commit,
                     self.runner_archive_sha256,
                     self.task_archive_sha256,
+                    remote_openclaw_package,
+                    candidate_sha256,
+                    candidate_version,
                 ],
             ),
             capture_output=False,
             description=f"bootstrap {lease.slug}",
+        )
+        self._checked(
+            self._scp_command(lease, self.config.env_file, remote_env),
+            capture_output=True,
+            description=f"sync provider environment to {lease.slug}",
+        )
+        self._checked(
+            self._ssh_command(
+                lease,
+                [
+                    "bash",
+                    "-c",
+                    """
+set -euo pipefail
+install -m 0600 "$1" "$2/secrets/provider.env"
+rm -f "$1"
+""",
+                    "fleet-provider-env",
+                    remote_env,
+                    self.config.remote_root,
+                ],
+            ),
+            capture_output=True,
+            description=f"install provider environment on {lease.slug}",
         )
         self._store.update(
             self._run_label_for_lease(lease.lease_id),
@@ -1475,6 +1640,8 @@ printf '%s\n' "$pid"
             "artifacts": [],
             "created_at_utc": utc_now(),
         }
+        if self.openclaw_package is not None:
+            rerun["openclaw_package"] = self.openclaw_package
         for metadata_field in (
             "task_names",
             "rerun_of_canonical_run",
@@ -1591,6 +1758,44 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _inspect_openclaw_package_tarball(path: Path) -> dict[str, str]:
+    try:
+        mode = path.stat().st_mode
+    except OSError as exc:
+        raise FleetError(f"OpenClaw package tarball is unavailable: {path}") from exc
+    if not stat.S_ISREG(mode) or not os.access(path, os.R_OK):
+        raise FleetError(
+            f"OpenClaw package tarball must be a readable regular file: {path}"
+        )
+    try:
+        with tarfile.open(path, "r:*") as handle:
+            member = handle.getmember("package/package.json")
+            if not member.isfile() or member.size > 1024 * 1024:
+                raise FleetError(
+                    "OpenClaw package tarball has an invalid package/package.json"
+                )
+            package_file = handle.extractfile(member)
+            if package_file is None:
+                raise FleetError(
+                    "OpenClaw package tarball is missing package/package.json"
+                )
+            package = json.loads(package_file.read())
+    except (KeyError, OSError, tarfile.TarError, json.JSONDecodeError) as exc:
+        raise FleetError(f"invalid OpenClaw npm package tarball: {path}") from exc
+    if not isinstance(package, dict) or package.get("name") != "openclaw":
+        raise FleetError("OpenClaw package tarball must have name=openclaw")
+    version = package.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise FleetError("OpenClaw package tarball must declare a package version")
+    return {
+        "source_kind": "npm_tarball",
+        "package_name": "openclaw",
+        "package_version": version,
+        "sha256": _sha256(path),
+        "artifact_filename": OPENCLAW_CANDIDATE_FILENAME,
+    }
+
+
 def _validate_model_values(values: dict[str, int], name: str) -> None:
     for model_slug, value in values.items():
         if not model_slug:
@@ -1646,6 +1851,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--runner-root", type=Path, required=True)
     parser.add_argument("--task-archive", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, required=True)
+    parser.add_argument("--openclaw-package-tarball", type=Path)
     parser.add_argument("--max-leases", type=int, default=10)
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--task-concurrency", type=int, default=16)
@@ -1720,6 +1926,7 @@ def main(argv: list[str] | None = None) -> int:
         runner_root=args.runner_root,
         task_archive=args.task_archive,
         env_file=args.env_file,
+        openclaw_package_tarball=args.openclaw_package_tarball,
         max_leases=args.max_leases,
         max_attempts=args.max_attempts,
         task_concurrency=args.task_concurrency,
