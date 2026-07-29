@@ -40,7 +40,30 @@ for start in range(len(text) - 1, -1, -1):
         and isinstance(value.get("payloads"), list)
         and isinstance(value.get("meta"), dict)
     ):
-        sys.exit(0)
+        meta = value["meta"]
+        liveness = str(meta.get("livenessState") or "").lower()
+        if meta.get("yielded") is True or liveness in {
+            "active",
+            "paused",
+            "running",
+            "waiting",
+        }:
+            continue
+        completion = meta.get("completion")
+        stop_reason = (
+            completion.get("stopReason")
+            if isinstance(completion, dict)
+            else meta.get("stopReason")
+        )
+        visible_payload = any(
+            isinstance(item, dict)
+            and isinstance(item.get("text"), str)
+            and item["text"].strip()
+            and item.get("isReasoning") is not True
+            for item in value["payloads"]
+        )
+        if visible_payload or stop_reason or meta.get("aborted") is True:
+            sys.exit(0)
 sys.exit(1)
 """
 
@@ -102,6 +125,8 @@ def _openclaw(
             "defaults": {
                 "workspace": ".",
                 "skipBootstrap": True,
+                "model": {"primary": model},
+                "subagents": {"model": model},
             }
         },
         "gateway": {"mode": "local"},
@@ -130,9 +155,11 @@ def _openclaw(
     setup = (
         f"export PATH={_base_path()}; export HOME={home}; "
         "rm -rf \"$HOME\"; mkdir -p \"$HOME/.openclaw\"; "
+        f"printf %s {config_json} > \"$HOME/.openclaw/openclaw.json\"; "
         "openclaw setup --baseline --skip-bootstrap --workspace . "
         ">/logs/agent/setup.log 2>&1; "
-        "rm -f BOOTSTRAP.md; "
+        "rm -f AGENTS.md BOOTSTRAP.md HEARTBEAT.md IDENTITY.md "
+        "SOUL.md TOOLS.md USER.md; "
         f"printf %s {config_json} > \"$HOME/.openclaw/openclaw.json\""
     )
     run_command = (
@@ -143,16 +170,9 @@ def _openclaw(
         "--message \"$(cat /tmp/shellbench-instruction.md)\" "
         ">\"$log\" 2>&1 </dev/null & pid=$!; "
         "while kill -0 \"$pid\" 2>/dev/null; do "
-        "if grep -Eq \"\\[agents/agent-command\\] \\[agent\\] run .* "
-        f"ended with stopReason=\" \"$log\" || python3 -c {completion_probe} "
-        "\"$log\"; then "
-        "sleep 2; kill \"$pid\" 2>/dev/null || true; sleep 1; "
+        f"if python3 -c {completion_probe} \"$log\"; then "
+        "sleep 1; kill \"$pid\" 2>/dev/null || true; sleep 1; "
         "kill -KILL \"$pid\" 2>/dev/null || true; "
-        "for f in /proc/[0-9]*/comm; do "
-        "name=$(cat \"$f\" 2>/dev/null || true); "
-        "case \"$name\" in openclaw-agent|\"npm exec chrome\"|chrome-devtools) "
-        "child=${f#/proc/}; child=${child%/comm}; "
-        "kill -KILL \"$child\" 2>/dev/null || true;; esac; done; "
         "wait \"$pid\" 2>/dev/null || true; cat \"$log\"; exit 0; "
         "fi; sleep 1; done; "
         "wait \"$pid\"; status=$?; cat \"$log\"; exit \"$status\""
@@ -245,7 +265,11 @@ def _hermes(
         "memory": {"memory_enabled": False, "user_profile_enabled": False},
         "compression": {"enabled": True, "threshold": 0.85},
         "terminal": {"backend": "local", "timeout": 180},
-        "delegation": {"max_iterations": 50},
+        "delegation": {
+            "max_iterations": 50,
+            "provider": provider_name,
+            "model": run.model_id,
+        },
         "checkpoints": {"enabled": False},
     }
     if mcp_servers:
@@ -277,15 +301,8 @@ def _hermes(
     )
     cleanup = (
         f"export PATH={_base_path()}; export HERMES_HOME={home}; "
-        "session_id=$(sed -n 's/^session_id: //p' "
-        "/logs/agent/hermes.txt | tail -1); "
-        "if [ -n \"$session_id\" ]; then "
         "hermes sessions export /logs/agent/hermes-session.jsonl "
-        "--session-id \"$session_id\" --yes --redact; "
-        "else "
-        "hermes sessions export /logs/agent/hermes-session.jsonl "
-        "--yes --redact; "
-        "fi"
+        "--yes --redact"
     )
     return HarnessCommand(
         setup_command=setup,
