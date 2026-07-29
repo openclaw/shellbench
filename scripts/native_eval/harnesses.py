@@ -532,6 +532,7 @@ def _openclaw(
 ) -> HarnessCommand:
     provider = "openai"
     model = f"{provider}/{run.model_id}"
+    thinking = run.reasoning_effort or "off"
     home = "/tmp/shellbench-openclaw"
     audit_plugin_root = f"{home}/.openclaw/shellbench-audit"
     gateway_token = secrets.token_urlsafe(32)
@@ -616,7 +617,8 @@ def _openclaw(
         'kill "$gateway_pid" 2>/dev/null || true; '
         'wait "$gateway_pid" 2>/dev/null || true; '
         'cat "$gateway_log" >&2; exit 70; fi; '
-        "openclaw agent --json --agent main --thinking off "
+        "openclaw agent --json --agent main "
+        f"--thinking {shlex.quote(thinking)} "
         f"--model {shlex.quote(model)} "
         '--message "$(cat /tmp/shellbench-instruction.md)" '
         '>"$log" 2>&1 </dev/null & pid=$!; '
@@ -725,6 +727,9 @@ def _hermes(
 ) -> HarnessCommand:
     home = "/tmp/shellbench-hermes"
     provider_name = "custom:shellbench"
+    agent_config: dict[str, object] = {"max_turns": 90}
+    if run.reasoning_effort:
+        agent_config["reasoning_effort"] = run.reasoning_effort
     config: dict[str, object] = {
         "model": {
             "default": run.model_id,
@@ -741,7 +746,7 @@ def _hermes(
             }
         },
         "toolsets": ["hermes-cli"],
-        "agent": {"max_turns": 90},
+        "agent": agent_config,
         "memory": {"memory_enabled": False, "user_profile_enabled": False},
         "compression": {"enabled": True, "threshold": 0.85},
         "terminal": {"backend": "local", "timeout": 180},
@@ -817,11 +822,17 @@ def _codex(
         f'printf %s {auth_json} > "$CODEX_HOME/auth.json"; '
         f'printf %s {config_text} > "$CODEX_HOME/config.toml"'
     )
+    reasoning_override = (
+        f"-c {shlex.quote(f'model_reasoning_effort={json.dumps(run.reasoning_effort)}')} "
+        if run.reasoning_effort
+        else ""
+    )
     run_command = (
         f"export PATH={_base_path()}; export CODEX_HOME={home}; "
         "codex exec --dangerously-bypass-approvals-and-sandbox "
         "--skip-git-repo-check "
         f"--model {shlex.quote(run.model_id)} "
+        f"{reasoning_override}"
         "--json --enable unified_exec -- "
         '"$(cat /tmp/shellbench-instruction.md)" '
         ">/logs/agent/codex.txt 2>/logs/agent/codex-stderr.txt "
@@ -871,11 +882,13 @@ def _claude_code(
         'mkdir -p "$CLAUDE_CONFIG_DIR/debug" "$CLAUDE_CONFIG_DIR/projects/-app"; '
         f'printf %s {mcp_json} > "$CLAUDE_CONFIG_DIR/.claude.json"'
     )
+    effort_option = f"--effort {shlex.quote(run.reasoning_effort)} " if run.reasoning_effort else ""
     run_command = (
         f"export PATH={_base_path()}; export CLAUDE_CONFIG_DIR={home}; "
         "claude --verbose --output-format=stream-json "
         "--permission-mode=bypassPermissions --print "
         f"--model {shlex.quote(run.model_id)} "
+        f"{effort_option}"
         '"$(cat /tmp/shellbench-instruction.md)" '
         ">/logs/agent/claude-code.txt 2>&1 </dev/null; status=$?; "
         'cat /logs/agent/claude-code.txt; exit "$status"'

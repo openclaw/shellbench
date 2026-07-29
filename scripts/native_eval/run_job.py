@@ -270,7 +270,7 @@ def _run_manifest(
             "SHELLBENCH_HARBOR_REFERENCE_COMMIT"
         ),
         "judge_model_id": os.environ.get("SHELLBENCH_JUDGE_MODEL_ID"),
-        "reasoning_effort": os.environ.get("SHELLBENCH_REASONING_EFFORT"),
+        "reasoning_effort": run.reasoning_effort or os.environ.get("SHELLBENCH_REASONING_EFFORT"),
         "judge_reasoning_effort": os.environ.get(
             "SHELLBENCH_JUDGE_REASONING_EFFORT"
         ),
@@ -358,6 +358,9 @@ def _runner_patch_hash() -> str:
 def build_run_spec(args: argparse.Namespace) -> RunSpec:
     harness = harness_by_name(args.harness)
     model = model_by_slug(args.model_slug)
+    reasoning_effort = getattr(args, "reasoning_effort", None) or os.environ.get(
+        "SHELLBENCH_REASONING_EFFORT"
+    )
     return RunSpec(
         run_label=args.run_label,
         harness=harness.name,
@@ -369,6 +372,7 @@ def build_run_spec(args: argparse.Namespace) -> RunSpec:
         repetition=args.repetition,
         expected_task_count=args.expected_task_count,
         run_date=args.run_date,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -395,6 +399,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--public-tasks-commit", required=True)
     parser.add_argument("--task-suite-path", required=True)
     parser.add_argument("--run-date", required=True)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "high", "xhigh"),
+    )
     parser.add_argument(
         "--toolchain-root",
         type=Path,
