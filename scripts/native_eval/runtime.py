@@ -14,6 +14,7 @@ from typing import Any
 
 from scripts.native_eval.harness_trajectories import (
     load_openclaw_envelope,
+    write_claude_code_trajectory,
     write_hermes_trajectory,
     write_openclaw_trajectory,
 )
@@ -1040,6 +1041,8 @@ def write_agent_trajectory(
         return write_openclaw_trajectory(task.instruction, run, agent_dir)
     if run.harness == "hermes":
         return write_hermes_trajectory(task.instruction, run, agent_dir)
+    if run.harness == "claude-code":
+        return write_claude_code_trajectory(task.instruction, run, agent_dir)
     if run.harness != "codex":
         return {
             "trajectory_status": "unsupported",

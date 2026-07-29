@@ -57,13 +57,31 @@ def write_openclaw_trajectory(
     }
     session_models = _openclaw_session_models(session_path)
     log_models = _openclaw_log_models(log_path)
-    observed_models = session_models or envelope_models
-    if not observed_models and run.model_id in log_models:
-        observed_models = {run.model_id}
+    child_models = _openclaw_spawn_models(session_path)
+    parent_models = {
+        _normalize_observed_model(value, run)
+        for value in session_models | envelope_models
+    }
+    normalized_log_models = {
+        _normalize_observed_model(value, run) for value in log_models
+    }
+    normalized_child_models = {
+        _normalize_observed_model(value, run) for value in child_models
+    }
+    observed_models = parent_models | normalized_log_models | normalized_child_models
     runtime_model_name = (
-        next(iter(observed_models)) if len(observed_models) == 1 else None
+        next(iter(parent_models))
+        if len(parent_models) == 1
+        else run.model_id
+        if run.model_id in parent_models
+        else None
     )
-    canonical_model_identity = observed_models == {run.model_id}
+    canonical_model_identity = bool(observed_models) and observed_models == {
+        run.model_id
+    }
+    terminal_event_seen = _openclaw_session_terminal(session_path)
+    if not terminal_event_seen and envelope is not None:
+        terminal_event_seen = _openclaw_envelope_terminal(envelope)
 
     steps = _openclaw_session_steps(
         session_path,
@@ -87,12 +105,18 @@ def write_openclaw_trajectory(
         )
         trace_fidelity = "envelope"
         source_path = log_path
-    if len(steps) < 2:
+    if len(steps) < 2 or not terminal_event_seen:
         return _unavailable(
             source_path,
             runtime_model_name=runtime_model_name,
             canonical_model_identity=canonical_model_identity,
             observed_models=observed_models,
+            extra_validation={
+                "terminal_event_seen": terminal_event_seen,
+                "parent_models": sorted(parent_models),
+                "child_models": sorted(normalized_child_models),
+                "log_models": sorted(normalized_log_models),
+            },
         )
 
     usage = agent_meta.get("usage")
@@ -128,9 +152,12 @@ def write_openclaw_trajectory(
             "native_raw_trace_file": source_path.name,
             "trace_fidelity": trace_fidelity,
             "observed_models": sorted(observed_models),
-            "log_models": sorted(log_models),
+            "parent_models": sorted(parent_models),
+            "child_models": sorted(normalized_child_models),
+            "log_models": sorted(normalized_log_models),
             "stop_reason": _nested_string(meta, "completion", "stopReason"),
             "aborted": meta.get("aborted"),
+            "terminal_event_seen": terminal_event_seen,
         },
     }
     _atomic_write_json(agent_dir / "trajectory.json", trajectory)
@@ -143,8 +170,11 @@ def write_openclaw_trajectory(
         "trajectory_validation": {
             "trace_fidelity": trace_fidelity,
             "observed_models": sorted(observed_models),
-            "log_models": sorted(log_models),
+            "parent_models": sorted(parent_models),
+            "child_models": sorted(normalized_child_models),
+            "log_models": sorted(normalized_log_models),
             "session_id": session_id,
+            "terminal_event_seen": terminal_event_seen,
         },
     }
 
@@ -166,27 +196,36 @@ def write_hermes_trajectory(
         ),
         sessions[-1],
     )
-    observed_models = {
-        value
+    parent_models = {
+        _normalize_observed_model(value, run)
         for value in [session.get("model"), *_hermes_message_models(session)]
         if isinstance(value, str) and value
     }
+    observed_models = {
+        _normalize_observed_model(value, run)
+        for item in sessions
+        for value in [item.get("model"), *_hermes_message_models(item)]
+        if isinstance(value, str) and value
+    }
     runtime_model_name = (
-        next(iter(observed_models)) if len(observed_models) == 1 else None
+        next(iter(parent_models)) if len(parent_models) == 1 else None
     )
-    canonical_model_identity = observed_models == {run.model_id}
+    canonical_model_identity = bool(observed_models) and observed_models == {
+        run.model_id
+    }
     validation = _validate_hermes_session(session, instruction)
     steps = _hermes_steps(
         session,
         instruction,
         model_name=f"{run.provider}/{run.model_id}",
     )
-    if len(steps) < 2:
+    if len(steps) < 2 or validation["terminal_event_seen"] is not True:
         return _unavailable(
             source_path,
             runtime_model_name=runtime_model_name,
             canonical_model_identity=canonical_model_identity,
             observed_models=observed_models,
+            extra_validation=validation,
         )
 
     session_id = str(session.get("id") or session.get("session_id") or uuid.uuid4())
@@ -233,6 +272,174 @@ def write_hermes_trajectory(
             "session_id": session_id,
             **validation,
         },
+    }
+
+
+def write_claude_code_trajectory(
+    instruction: str,
+    run: RunSpec,
+    agent_dir: Path,
+) -> dict[str, Any]:
+    source_path = agent_dir / "claude-code.txt"
+    events = _load_json_lines(source_path)
+    observed_models: set[str] = set()
+    assistant_models: set[str] = set()
+    terminal_event_seen = False
+    session_id = str(uuid.uuid4())
+    steps: list[dict[str, Any]] = [
+        {"step_id": 1, "source": "user", "message": instruction}
+    ]
+    pending_calls: dict[str, dict[str, Any]] = {}
+    result_event: dict[str, Any] | None = None
+
+    for event in events:
+        event_type = str(event.get("type") or "")
+        if event_type == "system":
+            if event.get("session_id"):
+                session_id = str(event["session_id"])
+            _add_model(observed_models, event.get("model"), run)
+            continue
+        if event_type == "assistant":
+            message = event.get("message")
+            if not isinstance(message, dict):
+                continue
+            _add_model(observed_models, message.get("model"), run)
+            _add_model(assistant_models, message.get("model"), run)
+            text, reasoning, calls = _claude_content(message.get("content"))
+            if not (text or reasoning or calls):
+                continue
+            step = _without_none(
+                {
+                    "step_id": len(steps) + 1,
+                    "source": "agent",
+                    "message": text or "[tool call]",
+                    "model_name": f"{run.provider}/{run.model_id}",
+                    "reasoning_content": reasoning or None,
+                    "tool_calls": calls or None,
+                    "llm_call_count": 1,
+                }
+            )
+            steps.append(step)
+            for call in calls:
+                pending_calls[call["tool_call_id"]] = step
+            continue
+        if event_type == "user":
+            message = event.get("message")
+            if not isinstance(message, dict):
+                continue
+            for result in _claude_tool_results(message.get("content")):
+                step = pending_calls.get(str(result.get("source_call_id") or ""))
+                if step is None:
+                    continue
+                observation = step.setdefault("observation", {"results": []})
+                observation["results"].append(result)
+            continue
+        if event_type == "result":
+            result_event = event
+            if event.get("session_id"):
+                session_id = str(event["session_id"])
+            model_usage = event.get("modelUsage")
+            if isinstance(model_usage, dict):
+                for model_name, details in model_usage.items():
+                    _add_model(observed_models, model_name, run)
+                    if isinstance(details, dict):
+                        _add_model(
+                            observed_models,
+                            details.get("canonicalModel"),
+                            run,
+                        )
+            terminal_event_seen = (
+                event.get("is_error") is not True
+                and str(event.get("subtype") or "").lower() == "success"
+                and str(event.get("terminal_reason") or "completed").lower()
+                == "completed"
+            )
+            result_text = event.get("result")
+            if (
+                isinstance(result_text, str)
+                and result_text.strip()
+                and not any(
+                    step.get("source") == "agent"
+                    and step.get("message") == result_text.strip()
+                    for step in steps
+                )
+            ):
+                steps.append(
+                    {
+                        "step_id": len(steps) + 1,
+                        "source": "agent",
+                        "message": result_text.strip(),
+                        "model_name": f"{run.provider}/{run.model_id}",
+                        "llm_call_count": 1,
+                    }
+                )
+
+    runtime_model_name = (
+        next(iter(assistant_models))
+        if len(assistant_models) == 1
+        else run.model_id
+        if run.model_id in assistant_models
+        else None
+    )
+    canonical_model_identity = bool(observed_models) and observed_models == {
+        run.model_id
+    }
+    validation = {
+        "terminal_event_seen": terminal_event_seen,
+        "observed_models": sorted(observed_models),
+        "assistant_models": sorted(assistant_models),
+    }
+    if len(steps) < 2 or not terminal_event_seen or runtime_model_name is None:
+        return _unavailable(
+            source_path,
+            runtime_model_name=runtime_model_name,
+            canonical_model_identity=canonical_model_identity,
+            observed_models=observed_models,
+            extra_validation=validation,
+        )
+
+    usage = result_event.get("usage") if isinstance(result_event, dict) else {}
+    if not isinstance(usage, dict):
+        usage = {}
+    final_metrics = _without_none(
+        {
+            "total_prompt_tokens": _int(usage.get("input_tokens")) or None,
+            "total_completion_tokens": _int(usage.get("output_tokens")) or None,
+            "total_cached_tokens": _int(usage.get("cache_read_input_tokens"))
+            or None,
+            "total_cost_usd": (
+                result_event.get("total_cost_usd")
+                if isinstance(result_event, dict)
+                and isinstance(result_event.get("total_cost_usd"), (int, float))
+                else None
+            ),
+            "total_steps": len(steps),
+        }
+    )
+    trajectory = {
+        "schema_version": "ATIF-v1.7",
+        "session_id": session_id,
+        "agent": {
+            "name": run.harness,
+            "version": run.harness_version,
+            "model_name": f"{run.provider}/{runtime_model_name}",
+        },
+        "steps": steps,
+        "final_metrics": final_metrics,
+        "extra": {
+            "native_raw_trace_file": source_path.name,
+            "native_raw_event_count": len(events),
+            **validation,
+        },
+    }
+    _atomic_write_json(agent_dir / "trajectory.json", trajectory)
+    return {
+        "trajectory_status": "real",
+        "trajectory_source": str(source_path),
+        "trajectory_event_count": len(events),
+        "runtime_model_name": runtime_model_name,
+        "canonical_model_identity": canonical_model_identity,
+        "trajectory_validation": validation,
     }
 
 
@@ -440,6 +647,15 @@ def _openclaw_session_models(path: Path) -> set[str]:
     return models
 
 
+def _openclaw_spawn_models(path: Path) -> set[str]:
+    models: set[str] = set()
+    for record in _openclaw_session_records(path):
+        for value in _nested_strings(record):
+            for match in re.finditer(r'"resolvedModel"\s*:\s*"([^"]+)"', value):
+                models.add(match.group(1))
+    return models
+
+
 def _openclaw_log_models(path: Path) -> set[str]:
     if not path.is_file():
         return set()
@@ -449,6 +665,47 @@ def _openclaw_log_models(path: Path) -> set[str]:
             path.read_text(encoding="utf-8", errors="replace"),
         )
     )
+
+
+def _openclaw_session_terminal(path: Path) -> bool:
+    for record in reversed(_openclaw_session_records(path)):
+        message = record.get("message")
+        if (
+            record.get("type") != "message"
+            or not isinstance(message, dict)
+            or message.get("role") != "assistant"
+        ):
+            continue
+        text, tools = _openclaw_assistant_content(message.get("content"))
+        stop_reason = str(message.get("stopReason") or "").lower()
+        return bool(text.strip()) and not tools and stop_reason in {
+            "end_turn",
+            "stop",
+        }
+    return False
+
+
+def _openclaw_envelope_terminal(envelope: dict[str, Any]) -> bool:
+    meta = envelope.get("meta")
+    if not isinstance(meta, dict):
+        return False
+    liveness = str(meta.get("livenessState") or "").lower()
+    if meta.get("yielded") is True or liveness in {
+        "active",
+        "paused",
+        "running",
+        "waiting",
+    }:
+        return False
+    payloads = envelope.get("payloads")
+    visible = any(
+        isinstance(item, dict)
+        and isinstance(item.get("text"), str)
+        and item["text"].strip()
+        and item.get("isReasoning") is not True
+        for item in payloads
+    ) if isinstance(payloads, list) else False
+    return visible or meta.get("aborted") is True
 
 
 def _openclaw_session_id(path: Path) -> str | None:
@@ -703,6 +960,98 @@ def _content_text(content: Any) -> str:
     )
 
 
+def _load_json_lines(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    events: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            events.append(value)
+    return events
+
+
+def _claude_content(
+    content: Any,
+) -> tuple[str, str, list[dict[str, Any]]]:
+    if not isinstance(content, list):
+        return "", "", []
+    text: list[str] = []
+    reasoning: list[str] = []
+    calls: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = str(part.get("type") or "")
+        if part_type == "text" and isinstance(part.get("text"), str):
+            text.append(part["text"])
+        elif part_type == "thinking" and isinstance(part.get("thinking"), str):
+            reasoning.append(part["thinking"])
+        elif part_type == "tool_use" and isinstance(part.get("name"), str):
+            calls.append(
+                {
+                    "tool_call_id": str(part.get("id") or uuid.uuid4().hex[:8]),
+                    "function_name": part["name"],
+                    "arguments": _arguments(part.get("input")),
+                }
+            )
+    return "\n".join(text), "\n".join(reasoning), calls
+
+
+def _claude_tool_results(content: Any) -> list[dict[str, Any]]:
+    if not isinstance(content, list):
+        return []
+    results: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "tool_result":
+            continue
+        results.append(
+            _without_none(
+                {
+                    "source_call_id": str(part.get("tool_use_id") or ""),
+                    "content": _content_text(part.get("content")) or None,
+                    "is_error": part.get("is_error"),
+                }
+            )
+        )
+    return results
+
+
+def _add_model(models: set[str], value: Any, run: RunSpec) -> None:
+    if isinstance(value, str) and value:
+        models.add(_normalize_observed_model(value, run))
+
+
+def _normalize_observed_model(value: str, run: RunSpec) -> str:
+    if value == run.proxy_model_name:
+        return run.model_id
+    for prefix in ("anthropic/", "openai/"):
+        if value.startswith(prefix):
+            return value[len(prefix):]
+    return value
+
+
+def _nested_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [
+            item
+            for child in value
+            for item in _nested_strings(child)
+        ]
+    if isinstance(value, dict):
+        return [
+            item
+            for child in value.values()
+            for item in _nested_strings(child)
+        ]
+    return []
+
+
 def _arguments(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -721,16 +1070,20 @@ def _unavailable(
     runtime_model_name: str | None = None,
     canonical_model_identity: bool = False,
     observed_models: set[str] | None = None,
+    extra_validation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    validation = {
+        "observed_models": sorted(observed_models or set()),
+    }
+    if extra_validation:
+        validation.update(extra_validation)
     return {
         "trajectory_status": "unavailable",
         "trajectory_source": str(source_path),
         "trajectory_event_count": 0,
         "runtime_model_name": runtime_model_name,
         "canonical_model_identity": canonical_model_identity,
-        "trajectory_validation": {
-            "observed_models": sorted(observed_models or set()),
-        },
+        "trajectory_validation": validation,
     }
 
 
