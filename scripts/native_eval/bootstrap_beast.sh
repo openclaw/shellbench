@@ -145,7 +145,15 @@ install_hermes() {
 
 install_litellm() {
   local venv="$TOOLCHAIN_ROOT/litellm-venv"
-  "$TOOLCHAIN_ROOT/bin/uv" venv --clear --python 3.12 "$venv"
+  local python_root="$TOOLCHAIN_ROOT/uv-python"
+  local python_bin
+  UV_PYTHON_INSTALL_DIR="$python_root" \
+    "$TOOLCHAIN_ROOT/bin/uv" python install 3.12
+  python_bin="$(
+    UV_PYTHON_INSTALL_DIR="$python_root" \
+      "$TOOLCHAIN_ROOT/bin/uv" python find --managed-python 3.12
+  )"
+  "$TOOLCHAIN_ROOT/bin/uv" venv --clear --python "$python_bin" "$venv"
   "$TOOLCHAIN_ROOT/bin/uv" pip install \
     --python "$venv/bin/python" \
     "litellm[proxy]==$LITELLM_VERSION"

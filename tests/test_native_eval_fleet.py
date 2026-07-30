@@ -665,6 +665,17 @@ def test_bootstrap_retries_external_installer_downloads() -> None:
     assert script.count("--retry 5 --retry-delay 2 --retry-all-errors --retry-max-time 60") == 2
 
 
+def test_bootstrap_uses_managed_python_for_litellm() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts/native_eval/bootstrap_beast.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'local python_root="$TOOLCHAIN_ROOT/uv-python"' in script
+    assert '"$TOOLCHAIN_ROOT/bin/uv" python install 3.12' in script
+    assert '"$TOOLCHAIN_ROOT/bin/uv" python find --managed-python 3.12' in script
+    assert '"$TOOLCHAIN_ROOT/bin/uv" venv --clear --python "$python_bin" "$venv"' in script
+
+
 def test_candidate_package_rejects_wrong_npm_identity_before_leasing(
     tmp_path: Path,
 ) -> None:
