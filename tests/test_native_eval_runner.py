@@ -16,8 +16,8 @@ from scripts.native_eval.checkpoint_loop import (
     next_checkpoint_sequence,
 )
 from scripts.native_eval.harnesses import (
-    _OPENCLAW_COMPLETION_PROBE,
-    _OPENCLAW_SESSION_PROBE,
+    _OPENCLAW_CHILD_EXPORTS_READY,
+    _OPENCLAW_EXPORT_READY,
     build_harness_command,
 )
 from scripts.native_eval.harness_trajectories import (
@@ -52,13 +52,18 @@ from scripts.native_eval.tasks import TaskSpec, validate_suite
 
 
 def test_matrix_plan_contains_only_requested_models_and_harnesses() -> None:
-    plan = build_matrix_plan(116, run_date="20260727")
+    plan = build_matrix_plan(
+        116,
+        run_date="20260727",
+        reasoning_effort="high",
+    )
 
     assert len(plan) == 96
     assert len({run.run_label for run in plan}) == 96
     assert {run.harness for run in plan} == {harness.name for harness in HARNESSES}
     assert {run.model_slug for run in plan} == {model.slug for model in MODELS}
     assert {run.repetition for run in plan} == {1, 2, 3}
+    assert {run.reasoning_effort for run in plan} == {"high"}
 
 
 def test_run_index_records_agent_and_judge_reasoning(
@@ -615,6 +620,47 @@ def test_run_spec_preserves_explicit_planned_identity() -> None:
     assert run.proxy_model_name == "planned-proxy-name"
 
 
+def test_run_spec_preserves_planned_reasoning_effort(monkeypatch) -> None:
+    monkeypatch.setenv("SHELLBENCH_REASONING_EFFORT", "high")
+
+    run = build_run_spec(
+        Namespace(
+            run_label="openclaw-reasoning-high",
+            harness="openclaw",
+            harness_version="planned-version",
+            model_slug="gpt55",
+            model_id="gpt-5.5",
+            model_provider="openai",
+            proxy_model_name="gpt-5.5",
+            repetition=1,
+            expected_task_count=3,
+            run_date="20260730",
+        )
+    )
+
+    assert run.reasoning_effort == "high"
+
+
+def test_run_spec_rejects_invalid_reasoning_effort(monkeypatch) -> None:
+    monkeypatch.setenv("SHELLBENCH_REASONING_EFFORT", "extreme")
+
+    with pytest.raises(ValueError, match="reasoning_effort must be"):
+        build_run_spec(
+            Namespace(
+                run_label="openclaw-reasoning-invalid",
+                harness="openclaw",
+                harness_version="planned-version",
+                model_slug="gpt55",
+                model_id="gpt-5.5",
+                model_provider="openai",
+                proxy_model_name="gpt-5.5",
+                repetition=1,
+                expected_task_count=3,
+                run_date="20260730",
+            )
+        )
+
+
 def test_run_spec_normalizes_empty_openclaw_tool_mode(
     monkeypatch,
 ) -> None:
@@ -741,6 +787,7 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
             repetition=1,
             expected_task_count=116,
             run_date="20260727",
+            reasoning_effort="high",
         )
         command = build_harness_command(
             run,
@@ -756,36 +803,49 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
         assert "OPENROUTER_API_KEY" not in command.env
         assert 'exit "$status"' in command.run_command
         if harness.name == "openclaw":
-            assert "ended with stopReason=" not in command.run_command
             assert "python3 -c" in command.run_command
-            assert "--thinking off" in command.run_command
+            assert "--thinking high" in command.run_command
             assert "openclaw gateway --port 18789" in command.run_command
             assert "127.0.0.1:18789/readyz" in command.run_command
             assert "openclaw agent --local" not in command.run_command
+            assert "kill -KILL" not in command.run_command
+            assert "openclaw sessions export-trajectory" in command.run_command
+            assert '--session-key "agent:main:main"' in command.run_command
             assert "OPENCLAW_GATEWAY_TOKEN" in command.env
             assert len(command.env["OPENCLAW_GATEWAY_TOKEN"]) >= 32
-            assert "seq 1 60" in command.run_command
+            assert "seq 1 10" in command.run_command
             assert "status=71" in command.run_command
-            assert "setup --baseline --skip-bootstrap" in command.setup_command
+            assert command.setup_command.startswith("set -eu;")
+            assert "setup --baseline --workspace ." in command.setup_command
+            assert "--skip-bootstrap" not in command.setup_command
             assert "rm -f AGENTS.md BOOTSTRAP.md HEARTBEAT.md" in (command.setup_command)
             assert '"skipBootstrap":true' in command.setup_command
             assert '"primary":"openai/claude-opus-5"' in command.setup_command
-            assert '"subagents":{"model":"openai/claude-opus-5"}' in (command.setup_command)
+            assert '"thinkingDefault":"high"' in command.setup_command
+            assert (
+                '"subagents":{"model":"openai/claude-opus-5","thinking":"high"}'
+                in command.setup_command
+            )
             assert '"agentRuntime":{"id":"openclaw"}' in command.setup_command
             assert '"shellbench-audit":{"enabled":true}' in command.setup_command
             assert "openclaw.plugin.json" in command.setup_command
             assert '"configSchema":{"type":"object"' in command.setup_command
             assert 'api.on("subagent_spawned"' in command.setup_command
+            assert 'api.on("subagent_progress"' in command.setup_command
             assert 'api.on("subagent_ended"' in command.setup_command
-            assert 'api.on("session_end"' in command.setup_command
-            assert "zstdDecompressSync" in command.setup_command
-            assert "catch {" in command.setup_command
+            assert "event.phase !==" in command.setup_command
+            assert "execFile(" in command.setup_command
+            assert '"export-trajectory"' in command.setup_command
+            assert "exportsByRun" in command.setup_command
+            assert "zstdDecompressSync" not in command.setup_command
+            assert "shellbench-openclaw-child-exports.txt" in command.run_command
+            assert 'kill -0 "$gateway_pid"' in command.run_command
+            assert "child_wait" in command.run_command
+            assert "did not settle within 300s" in command.run_command
             assert "item.chmod(0o755 if item.is_dir() else 0o644)" in (command.cleanup_command)
-            assert "for agent in agents.iterdir()" in command.cleanup_command
             assert "archive/'audit'" in command.cleanup_command
-            assert "sources.append(str(sessions" in command.cleanup_command
-            assert "max(candidates" not in command.cleanup_command
-            assert "destination.chmod(0o644)" in command.cleanup_command
+            assert "archive/'exports'" in command.cleanup_command
+            assert "sessions.json" not in command.cleanup_command
         if harness.name == "hermes":
             assert '"delegation":{"max_iterations":50' in command.setup_command
             assert '"provider":"custom:shellbench"' in command.setup_command
@@ -872,325 +932,106 @@ def test_openclaw_harness_configures_tool_directory_mode() -> None:
     assert '"toolSearch":{"enabled":true,"mode":"directory"}' in command.setup_command
 
 
-def test_openclaw_completion_probe_accepts_markerless_final_envelope(
+def test_openclaw_child_exports_wait_for_every_spawned_session(
     tmp_path: Path,
 ) -> None:
-    log_path = tmp_path / "openclaw.txt"
-    log_path.write_text(
-        "debug preamble\n"
-        + json.dumps(
-            {
-                "payloads": [{"text": "done"}],
-                "meta": {"aborted": False},
-            }
-        ),
-        encoding="utf-8",
-    )
+    audit = tmp_path / "sessions.jsonl"
+    child = "agent:main:subagent:child"
+    nested = "agent:main:subagent:nested"
 
-    completed = subprocess.run(
-        [sys.executable, "-c", _OPENCLAW_COMPLETION_PROBE, str(log_path)],
-        check=False,
-    )
-
-    assert completed.returncode == 0
-
-
-def test_openclaw_completion_probe_rejects_partial_log(tmp_path: Path) -> None:
-    log_path = tmp_path / "openclaw.txt"
-    log_path.write_text(
-        'debug preamble\n{"payloads":[{"text":"still writing"}]',
-        encoding="utf-8",
-    )
-
-    completed = subprocess.run(
-        [sys.executable, "-c", _OPENCLAW_COMPLETION_PROBE, str(log_path)],
-        check=False,
-    )
-
-    assert completed.returncode == 1
-
-
-def test_openclaw_completion_probe_rejects_paused_yielded_envelope(
-    tmp_path: Path,
-) -> None:
-    log_path = tmp_path / "openclaw.txt"
-    log_path.write_text(
-        json.dumps(
-            {
-                "payloads": [{"text": "waiting for child"}],
-                "meta": {
-                    "aborted": False,
-                    "livenessState": "paused",
-                    "yielded": True,
-                    "stopReason": "end_turn",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    completed = subprocess.run(
-        [sys.executable, "-c", _OPENCLAW_COMPLETION_PROBE, str(log_path)],
-        check=False,
-    )
-
-    assert completed.returncode == 1
-
-
-def test_openclaw_session_probe_requires_terminal_accepted_tree(
-    tmp_path: Path,
-) -> None:
-    sessions = tmp_path / "sessions"
-    sessions.mkdir()
-    audit = tmp_path / "audit"
-    audit.mkdir()
-    child_key = "agent:main:subagent:child"
-    root_records = [
-        {"type": "session", "id": "root"},
-        {
-            "type": "message",
-            "message": {"role": "user", "content": "delegate"},
-        },
-        {
-            "type": "message",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "toolCall",
-                        "id": "spawn-1",
-                        "name": "sessions_spawn",
-                        "arguments": {"task": "inspect"},
-                    }
-                ],
-                "stopReason": "toolUse",
-            },
-        },
-        {
-            "type": "message",
-            "message": {
-                "role": "toolResult",
-                "toolCallId": "spawn-1",
-                "content": json.dumps(
-                    {
-                        "status": "accepted",
-                        "childSessionKey": child_key,
-                    }
-                ),
-            },
-        },
-        {
-            "type": "message",
-            "message": {
-                "role": "assistant",
-                "content": [{"type": "text", "text": "done"}],
-                "stopReason": "stop",
-            },
-        },
-    ]
-    child_records = [
-        {"type": "session", "id": "child"},
-        {
-            "type": "message",
-            "message": {"role": "user", "content": "inspect"},
-        },
-        {
-            "type": "message",
-            "message": {
-                "role": "assistant",
-                "content": [{"type": "text", "text": "inspected"}],
-                "stopReason": "stop",
-            },
-        },
-    ]
-    (sessions / "root.jsonl").write_text(
-        "\n".join(json.dumps(record) for record in root_records) + "\n",
-        encoding="utf-8",
-    )
-    (sessions / "child.jsonl").write_text(
-        "\n".join(json.dumps(record) for record in child_records) + "\n",
-        encoding="utf-8",
-    )
-    store = {
-        "agent:main:main": {
-            "sessionId": "root",
-            "sessionFile": "root.jsonl",
-        },
-        child_key: {
-            "sessionId": "child",
-            "sessionFile": "child.jsonl",
-            "spawnedBy": "agent:main:main",
-            "status": "done",
-        },
-    }
-    (sessions / "sessions.json").write_text(json.dumps(store), encoding="utf-8")
-
-    complete = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _OPENCLAW_SESSION_PROBE,
-            str(sessions),
-            str(audit),
-        ],
-        check=False,
-    )
-
-    assert complete.returncode == 0
-
-    root_records[3]["message"]["content"] = "spawn accepted: " + json.dumps(
-        {
-            "status": "accepted",
-            "childSessionKey": child_key,
-        }
-    )
-    (sessions / "root.jsonl").write_text(
-        "\n".join(json.dumps(record) for record in root_records) + "\n",
-        encoding="utf-8",
-    )
-    embedded_result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _OPENCLAW_SESSION_PROBE,
-            str(sessions),
-            str(audit),
-        ],
-        check=False,
-    )
-
-    assert embedded_result.returncode == 0
-
-    store.pop(child_key)
-    (sessions / "sessions.json").write_text(json.dumps(store), encoding="utf-8")
-    missing_child = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _OPENCLAW_SESSION_PROBE,
-            str(sessions),
-            str(audit),
-        ],
-        check=False,
-    )
-
-    assert missing_child.returncode == 1
-
-    (audit / "sessions.jsonl").write_text(
-        json.dumps(
-            {
-                "type": "subagent_ended",
-                "sessionKey": child_key,
-                "spawnedBy": "agent:main:main",
-                "status": "failed",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    failed_without_transcript = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _OPENCLAW_SESSION_PROBE,
-            str(sessions),
-            str(audit),
-        ],
-        check=False,
-    )
-
-    assert failed_without_transcript.returncode == 1
-
-    (audit / "transcripts").mkdir()
-    (audit / "transcripts" / "child.jsonl").write_text(
-        "\n".join(json.dumps(record) for record in child_records) + "\n",
-        encoding="utf-8",
-    )
-    (audit / "sessions.jsonl").write_text(
-        "\n".join(
-            [
-                json.dumps(
-                    {
-                        "type": "subagent_spawned",
-                        "sessionKey": child_key,
-                        "spawnedBy": "agent:main:main",
-                    }
-                ),
-                json.dumps(
-                    {
-                        "type": "session_end",
-                        "sessionKey": child_key,
-                        "sessionId": "child",
-                        "status": "done",
-                        "auditTranscript": "transcripts/child.jsonl",
-                    }
-                ),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    audited_child = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _OPENCLAW_SESSION_PROBE,
-            str(sessions),
-            str(audit),
-        ],
-        check=False,
-    )
-
-    assert audited_child.returncode == 0
-
-    store[child_key] = {
-        "sessionId": "child",
-        "sessionFile": "missing-child.jsonl",
-        "spawnedBy": "agent:main:main",
-        "status": "done",
-    }
-    (sessions / "sessions.json").write_text(json.dumps(store), encoding="utf-8")
-    stale_index_with_audit = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _OPENCLAW_SESSION_PROBE,
-            str(sessions),
-            str(audit),
-        ],
-        check=False,
-    )
-
-    assert stale_index_with_audit.returncode == 0
-
-    (audit / "transcripts" / "child.jsonl").write_text(
-        "\n".join(json.dumps(record) for record in child_records[:2]) + "\n",
-        encoding="utf-8",
-    )
-    for terminal_status in ("deleted", "error", "reset"):
-        with (audit / "sessions.jsonl").open("a", encoding="utf-8") as audit_file:
-            audit_file.write(
-                json.dumps(
-                    {
-                        "type": "subagent_ended",
-                        "sessionKey": child_key,
-                        "status": terminal_status,
-                    }
-                )
-                + "\n"
-            )
-        failed_child = subprocess.run(
+    def run_probe() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
             [
                 sys.executable,
                 "-c",
-                _OPENCLAW_SESSION_PROBE,
-                str(sessions),
+                _OPENCLAW_CHILD_EXPORTS_READY,
                 str(audit),
             ],
             check=False,
+            capture_output=True,
+            text=True,
         )
 
-        assert failed_child.returncode == 0
+    assert run_probe().returncode == 1
+    audit.write_text(
+        json.dumps({"type": "audit_ready"}) + "\n",
+        encoding="utf-8",
+    )
+    assert run_probe().returncode == 0
+    with audit.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "subagent_spawned",
+                    "sessionKey": child,
+                    "runId": "run-child",
+                }
+            )
+            + "\n"
+        )
+    assert run_probe().returncode == 1
+
+    with audit.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "subagent_spawned",
+                    "sessionKey": nested,
+                    "runId": "run-nested",
+                }
+            )
+            + "\n"
+        )
+        handle.write(
+            json.dumps(
+            {
+                "type": "subagent_exported",
+                "sessionKey": child,
+                "runId": "run-child",
+                "exportOk": True,
+                "exportOutput": "shellbench-child-one",
+            }
+        )
+            + "\n"
+        )
+    assert run_probe().returncode == 1
+
+    with audit.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "subagent_exported",
+                    "sessionKey": nested,
+                    "runId": "run-nested",
+                    "exportOk": True,
+                    "exportOutput": "shellbench-child-two",
+                }
+            )
+            + "\n"
+        )
+    completed = run_probe()
+    assert completed.returncode == 0
+    assert completed.stdout.splitlines() == [
+        "shellbench-child-one",
+        "shellbench-child-two",
+    ]
+
+    with audit.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "subagent_exported",
+                    "sessionKey": nested,
+                    "runId": "run-nested",
+                    "exportOk": False,
+                    "exportOutput": "shellbench-child-two",
+                }
+            )
+            + "\n"
+        )
+    failed = run_probe()
+    assert failed.returncode == 2
+    assert nested in failed.stderr
 
 
 def test_openclaw_terminal_rejects_an_unanswered_latest_user_turn(
@@ -1222,142 +1063,6 @@ def test_openclaw_terminal_rejects_an_unanswered_latest_user_turn(
     )
 
     assert _openclaw_session_terminal(session) is False
-
-    sessions = tmp_path / "sessions"
-    sessions.mkdir()
-    (sessions / "root.jsonl").write_text(session.read_text(encoding="utf-8"))
-    (sessions / "sessions.json").write_text(
-        json.dumps(
-            {
-                "agent:main:main": {
-                    "sessionId": "root",
-                    "sessionFile": "root.jsonl",
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    audit = tmp_path / "audit"
-    audit.mkdir()
-
-    probe = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _OPENCLAW_SESSION_PROBE,
-            str(sessions),
-            str(audit),
-        ],
-        check=False,
-    )
-
-    assert probe.returncode == 1
-
-
-def test_openclaw_session_probe_rejects_audit_paths_outside_its_root(
-    tmp_path: Path,
-) -> None:
-    sessions = tmp_path / "sessions"
-    sessions.mkdir()
-    audit = tmp_path / "audit"
-    audit.mkdir()
-    outside = tmp_path / "outside.jsonl"
-    child_key = "agent:main:subagent:child"
-    root_records = [
-        {"type": "session", "id": "root"},
-        {
-            "type": "message",
-            "message": {"role": "user", "content": "delegate"},
-        },
-        {
-            "type": "message",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "toolCall",
-                        "id": "spawn-1",
-                        "name": "sessions_spawn",
-                        "arguments": {"task": "inspect"},
-                    }
-                ],
-                "stopReason": "toolUse",
-            },
-        },
-        {
-            "type": "message",
-            "message": {
-                "role": "toolResult",
-                "toolCallId": "spawn-1",
-                "content": json.dumps({"status": "accepted", "childSessionKey": child_key}),
-            },
-        },
-        {
-            "type": "message",
-            "message": {
-                "role": "assistant",
-                "content": [{"type": "text", "text": "done"}],
-                "stopReason": "stop",
-            },
-        },
-    ]
-    terminal_records = [
-        {"type": "session", "id": "outside"},
-        {
-            "type": "message",
-            "message": {
-                "role": "assistant",
-                "content": [{"type": "text", "text": "forged"}],
-                "stopReason": "stop",
-            },
-        },
-    ]
-    (sessions / "root.jsonl").write_text(
-        "\n".join(json.dumps(record) for record in root_records) + "\n",
-        encoding="utf-8",
-    )
-    outside.write_text(
-        "\n".join(json.dumps(record) for record in terminal_records) + "\n",
-        encoding="utf-8",
-    )
-    (sessions / "sessions.json").write_text(
-        json.dumps(
-            {
-                "agent:main:main": {
-                    "sessionId": "root",
-                    "sessionFile": "root.jsonl",
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    (audit / "sessions.jsonl").write_text(
-        json.dumps(
-            {
-                "type": "session_end",
-                "sessionKey": child_key,
-                "sessionId": "child",
-                "spawnedBy": "agent:main:main",
-                "status": "done",
-                "auditTranscript": "../outside.jsonl",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    probe = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _OPENCLAW_SESSION_PROBE,
-            str(sessions),
-            str(audit),
-        ],
-        check=False,
-    )
-
-    assert probe.returncode == 1
 
 
 def test_openclaw_archived_session_path_preserves_safe_subdirectories(
@@ -2226,6 +1931,457 @@ def test_openclaw_session_without_envelope_converts_to_atif(
     assert fallback_trajectory["final_metrics"]["total_prompt_tokens"] == 100
     assert fallback_trajectory["final_metrics"]["total_completion_tokens"] == 9
     assert fallback_trajectory["final_metrics"]["total_cached_tokens"] == 20
+
+
+def test_openclaw_exported_trajectory_bundle_converts_to_atif(
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    bundle = agent_dir / "openclaw.sessions" / "exports" / "shellbench-root"
+    bundle.mkdir(parents=True)
+    user = {"role": "user", "content": "do the task", "timestamp": 1_753_833_602_000}
+    exec_call = {
+        "role": "assistant",
+        "model": "gpt-5.5",
+        "timestamp": 1_753_833_603_000,
+        "content": [
+            {
+                "type": "toolCall",
+                "id": "call-exec",
+                "name": "exec",
+                "arguments": {"code": "await tools.shell({cmd: 'pwd'})"},
+            }
+        ],
+        "usage": {"input": 12, "output": 3, "cacheRead": 5},
+        "stopReason": "toolUse",
+    }
+    exec_result = {
+        "role": "toolResult",
+        "toolCallId": "call-exec",
+        "timestamp": 1_753_833_604_000,
+        "content": [{"type": "text", "text": "code completed"}],
+    }
+    nested_call = {
+        "role": "assistant",
+        "timestamp": 1_753_833_604_100,
+        "content": [
+            {
+                "type": "toolCall",
+                "id": "tool_search_code:call-exec:shell:1",
+                "name": "shell",
+                "arguments": {"cmd": "pwd"},
+            }
+        ],
+        "stopReason": "toolUse",
+    }
+    nested_result = {
+        "role": "toolResult",
+        "toolCallId": "tool_search_code:call-exec:shell:1",
+        "timestamp": 1_753_833_604_200,
+        "content": [{"type": "text", "text": "/app"}],
+    }
+    final = {
+        "role": "assistant",
+        "model": "gpt-5.5",
+        "timestamp": 1_753_833_605_000,
+        "content": [{"type": "text", "text": "done"}],
+        "usage": {"input": 4, "output": 2, "cacheRead": 1},
+        "stopReason": "stop",
+    }
+    persisted_messages = [user, exec_call, exec_result, final]
+    snapshot = [user, exec_call, exec_result, nested_call, nested_result, final]
+    records = [
+        {
+            "type": "message",
+            "id": f"entry-{index}",
+            "timestamp": f"2026-07-30T00:00:0{index}Z",
+            "message": message,
+        }
+        for index, message in enumerate(persisted_messages, start=1)
+    ]
+    runtime_events = [
+        {
+            "traceSchema": "openclaw-trajectory",
+            "schemaVersion": 1,
+            "traceId": "session-export-123",
+            "source": "runtime",
+            "type": "context.compiled",
+            "ts": "2026-07-30T00:00:01Z",
+            "seq": 1,
+            "sourceSeq": 1,
+            "sessionId": "session-export-123",
+            "sessionKey": "agent:main:main",
+            "runId": "run-1",
+            "data": {
+                "tools": [{"name": "shell"}, {"name": "read"}],
+                "providerVisibleTools": [{"name": "exec"}, {"name": "wait"}],
+            },
+        },
+        {
+            "traceSchema": "openclaw-trajectory",
+            "schemaVersion": 1,
+            "traceId": "session-export-123",
+            "source": "runtime",
+            "type": "model.completed",
+            "ts": "2026-07-30T00:00:03Z",
+            "seq": 2,
+            "sourceSeq": 2,
+            "sessionId": "session-export-123",
+            "sessionKey": "agent:main:main",
+            "runId": "run-1",
+            "provider": "openai",
+            "modelId": "gpt-5.5",
+            "data": {"usage": {"input": 12, "output": 3, "cacheRead": 5}},
+        },
+        {
+            "traceSchema": "openclaw-trajectory",
+            "schemaVersion": 1,
+            "traceId": "session-export-123",
+            "source": "runtime",
+            "type": "model.completed",
+            "ts": "2026-07-30T00:00:05Z",
+            "seq": 3,
+            "sourceSeq": 3,
+            "sessionId": "session-export-123",
+            "sessionKey": "agent:main:main",
+            "runId": "run-1",
+            "provider": "openai",
+            "modelId": "gpt-5.5",
+            "data": {
+                "usage": {"input": 4, "output": 2, "cacheRead": 1},
+                "messagesSnapshot": snapshot,
+            },
+        },
+        {
+            "traceSchema": "openclaw-trajectory",
+            "schemaVersion": 1,
+            "traceId": "session-export-123",
+            "source": "runtime",
+            "type": "session.ended",
+            "ts": "2026-07-30T00:00:06Z",
+            "seq": 4,
+            "sourceSeq": 4,
+            "sessionId": "session-export-123",
+            "sessionKey": "agent:main:main",
+            "runId": "run-1",
+            "data": {"status": "success"},
+        },
+    ]
+    transcript_events = [
+        {
+            "traceSchema": "openclaw-trajectory",
+            "schemaVersion": 1,
+            "traceId": "session-export-123",
+            "source": "transcript",
+            "type": "assistant.message",
+            "ts": record["timestamp"],
+            "seq": 4 + index,
+            "sourceSeq": index,
+            "sessionId": "session-export-123",
+            "sessionKey": "agent:main:main",
+            "entryId": record["id"],
+            "data": {"message": record["message"]},
+        }
+        for index, record in enumerate(records, start=1)
+    ]
+    events = [*runtime_events, *transcript_events]
+    (bundle / "manifest.json").write_text(
+        json.dumps(
+            {
+                "traceSchema": "openclaw-trajectory",
+                "schemaVersion": 1,
+                "generatedAt": "2026-07-30T00:00:07Z",
+                "traceId": "session-export-123",
+                "sessionId": "session-export-123",
+                "sessionKey": "agent:main:main",
+                "workspaceDir": "$WORKSPACE_DIR",
+                "leafId": "entry-4",
+                "eventCount": len(events),
+                "runtimeEventCount": len(runtime_events),
+                "transcriptEventCount": len(transcript_events),
+                "sourceFiles": {"session": "$OPENCLAW_STATE/session"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bundle / "session-branch.json").write_text(
+        json.dumps(
+            {
+                "header": {
+                    "type": "session",
+                    "id": "session-export-123",
+                    "timestamp": "2026-07-30T00:00:00Z",
+                    "cwd": "/app",
+                },
+                "leafId": "entry-4",
+                "entries": records,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (agent_dir / "openclaw.txt").write_text(
+        "[provider-transport-fetch] [model-fetch] response "
+        "provider=openai api=openai-responses model=gpt-5.5 status=200\n",
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_label="openclaw-gpt55-code",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt55",
+        model_id="gpt-5.5",
+        provider="openai",
+        proxy_model_name="gpt-5.5",
+        repetition=1,
+        expected_task_count=1,
+        run_date="20260730",
+        openclaw_tool_mode="code",
+    )
+
+    metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    trajectory = json.loads((agent_dir / "trajectory.json").read_text())
+
+    assert metadata["trajectory_status"] == "real"
+    assert metadata["trajectory_validation"]["trace_fidelity"] == "session"
+    assert metadata["trajectory_validation"]["session_tree_session_count"] == 1
+    assert metadata["trajectory_validation"]["export_snapshot_used"] is True
+    assert metadata["trajectory_validation"]["export_visible_tools"] == ["exec", "wait"]
+    assert metadata["trajectory_validation"]["tool_mode_observed"] is True
+    assert trajectory["session_id"] == "session-export-123"
+    assert trajectory["steps"][1]["tool_calls"][0]["function_name"] == "exec"
+    assert trajectory["steps"][2]["tool_calls"][0]["function_name"] == "shell"
+    assert trajectory["steps"][2]["observation"]["results"][0]["content"] == "/app"
+    assert trajectory["steps"][-1]["message"] == "done"
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 22
+    assert trajectory["final_metrics"]["total_completion_tokens"] == 5
+    assert trajectory["final_metrics"]["total_cached_tokens"] == 6
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "root",
+            ],
+            check=False,
+        ).returncode
+        == 0
+    )
+    latest_completion = runtime_events[2]
+    terminal_event = runtime_events[3]
+    terminal_event["data"] = {"status": "error"}
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    failed_root_metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    assert failed_root_metadata["trajectory_status"] == "unavailable"
+    assert failed_root_metadata["trajectory_validation"]["export_terminal_status"] == "error"
+    terminal_event["data"] = {"status": "success"}
+    latest_completion["data"]["messagesSnapshot"] = []
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "root",
+            ],
+            check=False,
+        ).returncode
+        == 1
+    )
+    latest_completion["data"]["messagesSnapshot"] = snapshot
+    latest_completion["data"].pop("messagesSnapshot")
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    incomplete_metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    assert incomplete_metadata["trajectory_status"] == "unavailable"
+    assert incomplete_metadata["trajectory_validation"]["export_snapshot_used"] is False
+    assert incomplete_metadata["trajectory_validation"]["tool_mode_observed"] is False
+    latest_completion["data"]["messagesSnapshot"] = snapshot
+    runtime_events[0]["data"]["providerVisibleTools"] = [{"name": "exec"}]
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "root",
+            ],
+            check=False,
+        ).returncode
+        == 1
+    )
+    runtime_events[0]["data"]["tools"] = [{"name": "exec"}, {"name": "wait"}]
+    runtime_events[0]["data"]["providerVisibleTools"] = []
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "root",
+            ],
+            check=False,
+        ).returncode
+        == 1
+    )
+    empty_visible_metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    assert empty_visible_metadata["trajectory_status"] == "unavailable"
+    assert empty_visible_metadata["trajectory_validation"]["export_visible_tools"] == []
+    assert empty_visible_metadata["trajectory_validation"]["tool_mode_observed"] is False
+    runtime_events[0]["data"]["tools"] = [{"name": "shell"}, {"name": "read"}]
+    runtime_events[0]["data"]["providerVisibleTools"] = [
+        {"name": "exec"},
+        {"name": "wait"},
+    ]
+    latest_completion["traceId"] = "stale-trace"
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "root",
+            ],
+            check=False,
+        ).returncode
+        == 1
+    )
+    invalid_trace_metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    assert invalid_trace_metadata["trajectory_status"] == "unavailable"
+    assert invalid_trace_metadata["trajectory_validation"]["export_valid"] is False
+    latest_completion["traceId"] = "session-export-123"
+    terminal_only_events = [
+        {
+            **event,
+            "data": {"status": "error"},
+        }
+        for event in events
+        if event["type"] == "session.ended"
+    ]
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    manifest["eventCount"] = len(terminal_only_events) + len(transcript_events)
+    manifest["runtimeEventCount"] = len(terminal_only_events)
+    (bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (bundle / "events.jsonl").write_text(
+        "".join(
+            json.dumps(event) + "\n"
+            for event in [*terminal_only_events, *transcript_events]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "child",
+            ],
+            check=False,
+        ).returncode
+        == 0
+    )
+    terminal_only_events[0]["data"] = {"status": "success"}
+    (bundle / "events.jsonl").write_text(
+        "".join(
+            json.dumps(event) + "\n"
+            for event in [*terminal_only_events, *transcript_events]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "child",
+            ],
+            check=False,
+        ).returncode
+        == 1
+    )
+    terminal_only_events[0]["data"] = {"status": "error"}
+    (bundle / "events.jsonl").write_text(
+        "".join(
+            json.dumps(event) + "\n"
+            for event in [*terminal_only_events, *transcript_events]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "root",
+            ],
+            check=False,
+        ).returncode
+        == 1
+    )
 
 
 def test_openclaw_transport_model_mismatch_invalidates_identity(tmp_path: Path) -> None:

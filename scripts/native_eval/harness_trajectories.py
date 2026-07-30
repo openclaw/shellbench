@@ -4,7 +4,7 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +12,10 @@ from scripts.native_eval.models import RunSpec
 
 
 OpenClawSessionTrace = tuple[str, Path, int, list[dict[str, Any]]]
+_OPENCLAW_FATAL_EXPORT_WARNINGS = {
+    "cyclic-session-branch",
+    "incomplete-session-branch",
+}
 
 
 def load_openclaw_envelope(path: Path) -> dict[str, Any] | None:
@@ -41,7 +45,7 @@ def write_openclaw_trajectory(
     agent_dir: Path,
 ) -> dict[str, Any]:
     log_path = agent_dir / "openclaw.txt"
-    session_path = agent_dir / "openclaw.session.jsonl"
+    session_path = _openclaw_root_session_path(agent_dir)
     envelope = load_openclaw_envelope(log_path)
     meta = envelope.get("meta") if envelope else {}
     if not isinstance(meta, dict):
@@ -63,8 +67,12 @@ def write_openclaw_trajectory(
         agent_dir,
         session_path,
     )
+    export_metadata = _openclaw_export_metadata(session_path)
     root_records = session_tree[0][3] if session_tree else None
     session_models = _openclaw_session_models(session_path, records=root_records)
+    export_model = export_metadata.get("export_model")
+    if isinstance(export_model, str) and export_model:
+        session_models.add(export_model)
     log_models = _openclaw_log_models(log_path)
     child_models = {
         result["resolved_model"]
@@ -94,9 +102,26 @@ def write_openclaw_trajectory(
         session_path,
         records=root_records,
     )
-    if not terminal_event_seen and envelope is not None:
+    if export_metadata:
+        terminal_event_seen = export_metadata.get("export_terminal_event_seen") is True
+    elif not terminal_event_seen and envelope is not None:
         terminal_event_seen = _openclaw_envelope_terminal(envelope)
-    if session_tree_validation["session_tree_complete"] is not True:
+    visible_tools = export_metadata.get("export_visible_tools")
+    tool_mode_observed = (
+        visible_tools == ["exec", "wait"]
+        and export_metadata.get("export_snapshot_used") is True
+        if run.openclaw_tool_mode == "code" and export_metadata
+        else True
+    )
+    if (
+        export_metadata.get("export_valid") is False
+        or (
+            export_metadata
+            and export_metadata.get("export_terminal_status") != "success"
+        )
+        or not tool_mode_observed
+        or session_tree_validation["session_tree_complete"] is not True
+    ):
         return _unavailable(
             session_path,
             runtime_model_name=runtime_model_name,
@@ -104,9 +129,11 @@ def write_openclaw_trajectory(
             observed_models=observed_models,
             extra_validation={
                 "terminal_event_seen": terminal_event_seen,
+                "tool_mode_observed": tool_mode_observed,
                 "parent_models": sorted(parent_models),
                 "child_models": sorted(normalized_child_models),
                 "log_models": sorted(normalized_log_models),
+                **export_metadata,
                 **session_tree_validation,
             },
         )
@@ -154,16 +181,20 @@ def write_openclaw_trajectory(
                 "parent_models": sorted(parent_models),
                 "child_models": sorted(normalized_child_models),
                 "log_models": sorted(normalized_log_models),
+                "tool_mode_observed": tool_mode_observed,
+                **export_metadata,
             },
         )
 
     usage = (
         _openclaw_session_tree_usage(session_tree)
-        if len(session_tree) > 1
+        if export_metadata and session_tree
         else agent_meta.get("usage")
     )
-    if not isinstance(usage, dict) and session_tree:
-        usage = _openclaw_session_tree_usage(session_tree)
+    if not isinstance(usage, dict):
+        usage = _openclaw_session_tree_usage(session_tree) if session_tree else None
+    if not isinstance(usage, dict):
+        usage = export_metadata.get("export_usage")
     if not isinstance(usage, dict):
         usage = _openclaw_session_usage(session_path, records=root_records)
     input_tokens = _int(usage.get("input"))
@@ -200,6 +231,8 @@ def write_openclaw_trajectory(
             "stop_reason": _nested_string(meta, "completion", "stopReason"),
             "aborted": meta.get("aborted"),
             "terminal_event_seen": terminal_event_seen,
+            "tool_mode_observed": tool_mode_observed,
+            **export_metadata,
             **session_tree_validation,
         },
     }
@@ -218,6 +251,8 @@ def write_openclaw_trajectory(
             "log_models": sorted(normalized_log_models),
             "session_id": session_id,
             "terminal_event_seen": terminal_event_seen,
+            "tool_mode_observed": tool_mode_observed,
+            **export_metadata,
             **session_tree_validation,
         },
     }
@@ -682,6 +717,21 @@ def _openclaw_session_steps(
 def _openclaw_session_records(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
+    if path.name == "session-branch.json":
+        bundle = _openclaw_export_bundle(path)
+        if bundle is None:
+            return []
+        _, branch, events = bundle
+        records = _openclaw_export_snapshot_records(events)
+        if not records:
+            entries = branch.get("entries")
+            records = (
+                [entry for entry in entries if isinstance(entry, dict)]
+                if isinstance(entries, list)
+                else []
+            )
+        header = branch.get("header")
+        return [header, *records] if isinstance(header, dict) else records
     records: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
@@ -691,6 +741,189 @@ def _openclaw_session_records(path: Path) -> list[dict[str, Any]]:
         if isinstance(value, dict):
             records.append(value)
     return records
+
+
+def _openclaw_export_bundle(
+    branch_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]] | None:
+    manifest = _load_json_object(branch_path.parent / "manifest.json")
+    branch = _load_json_object(branch_path)
+    if (
+        manifest.get("traceSchema") != "openclaw-trajectory"
+        or manifest.get("schemaVersion") != 1
+        or not isinstance(manifest.get("traceId"), str)
+        or not isinstance(manifest.get("sessionId"), str)
+        or not isinstance(manifest.get("sessionKey"), str)
+        or not isinstance(manifest.get("eventCount"), int)
+        or not isinstance(manifest.get("runtimeEventCount"), int)
+        or not isinstance(manifest.get("transcriptEventCount"), int)
+        or not isinstance(manifest.get("sourceFiles"), dict)
+        or not isinstance(branch.get("entries"), list)
+    ):
+        return None
+    warnings = manifest.get("warnings")
+    if isinstance(warnings, list) and any(
+        isinstance(warning, dict)
+        and warning.get("code") in _OPENCLAW_FATAL_EXPORT_WARNINGS
+        for warning in warnings
+    ):
+        return None
+    events: list[dict[str, Any]] = []
+    events_path = branch_path.parent / "events.jsonl"
+    if events_path.is_file():
+        for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                return None
+            if (
+                not isinstance(event, dict)
+                or event.get("traceSchema") != "openclaw-trajectory"
+                or event.get("schemaVersion") != 1
+                or event.get("traceId") != manifest["traceId"]
+                or event.get("sessionId") != manifest["sessionId"]
+                or event.get("sessionKey") != manifest["sessionKey"]
+            ):
+                return None
+            events.append(event)
+    if len(events) != manifest["eventCount"]:
+        return None
+    if (
+        sum(event.get("source") == "runtime" for event in events)
+        != manifest["runtimeEventCount"]
+        or sum(event.get("source") == "transcript" for event in events)
+        != manifest["transcriptEventCount"]
+    ):
+        return None
+    return manifest, branch, events
+
+
+def _openclaw_export_runtime_turn(
+    events: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    runtime_events = [event for event in events if event.get("source") == "runtime"]
+    terminal = next(
+        (event for event in reversed(runtime_events) if event.get("type") == "session.ended"),
+        None,
+    )
+    run_id = terminal.get("runId") if isinstance(terminal, dict) else None
+
+    def matching(event: dict[str, Any], event_type: str) -> bool:
+        if event.get("type") != event_type:
+            return False
+        return not isinstance(run_id, str) or event.get("runId") == run_id
+
+    completion = next(
+        (event for event in reversed(runtime_events) if matching(event, "model.completed")),
+        None,
+    )
+    context = next(
+        (event for event in reversed(runtime_events) if matching(event, "context.compiled")),
+        None,
+    )
+    return terminal, completion, context
+
+
+def _openclaw_export_snapshot_records(
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    _, completion, _ = _openclaw_export_runtime_turn(events)
+    data = completion.get("data") if isinstance(completion, dict) else None
+    if not isinstance(data, dict) or data.get("truncated") is True:
+        return []
+    snapshot = data.get("messagesSnapshot")
+    if not isinstance(snapshot, list):
+        return []
+    records: list[dict[str, Any]] = []
+    for index, message in enumerate(snapshot):
+        if not isinstance(message, dict):
+            return []
+        timestamp = message.get("timestamp")
+        if isinstance(timestamp, (int, float)):
+            timestamp = (
+                datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+        records.append(
+            {
+                "type": "message",
+                "id": f"runtime-message-{index + 1}",
+                "timestamp": timestamp,
+                "message": message,
+            }
+        )
+    roles = {
+        record["message"].get("role")
+        for record in records
+        if isinstance(record.get("message"), dict)
+        and isinstance(record["message"].get("role"), str)
+    }
+    if not {"user", "assistant"} <= roles:
+        return []
+    return records
+
+
+def _openclaw_export_metadata(path: Path) -> dict[str, Any]:
+    if path.name != "session-branch.json":
+        return {}
+    bundle = _openclaw_export_bundle(path)
+    if bundle is None:
+        return {"export_valid": False}
+    manifest, _, events = bundle
+    terminal, completion, context = _openclaw_export_runtime_turn(events)
+    completion_data = completion.get("data") if isinstance(completion, dict) else None
+    context_data = context.get("data") if isinstance(context, dict) else None
+    visible_tools = None
+    if isinstance(context_data, dict):
+        visible_tools = (
+            context_data.get("providerVisibleTools")
+            if "providerVisibleTools" in context_data
+            else context_data.get("tools")
+        )
+    visible_tool_names = (
+        sorted(
+            {
+                tool["name"]
+                for tool in visible_tools
+                if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+            }
+        )
+        if isinstance(visible_tools, list)
+        else []
+    )
+    return {
+        "export_valid": True,
+        "export_event_count": len(events),
+        "export_runtime_event_count": manifest["runtimeEventCount"],
+        "export_transcript_event_count": manifest["transcriptEventCount"],
+        "export_terminal_event_seen": terminal is not None,
+        "export_terminal_status": (
+            terminal.get("data", {}).get("status")
+            if isinstance(terminal, dict) and isinstance(terminal.get("data"), dict)
+            else None
+        ),
+        "export_snapshot_used": bool(_openclaw_export_snapshot_records(events)),
+        "export_visible_tools": visible_tool_names,
+        "export_model": completion.get("modelId") if isinstance(completion, dict) else None,
+        "export_usage": (
+            completion_data.get("usage") if isinstance(completion_data, dict) else None
+        ),
+    }
+
+
+def _openclaw_root_session_path(agent_dir: Path) -> Path:
+    legacy = agent_dir / "openclaw.session.jsonl"
+    if legacy.is_file():
+        return legacy
+    entries, ambiguous_keys = _load_openclaw_session_index(agent_dir / "openclaw.sessions")
+    if "agent:main:main" in ambiguous_keys:
+        return legacy
+    indexed = entries.get("agent:main:main")
+    if indexed is None:
+        return legacy
+    entry, store_dir = indexed
+    return _resolve_archived_openclaw_session_path(store_dir, entry) or legacy
 
 
 _OPENCLAW_CANONICAL_SESSION_ENTRY_TYPES = {
@@ -958,13 +1191,20 @@ def _openclaw_session_tree(
     seen_paths = {root_path.resolve()}
     while pending:
         parent_key, parent_path, parent_records = pending.pop(0)
-        for spawn in _openclaw_spawn_results(
-            parent_path,
-            records=parent_records,
-        ):
-            child_key = spawn.get("child_session_key")
-            if not child_key:
-                continue
+        transcript_children = [
+            spawn["child_session_key"]
+            for spawn in _openclaw_spawn_results(
+                parent_path,
+                records=parent_records,
+            )
+            if spawn.get("child_session_key")
+        ]
+        audited_children = sorted(
+            key
+            for key, event in audit.items()
+            if event.get("spawnedBy") == parent_key and key not in transcript_children
+        )
+        for child_key in [*transcript_children, *audited_children]:
             accepted_spawn_count += 1
             ancestor: str | None = parent_key
             while ancestor is not None and ancestor != child_key:
@@ -998,6 +1238,7 @@ def _openclaw_session_tree(
                 entry, path = deleted
             else:
                 entry, store_dir = indexed
+                entry = {**entry, **audit.get(child_key, {})}
                 path = _resolve_archived_openclaw_session_path(store_dir, entry)
                 if path is None:
                     deleted, deleted_error = _resolve_deleted_openclaw_session(
@@ -1142,6 +1383,31 @@ def _load_openclaw_session_index(
                 ambiguous_keys.add(key)
                 continue
             entries[key] = (value, store_path.parent)
+    manifest_paths = sorted(archive.rglob("manifest.json")) if archive.is_dir() else []
+    for manifest_path in manifest_paths:
+        manifest = _load_json_object(manifest_path)
+        key = manifest.get("sessionKey")
+        session_id = manifest.get("sessionId")
+        branch_path = manifest_path.parent / "session-branch.json"
+        if (
+            not isinstance(key, str)
+            or not key.strip()
+            or not isinstance(session_id, str)
+            or not session_id.strip()
+            or not branch_path.is_file()
+        ):
+            continue
+        key = key.strip()
+        if key in entries:
+            ambiguous_keys.add(key)
+            continue
+        entries[key] = (
+            {
+                "sessionId": session_id.strip(),
+                "sessionFile": branch_path.name,
+            },
+            manifest_path.parent,
+        )
     return entries, ambiguous_keys
 
 
