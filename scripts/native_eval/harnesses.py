@@ -432,7 +432,7 @@ def _openclaw(
             "entries": {"shellbench-audit": {"enabled": True}},
         },
         "tools": {
-            "deny": ["message", "computer"],
+            "allow": ["group:runtime", "group:fs", "bundle-mcp"],
             "codeMode": run.openclaw_tool_mode == "code",
             "toolSearch": (
                 {"enabled": True, "mode": "directory"}

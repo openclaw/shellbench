@@ -1011,6 +1011,8 @@ def test_openclaw_harness_uses_direct_tools_by_default() -> None:
 
     assert '"codeMode":false' in command.setup_command
     assert '"toolSearch":false' in command.setup_command
+    assert '"allow":["group:runtime","group:fs","bundle-mcp"]' in command.setup_command
+    assert '"deny":["message","computer"]' not in command.setup_command
     assert '"deny":["message","computer"]' in command.setup_command
 
 
