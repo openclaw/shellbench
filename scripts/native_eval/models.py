@@ -6,6 +6,7 @@ from typing import Iterable
 
 
 OPENCLAW_TOOL_MODES = frozenset({"direct", "directory", "code"})
+CODEX_TOOL_MODES = frozenset({"direct", "code"})
 REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 
 
@@ -38,6 +39,7 @@ class RunSpec:
     run_date: str
     reasoning_effort: str | None = None
     openclaw_tool_mode: str | None = None
+    codex_tool_mode: str | None = None
 
     def __post_init__(self) -> None:
         if (

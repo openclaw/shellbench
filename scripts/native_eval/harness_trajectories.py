@@ -217,6 +217,8 @@ def write_openclaw_trajectory(
     input_tokens = _int(usage.get("input"))
     output_tokens = _int(usage.get("output"))
     cache_read = _int(usage.get("cacheRead"))
+    cache_write = _int(usage.get("cacheWrite"))
+    prompt_tokens = input_tokens + cache_read + cache_write
     session_id = str(
         agent_meta.get("sessionId") or _openclaw_session_id(session_path) or uuid.uuid4()
     )
@@ -232,7 +234,7 @@ def write_openclaw_trajectory(
         "steps": steps,
         "final_metrics": _without_none(
             {
-                "total_prompt_tokens": input_tokens + cache_read or None,
+                "total_prompt_tokens": prompt_tokens or None,
                 "total_completion_tokens": output_tokens or None,
                 "total_cached_tokens": cache_read or None,
                 "total_steps": len(steps),
@@ -249,6 +251,7 @@ def write_openclaw_trajectory(
             "aborted": meta.get("aborted"),
             "terminal_event_seen": terminal_event_seen,
             "tool_mode_observed": tool_mode_observed,
+            "cache_write_tokens": cache_write or None,
             **export_metadata,
             **session_tree_validation,
         },
@@ -561,7 +564,7 @@ def _openclaw_envelope_steps(
     cache_write = _int(usage.get("cacheWrite"))
     metrics = _without_none(
         {
-            "prompt_tokens": input_tokens + cache_read or None,
+            "prompt_tokens": input_tokens + cache_read + cache_write or None,
             "completion_tokens": output_tokens or None,
             "cached_tokens": cache_read or None,
             "extra": {"cache_write_tokens": cache_write} if cache_write else None,
@@ -1941,7 +1944,7 @@ def _openclaw_usage_metrics(value: Any) -> dict[str, Any] | None:
     cache_write = _int(value.get("cacheWrite"))
     metrics = _without_none(
         {
-            "prompt_tokens": input_tokens + cache_read or None,
+            "prompt_tokens": input_tokens + cache_read + cache_write or None,
             "completion_tokens": output_tokens or None,
             "cached_tokens": cache_read or None,
             "extra": {"cache_write_tokens": cache_write} if cache_write else None,

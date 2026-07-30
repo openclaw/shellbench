@@ -335,6 +335,7 @@ class FakeExecutor:
         self.dispatch_arguments: dict[str, list[str]] = {}
         self.dispatch_parity_validation: dict[str, str] = {}
         self.dispatch_tool_mode: dict[str, str] = {}
+        self.dispatch_codex_tool_mode: dict[str, str] = {}
         self.dispatch_qualification_family: dict[str, str] = {}
         self.dispatch_phase: dict[str, str] = {}
         self.dispatch_leaderboard_eligible: dict[str, str] = {}
@@ -470,7 +471,8 @@ class FakeExecutor:
             exclusion_reason = remote_command[dispatch_marker + 18]
             parity_validation = remote_command[dispatch_marker + 20]
             tool_mode = remote_command[dispatch_marker + 21]
-            remote_run_args = remote_command[dispatch_marker + 22 :]
+            codex_tool_mode = remote_command[dispatch_marker + 22]
+            remote_run_args = remote_command[dispatch_marker + 23 :]
             with self._dispatch_condition:
                 attempt = self.dispatch_attempts.get(label, 0) + 1
                 self.dispatch_attempts[label] = attempt
@@ -485,6 +487,7 @@ class FakeExecutor:
                 self.dispatch_arguments[label] = remote_run_args
                 self.dispatch_parity_validation[label] = parity_validation
                 self.dispatch_tool_mode[label] = tool_mode
+                self.dispatch_codex_tool_mode[label] = codex_tool_mode
                 self.dispatch_qualification_family[label] = qualification_family
                 self.dispatch_phase[label] = run_phase
                 self.dispatch_leaderboard_eligible[label] = leaderboard_eligible
@@ -945,6 +948,20 @@ def test_controller_dispatches_openclaw_tool_mode(tmp_path: Path) -> None:
     assert FleetController(config, executor=executor).run() == 0
 
     assert executor.dispatch_tool_mode[label] == "code"
+
+
+def test_controller_dispatches_codex_tool_mode(tmp_path: Path) -> None:
+    label = "codex-gpt55-high-full-2-r1-20260730"
+    run = _planned(_run_spec(label, harness="codex"))
+    run["codex_tool_mode"] = "code"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    assert executor.dispatch_codex_tool_mode[label] == "code"
 
 
 def test_controller_rejects_retired_openclaw_tool_search_mode(
@@ -1583,6 +1600,29 @@ def test_failed_run_preserves_openclaw_tool_mode_on_rerun(
     runs = json.loads(run_index.read_text(encoding="utf-8"))["runs"]
     assert runs[1]["openclaw_tool_mode"] == "directory"
     assert executor.dispatch_tool_mode[rerun] == "directory"
+
+
+def test_failed_run_preserves_codex_tool_mode_on_rerun(
+    tmp_path: Path,
+) -> None:
+    base = "codex-gpt55-high-full-2-r1-20260730"
+    rerun = f"{base}-rerun1"
+    run = _planned(_run_spec(base, harness="codex"))
+    run["codex_tool_mode"] = "code"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index, max_attempts=2)
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={base: 1, rerun: 2},
+        checkpoint_codes={base: 1},
+    )
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    runs = json.loads(run_index.read_text(encoding="utf-8"))["runs"]
+    assert runs[1]["codex_tool_mode"] == "code"
+    assert executor.dispatch_codex_tool_mode[rerun] == "code"
 
 
 def test_resume_attaches_to_running_lease_without_redispatch(tmp_path: Path) -> None:

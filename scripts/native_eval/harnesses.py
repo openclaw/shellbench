@@ -633,6 +633,7 @@ def _codex(
     mcp_servers: tuple[McpServer, ...],
 ) -> HarnessCommand:
     home = "/tmp/shellbench-codex"
+    code_mode_flag = "--enable code_mode_only " if run.codex_tool_mode == "code" else ""
     config_lines = [f'openai_base_url = "{proxy_url.rstrip("/")}/v1"']
     for server in mcp_servers:
         config_lines.append(f"[mcp_servers.{server.name}]")
@@ -653,6 +654,7 @@ def _codex(
         f"export PATH={_base_path()}; export CODEX_HOME={home}; "
         "codex exec --dangerously-bypass-approvals-and-sandbox "
         "--skip-git-repo-check "
+        f"{code_mode_flag}"
         f"--model {shlex.quote(run.model_id)} "
         "--json --enable unified_exec -- "
         '"$(cat /tmp/shellbench-instruction.md)" '

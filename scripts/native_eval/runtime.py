@@ -843,7 +843,10 @@ def collect_agent_metrics(harness: str, agent_dir: Path) -> dict[str, Any]:
     for event in events:
         usage = _find_usage(event)
         if usage:
-            _merge_usage(metrics, usage)
+            if harness == "openclaw":
+                _merge_openclaw_usage(metrics, usage)
+            else:
+                _merge_usage(metrics, usage)
         _merge_event_cost(metrics, event)
     return metrics
 
@@ -1134,6 +1137,25 @@ def _merge_usage(metrics: dict[str, Any], usage: dict[str, Any]) -> None:
             if isinstance(value, (int, float)):
                 metrics[target] = value
                 break
+
+
+def _usage_number(value: Any) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return value
+
+
+def _merge_openclaw_usage(metrics: dict[str, Any], usage: dict[str, Any]) -> None:
+    input_tokens = _usage_number(usage.get("input"))
+    cache_read = _usage_number(usage.get("cacheRead"))
+    cache_write = _usage_number(usage.get("cacheWrite"))
+    metrics["n_input_tokens"] = input_tokens + cache_read + cache_write
+    metrics["n_cache_tokens"] = cache_read
+    output_tokens = usage.get("output")
+    if isinstance(output_tokens, (int, float)):
+        metrics["n_output_tokens"] = output_tokens
+    metrics["metadata"]["cache_write_tokens"] = cache_write
+    metrics["metadata"]["input_token_semantics"] = "total_prompt_including_cache"
 
 
 def _merge_event_cost(metrics: dict[str, Any], event: dict[str, Any]) -> None:

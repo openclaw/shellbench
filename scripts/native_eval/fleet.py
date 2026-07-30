@@ -23,6 +23,7 @@ from typing import Any, Protocol, Sequence
 
 from scripts.native_eval.checkpoint_loop import count_result_json
 from scripts.native_eval.models import (
+    CODEX_TOOL_MODES,
     OPENCLAW_TOOL_MODES,
     REASONING_EFFORTS,
     RunSpec,
@@ -487,6 +488,17 @@ class FleetController:
                     raise FleetError(
                         f"{run.run_label} must set openclaw_tool_mode to "
                         f"one of {sorted(OPENCLAW_TOOL_MODES)}"
+                    )
+            codex_tool_mode = str(entry.get("codex_tool_mode") or "")
+            if codex_tool_mode:
+                if run.harness != "codex":
+                    raise FleetError(
+                        f"{run.run_label} codex_tool_mode requires the Codex harness"
+                    )
+                if codex_tool_mode not in CODEX_TOOL_MODES:
+                    raise FleetError(
+                        f"{run.run_label} must set codex_tool_mode to "
+                        f"one of {sorted(CODEX_TOOL_MODES)}"
                     )
         if self.config.openclaw_package_tarball and harnesses != {"openclaw"}:
             raise FleetError(
@@ -1159,7 +1171,8 @@ shift 9
 parity_validated=$1
 parity_validation_json=$2
 openclaw_tool_mode=$3
-shift 3
+codex_tool_mode=$4
+shift 4
 mkdir -p "$root/run-logs"
 stdout="$root/run-logs/$label.stdout.log"
 stderr="$root/run-logs/$label.stderr.log"
@@ -1183,6 +1196,7 @@ nohup env \
   "SHELLBENCH_PARITY_VALIDATED=$parity_validated" \
   "SHELLBENCH_PARITY_VALIDATION_JSON=$parity_validation_json" \
   "SHELLBENCH_OPENCLAW_TOOL_MODE=$openclaw_tool_mode" \
+  "SHELLBENCH_CODEX_TOOL_MODE=$codex_tool_mode" \
   "$root/runner/scripts/native_eval/remote_run.sh" "$@" \
   >"$stdout" 2>"$stderr" </dev/null &
 pid=$!
@@ -1234,6 +1248,7 @@ printf '%s\n' "$pid"
                 sort_keys=True,
             )
         openclaw_tool_mode = str(entry.get("openclaw_tool_mode") or "")
+        codex_tool_mode = str(entry.get("codex_tool_mode") or "")
         command = self._ssh_command(
             lease,
             [
@@ -1262,6 +1277,7 @@ printf '%s\n' "$pid"
                 str(self.config.parity_validated).lower(),
                 parity_validation,
                 openclaw_tool_mode,
+                codex_tool_mode,
                 *args,
             ],
         )
@@ -1644,6 +1660,7 @@ printf '%s\n' "$pid"
             "run_label": label,
             "judge_reasoning_effort": entry.get("judge_reasoning_effort"),
             "openclaw_tool_mode": entry.get("openclaw_tool_mode"),
+            "codex_tool_mode": entry.get("codex_tool_mode"),
             "phase": entry.get("phase"),
             "qualification_family": entry.get("qualification_family"),
             "attempt": next_attempt,
@@ -1662,6 +1679,7 @@ printf '%s\n' "$pid"
             "rerun_of_canonical_run",
             "repair_classifications",
             "openclaw_tool_mode",
+            "codex_tool_mode",
         ):
             if metadata_field in entry:
                 rerun[metadata_field] = copy.deepcopy(entry[metadata_field])
@@ -1686,6 +1704,7 @@ printf '%s\n' "$pid"
                 **{field: entry[field] for field in RUN_SPEC_FIELDS},
                 reasoning_effort=entry.get("reasoning_effort"),
                 openclaw_tool_mode=entry.get("openclaw_tool_mode"),
+                codex_tool_mode=entry.get("codex_tool_mode"),
             )
         except KeyError as exc:
             raise FleetError(

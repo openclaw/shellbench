@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.native_eval.models import (
+    CODEX_TOOL_MODES,
     OPENCLAW_TOOL_MODES,
     RunSpec,
     harness_by_name,
@@ -312,6 +313,11 @@ def _run_manifest(
             or os.environ.get("SHELLBENCH_OPENCLAW_TOOL_MODE")
             or None
         ),
+        "codex_tool_mode": (
+            run.codex_tool_mode
+            or os.environ.get("SHELLBENCH_CODEX_TOOL_MODE")
+            or None
+        ),
         "judge_reasoning_effort": os.environ.get(
             "SHELLBENCH_JUDGE_REASONING_EFFORT"
         ),
@@ -427,6 +433,14 @@ def build_run_spec(args: argparse.Namespace) -> RunSpec:
             "SHELLBENCH_OPENCLAW_TOOL_MODE must be one of "
             f"{sorted(OPENCLAW_TOOL_MODES)}"
         )
+    codex_tool_mode = os.environ.get("SHELLBENCH_CODEX_TOOL_MODE") or None
+    if codex_tool_mode and harness.name != "codex":
+        raise ValueError("SHELLBENCH_CODEX_TOOL_MODE requires the Codex harness")
+    if codex_tool_mode and codex_tool_mode not in CODEX_TOOL_MODES:
+        raise ValueError(
+            "SHELLBENCH_CODEX_TOOL_MODE must be one of "
+            f"{sorted(CODEX_TOOL_MODES)}"
+        )
     return RunSpec(
         run_label=args.run_label,
         harness=harness.name,
@@ -440,6 +454,7 @@ def build_run_spec(args: argparse.Namespace) -> RunSpec:
         run_date=args.run_date,
         reasoning_effort=os.environ.get("SHELLBENCH_REASONING_EFFORT") or None,
         openclaw_tool_mode=openclaw_tool_mode,
+        codex_tool_mode=codex_tool_mode,
     )
 
 

@@ -842,6 +842,67 @@ def test_run_spec_rejects_openclaw_tool_mode_for_other_harness(
         )
 
 
+def test_run_spec_accepts_codex_tool_mode(monkeypatch) -> None:
+    monkeypatch.setenv("SHELLBENCH_CODEX_TOOL_MODE", "code")
+
+    run = build_run_spec(
+        Namespace(
+            run_label="codex-code-mode",
+            harness="codex",
+            harness_version="planned-version",
+            model_slug="gpt55",
+            model_id="gpt-5.5",
+            model_provider="openai",
+            proxy_model_name="gpt-5.5",
+            repetition=1,
+            expected_task_count=3,
+            run_date="20260730",
+        )
+    )
+
+    assert run.codex_tool_mode == "code"
+
+
+def test_run_spec_rejects_codex_tool_mode_for_other_harness(monkeypatch) -> None:
+    monkeypatch.setenv("SHELLBENCH_CODEX_TOOL_MODE", "code")
+
+    with pytest.raises(ValueError, match="requires the Codex harness"):
+        build_run_spec(
+            Namespace(
+                run_label="openclaw-codex-mode-invalid",
+                harness="openclaw",
+                harness_version="planned-version",
+                model_slug="gpt55",
+                model_id="gpt-5.5",
+                model_provider="openai",
+                proxy_model_name="gpt-5.5",
+                repetition=1,
+                expected_task_count=3,
+                run_date="20260730",
+            )
+        )
+
+
+def test_run_spec_rejects_invalid_codex_tool_mode(monkeypatch) -> None:
+    monkeypatch.setenv("SHELLBENCH_CODEX_TOOL_MODE", "directory")
+
+    with pytest.raises(ValueError, match="must be one of"):
+        build_run_spec(
+            Namespace(
+                run_label="codex-tool-mode-invalid",
+                harness="codex",
+                harness_version="planned-version",
+                model_slug="gpt55",
+                model_id="gpt-5.5",
+                model_provider="openai",
+                proxy_model_name="gpt-5.5",
+                repetition=1,
+                expected_task_count=3,
+                run_date="20260730",
+            )
+        )
+
+
 def test_harness_commands_preserve_canonical_model_identity() -> None:
     for harness in HARNESSES:
         run = RunSpec(
@@ -1001,6 +1062,55 @@ def test_openclaw_harness_configures_tool_directory_mode() -> None:
 
     assert '"codeMode":false' in command.setup_command
     assert '"toolSearch":{"enabled":true,"mode":"directory"}' in command.setup_command
+
+
+def test_codex_harness_configures_code_mode() -> None:
+    run = RunSpec(
+        run_label="codex-code-mode",
+        harness="codex",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=4,
+        run_date="20260730",
+        codex_tool_mode="code",
+    )
+
+    command = build_harness_command(
+        run,
+        proxy_url="http://host.docker.internal:4000",
+        proxy_key="local-proxy-key",
+        mcp_servers=(),
+    )
+
+    assert "--enable code_mode_only" in command.run_command
+
+
+def test_codex_harness_uses_direct_tools_by_default() -> None:
+    run = RunSpec(
+        run_label="codex-direct-mode",
+        harness="codex",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=4,
+        run_date="20260730",
+    )
+
+    command = build_harness_command(
+        run,
+        proxy_url="http://host.docker.internal:4000",
+        proxy_key="local-proxy-key",
+        mcp_servers=(),
+    )
+
+    assert "--enable code_mode_only" not in command.run_command
 
 
 def test_openclaw_child_exports_wait_for_every_spawned_session(
@@ -1880,10 +1990,13 @@ def test_openclaw_mixed_log_converts_harbor_envelope_to_atif(
     assert trajectory["session_id"] == "session-123"
     assert trajectory["agent"]["model_name"] == "openai/gpt-5.6-luna"
     assert trajectory["steps"][1]["message"] == "done"
-    assert trajectory["final_metrics"]["total_prompt_tokens"] == 40
-    assert metrics["n_input_tokens"] == 10
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 44
+    assert trajectory["extra"]["cache_write_tokens"] == 4
+    assert metrics["n_input_tokens"] == 44
     assert metrics["n_cache_tokens"] == 30
     assert metrics["n_output_tokens"] == 20
+    assert metrics["metadata"]["cache_write_tokens"] == 4
+    assert metrics["metadata"]["input_token_semantics"] == "total_prompt_including_cache"
 
 
 def test_openclaw_session_without_envelope_converts_to_atif(
@@ -1966,9 +2079,10 @@ def test_openclaw_session_without_envelope_converts_to_atif(
     assert metadata["trajectory_validation"]["log_models"] == ["gpt-5.6-terra"]
     assert trajectory["session_id"] == "session-only-123"
     assert trajectory["agent"]["model_name"] == "openai/gpt-5.6-terra"
-    assert trajectory["final_metrics"]["total_prompt_tokens"] == 42
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 44
     assert trajectory["final_metrics"]["total_completion_tokens"] == 7
     assert trajectory["final_metrics"]["total_cached_tokens"] == 30
+    assert trajectory["extra"]["cache_write_tokens"] == 2
 
     records[-1]["message"]["usage"] = {"input": 1}
     (agent_dir / "openclaw.session.jsonl").write_text(
