@@ -19,7 +19,11 @@ from pathlib import PurePosixPath
 from typing import Any, Protocol, Sequence
 
 from scripts.native_eval.checkpoint_loop import count_result_json
-from scripts.native_eval.models import OPENCLAW_TOOL_MODES, RunSpec
+from scripts.native_eval.models import (
+    OPENCLAW_TOOL_MODES,
+    REASONING_EFFORTS,
+    RunSpec,
+)
 from scripts.native_eval.runtime import atomic_write_json, utc_now
 
 
@@ -47,7 +51,6 @@ RESUMABLE_STATUSES = {
 RERUN_STATUSES = {"failed", "lease_lost"}
 ACTIVE_RUN_STATUSES = {"leasing", "bootstrapping", "ready", "running"}
 CLEANUP_STATUSES = {"exported", "stop_pending"}
-REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
 # Crabbox's coordinator release path retries five 60-second requests with
 # bounded backoff. Give it enough time to finish instead of leaking live AWS
 # leases after a verified export.
@@ -1482,7 +1485,6 @@ printf '%s\n' "$pid"
         rerun = {
             **run.to_dict(),
             "run_label": label,
-            "reasoning_effort": entry.get("reasoning_effort"),
             "judge_reasoning_effort": entry.get("judge_reasoning_effort"),
             "openclaw_tool_mode": entry.get("openclaw_tool_mode"),
             "phase": entry.get("phase"),
@@ -1523,6 +1525,7 @@ printf '%s\n' "$pid"
         try:
             return RunSpec(
                 **{field: entry[field] for field in RUN_SPEC_FIELDS},
+                reasoning_effort=entry.get("reasoning_effort"),
                 openclaw_tool_mode=entry.get("openclaw_tool_mode"),
             )
         except KeyError as exc:

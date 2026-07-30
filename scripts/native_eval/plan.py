@@ -86,7 +86,6 @@ def write_run_index(
     entries = [
         {
             **run.to_dict(),
-            "reasoning_effort": reasoning_effort,
             "judge_model_id": judge_model_id,
             "judge_reasoning_effort": judge_reasoning_effort,
             "phase": phase,

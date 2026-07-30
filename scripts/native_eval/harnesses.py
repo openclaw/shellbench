@@ -15,373 +15,175 @@ NODE_BIN = TOOLCHAIN_ROOT / "node" / "bin"
 NPM_BIN = TOOLCHAIN_ROOT / "npm-packages" / "node_modules" / ".bin"
 HERMES_BIN = TOOLCHAIN_ROOT / "home" / ".local" / "bin"
 
-_OPENCLAW_COMPLETION_PROBE = """\
+_OPENCLAW_CHILD_EXPORTS_READY = """\
 import json
 import pathlib
 import sys
 
-try:
-    text = pathlib.Path(sys.argv[1]).read_text(
-        encoding="utf-8",
-        errors="replace",
-    ).strip()
-except OSError:
+path = pathlib.Path(sys.argv[1])
+if not path.is_file():
     sys.exit(1)
-
-decoder = json.JSONDecoder()
-for start in range(len(text) - 1, -1, -1):
-    if text[start] != "{":
-        continue
+ready = False
+spawned = {}
+exported = {}
+for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
     try:
-        value, _ = decoder.raw_decode(text[start:])
-    except (json.JSONDecodeError, ValueError):
+        event = json.loads(line)
+    except json.JSONDecodeError:
         continue
+    if not isinstance(event, dict):
+        continue
+    if event.get("type") == "audit_ready":
+        ready = True
+        continue
+    run_id = event.get("runId")
+    session_key = event.get("sessionKey")
     if (
-        isinstance(value, dict)
-        and isinstance(value.get("payloads"), list)
-        and isinstance(value.get("meta"), dict)
+        not isinstance(run_id, str)
+        or not run_id.strip()
+        or not isinstance(session_key, str)
+        or not session_key.strip()
     ):
-        meta = value["meta"]
-        liveness = str(meta.get("livenessState") or "").lower()
-        if meta.get("yielded") is True or liveness in {
-            "active",
-            "paused",
-            "running",
-            "waiting",
-        }:
-            continue
-        completion = meta.get("completion")
-        stop_reason = (
-            completion.get("stopReason")
-            if isinstance(completion, dict)
-            else meta.get("stopReason")
+        continue
+    run_id = run_id.strip()
+    session_key = session_key.strip()
+    if event.get("type") == "subagent_spawned":
+        spawned[run_id] = session_key
+    elif event.get("type") == "subagent_exported":
+        exported[run_id] = event
+if not ready:
+    sys.exit(1)
+failed = [
+    run_id
+    for run_id in sorted(spawned)
+    if run_id in exported and exported[run_id].get("exportOk") is not True
+]
+if failed:
+    for run_id in failed:
+        print(
+            f"child export failed: {spawned[run_id]} ({run_id})",
+            file=sys.stderr,
         )
-        visible_payload = any(
-            isinstance(item, dict)
-            and isinstance(item.get("text"), str)
-            and item["text"].strip()
-            and item.get("isReasoning") is not True
-            for item in value["payloads"]
-        )
-        if visible_payload or stop_reason or meta.get("aborted") is True:
-            sys.exit(0)
-sys.exit(1)
+    sys.exit(2)
+if not spawned.keys() <= exported.keys():
+    sys.exit(1)
+for run_id in sorted(spawned):
+    output = exported[run_id].get("exportOutput")
+    if not isinstance(output, str) or not output.strip():
+        sys.exit(2)
+    print(output.strip())
 """
 
-# ShellBench pins OpenClaw 2026.7.1-2, whose runtime session contract is the
-# sessions.json registry plus JSONL transcripts under each agent's sessions dir.
-_OPENCLAW_SESSION_PROBE = """\
+_OPENCLAW_EXPORT_READY = """\
 import json
 import pathlib
 import sys
 
-sessions = pathlib.Path(sys.argv[1])
-audit_root = pathlib.Path(sys.argv[2])
+bundle = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+scope = sys.argv[3]
 try:
-    store = json.loads((sessions / "sessions.json").read_text(encoding="utf-8"))
+    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    events = [
+        json.loads(line)
+        for line in (bundle / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 except (OSError, json.JSONDecodeError):
     sys.exit(1)
-if not isinstance(store, dict):
+if (
+    manifest.get("traceSchema") != "openclaw-trajectory"
+    or manifest.get("schemaVersion") != 1
+    or len(events) != manifest.get("eventCount")
+    or sum(event.get("source") == "runtime" for event in events)
+    != manifest.get("runtimeEventCount")
+    or sum(event.get("source") == "transcript" for event in events)
+    != manifest.get("transcriptEventCount")
+):
     sys.exit(1)
-
-audit = {}
-audit_path = audit_root / "sessions.jsonl"
-if audit_path.is_file():
-    for line in audit_path.read_text(
-        encoding="utf-8",
-        errors="replace",
-    ).splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        key = event.get("sessionKey") if isinstance(event, dict) else None
-        if isinstance(key, str) and key.strip():
-            audit.setdefault(key.strip(), {}).update(event)
-
-def session_path(key, entry):
-    def contained(root, candidate):
-        try:
-            return candidate.resolve().is_relative_to(root.resolve())
-        except (OSError, RuntimeError):
-            return False
-
-    session_file = entry.get("sessionFile")
-    if isinstance(session_file, str) and session_file.strip():
-        path = pathlib.Path(session_file)
-        candidate = path if path.is_absolute() else sessions / path
-        if contained(sessions, candidate) and candidate.is_file():
-            return candidate
-    session_id = entry.get("sessionId")
-    active = sessions / f"{session_id}.jsonl" if session_id else None
-    if active and active.is_file():
-        return active
-    transcript = audit.get(key, {}).get("auditTranscript")
-    if isinstance(transcript, str) and transcript.strip():
-        candidate = audit_root / transcript
-        return candidate if contained(audit_root, candidate) else None
-    return active
-
-def records_for(key, entry):
-    path = session_path(key, entry)
-    if path is None or not path.is_file():
-        return []
-    records = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            records.append(value)
-    return records
-
-def content_text(content):
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    return "".join(
-        part.get("text", "")
-        for part in content
-        if isinstance(part, dict) and isinstance(part.get("text"), str)
+if any(
+    event.get("traceId") != manifest.get("traceId")
+    or event.get("sessionId") != manifest.get("sessionId")
+    or event.get("sessionKey") != manifest.get("sessionKey")
+    for event in events
+):
+    sys.exit(1)
+if any(
+    isinstance(warning, dict)
+    and warning.get("code") in {"cyclic-session-branch", "incomplete-session-branch"}
+    for warning in manifest.get("warnings", [])
+):
+    sys.exit(1)
+runtime = [event for event in events if event.get("source") == "runtime"]
+terminal = next(
+    (event for event in reversed(runtime) if event.get("type") == "session.ended"),
+    None,
+)
+if terminal is None:
+    sys.exit(1)
+run_id = terminal.get("runId")
+terminal_data = terminal.get("data")
+terminal_status = (
+    terminal_data.get("status") if isinstance(terminal_data, dict) else None
+)
+if scope == "root" and terminal_status != "success":
+    sys.exit(1)
+completion = next(
+    (
+        event
+        for event in reversed(runtime)
+        if event.get("type") == "model.completed"
+        and (not isinstance(run_id, str) or event.get("runId") == run_id)
+    ),
+    None,
+)
+if completion is None:
+    if scope != "child" or terminal_status not in {"error", "interrupted"}:
+        sys.exit(1)
+if mode == "code" and completion is not None:
+    completion_data = completion.get("data")
+    snapshot = (
+        completion_data.get("messagesSnapshot")
+        if isinstance(completion_data, dict)
+        else None
     )
-
-def active_records(records):
-    canonical_types = {
-        "message",
-        "thinking_level_change",
-        "model_change",
-        "compaction",
-        "reset",
-        "branch_summary",
-        "custom",
-        "custom_message",
-        "label",
-        "session_info",
-    }
-    nodes = {}
-    leaf = None
-    append_parent = None
-    explicit_update = False
-    invalid_leaf_ids = set()
-
-    def text(value):
-        return value.strip() if isinstance(value, str) and value.strip() else None
-
-    def resolve_parent(parent):
-        seen = set()
-        while parent is not None:
-            if parent in seen:
-                return parent
-            seen.add(parent)
-            node = nodes.get(parent)
-            if node is None or not node["is_leaf"]:
-                return parent
-            parent = node["parent"]
-        return None
-
-    for record in records:
-        record_type = record.get("type")
-        canonical = record_type in canonical_types
-        explicit = "parentId" in record
-        if record_type == "session" or (not explicit and not canonical):
-            continue
-        record_id = text(record.get("id"))
-        if record_id is None:
-            continue
-        raw_parent = record.get("parentId") if explicit else leaf
-        parent = None if raw_parent is None else text(raw_parent)
-        if raw_parent is not None and parent is None:
-            continue
-        is_leaf = record_type == "leaf"
-        if is_leaf:
-            raw_target = record.get("targetId")
-            target = None if raw_target is None else text(raw_target)
-            raw_append = record.get("appendParentId", raw_target)
-            next_append = None if raw_append is None else text(raw_append)
-            if (
-                (raw_target is not None and target is None)
-                or (raw_append is not None and next_append is None)
-                or record.get("appendMode") not in {None, "side"}
-            ):
-                continue
-            invalid = any(
-                ref is not None and (ref not in nodes or ref in invalid_leaf_ids)
-                for ref in (target, next_append)
-            )
-            if invalid:
-                invalid_leaf_ids.add(record_id)
-                next_leaf = ...
-                next_append = append_parent
-            else:
-                parent = target
-                next_leaf = target
-        else:
-            if (
-                explicit
-                and parent is not None
-                and parent not in nodes
-                and leaf is not None
-            ):
-                parent = leaf
-            elif (
-                explicit
-                and record.get("appendMode") != "side"
-                and parent == append_parent
-                and leaf != append_parent
-            ):
-                parent = leaf
-            parent = resolve_parent(parent)
-            next_leaf = record_id if canonical and record.get("appendMode") != "side" else ...
-            next_append = record_id
-        node = {
-            "record": record,
-            "parent": parent,
-            "leaf": next_leaf,
-            "append": next_append,
-            "is_leaf": is_leaf,
+    if (
+        not isinstance(completion_data, dict)
+        or completion_data.get("truncated") is True
+        or not isinstance(snapshot, list)
+        or not snapshot
+        or not all(isinstance(message, dict) for message in snapshot)
+        or not {"user", "assistant"} <= {
+            message.get("role")
+            for message in snapshot
+            if isinstance(message.get("role"), str)
         }
-        nodes[record_id] = node
-        append_parent = next_append
-        if next_leaf is not ...:
-            leaf = next_leaf
-            explicit_update = explicit_update or explicit
-
-    if not explicit_update:
-        return records
-    if leaf is None:
-        return []
-    selected = []
-    seen = set()
-    current = leaf
-    while current is not None:
-        if current in seen:
-            return []
-        seen.add(current)
-        node = nodes.get(current)
-        if node is None:
-            break
-        if not node["is_leaf"]:
-            selected.append(node["record"])
-        current = node["parent"]
-    selected.reverse()
-    return selected
-
-def terminal(entry, records):
-    if str(entry.get("status") or "").lower() in {
-        "cancelled",
-        "deleted",
-        "error",
-        "failed",
-        "killed",
-        "reset",
-        "timeout",
-    }:
-        return bool(records)
-    for record in reversed(active_records(records)):
-        message = record.get("message")
-        if (
-            record.get("type") != "message"
-            or not isinstance(message, dict)
-        ):
-            continue
-        if message.get("role") != "assistant":
-            return False
-        content = message.get("content")
-        parts = content if isinstance(content, list) else []
-        text = content_text(content)
-        tools = [
-            part
-            for part in parts
-            if isinstance(part, dict) and part.get("type") == "toolCall"
-        ]
-        return (
-            bool(text.strip())
-            and not tools
-            and str(message.get("stopReason") or "").lower() in {"end_turn", "stop"}
+    ):
+        sys.exit(1)
+    context = next(
+        (
+            event
+            for event in reversed(runtime)
+            if event.get("type") == "context.compiled"
+            and (not isinstance(run_id, str) or event.get("runId") == run_id)
+        ),
+        None,
+    )
+    data = context.get("data") if isinstance(context, dict) else None
+    tools = None
+    if isinstance(data, dict):
+        tools = (
+            data.get("providerVisibleTools")
+            if "providerVisibleTools" in data
+            else data.get("tools")
         )
-    return False
-
-def result_object(message):
-    details = message.get("details")
-    if isinstance(details, dict):
-        return details
-    text = content_text(message.get("content")).strip()
-    if not text:
-        return {}
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        decoder = json.JSONDecoder()
-        for start, char in enumerate(text):
-            if char != "{":
-                continue
-            try:
-                value, _ = decoder.raw_decode(text[start:])
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                return value
-        return {}
-    return value if isinstance(value, dict) else {}
-
-def spawned_children(records):
-    pending = set()
-    children = []
-    for record in active_records(records):
-        message = record.get("message")
-        if record.get("type") != "message" or not isinstance(message, dict):
-            continue
-        if message.get("role") == "assistant":
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            pending.update(
-                str(part.get("id"))
-                for part in content
-                if isinstance(part, dict)
-                and part.get("type") == "toolCall"
-                and part.get("name") == "sessions_spawn"
-                and part.get("id")
-            )
-            continue
-        if message.get("role") != "toolResult":
-            continue
-        call_id = str(message.get("toolCallId") or "")
-        if call_id not in pending:
-            continue
-        pending.discard(call_id)
-        payload = result_object(message)
-        child = payload.get("childSessionKey")
-        if (
-            str(payload.get("status") or "").lower() == "accepted"
-            and isinstance(child, str)
-            and child.strip()
-        ):
-            children.append(child.strip())
-    return children
-
-root_key = "agent:main:main"
-pending = [(root_key, None)]
-seen = set()
-while pending:
-    key, parent = pending.pop(0)
-    if key in seen:
-        continue
-    seen.add(key)
-    entry = store.get(key)
-    if not isinstance(entry, dict):
-        entry = audit.get(key)
-    if not isinstance(entry, dict):
+    names = sorted(
+        tool.get("name")
+        for tool in tools
+        if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+    ) if isinstance(tools, list) else []
+    if names != ["exec", "wait"]:
         sys.exit(1)
-    if parent and entry.get("spawnedBy") not in {None, "", parent}:
-        sys.exit(1)
-    records = records_for(key, entry)
-    if not terminal(entry, records):
-        sys.exit(1)
-    pending.extend((child, key) for child in spawned_children(records))
-sys.exit(0)
 """
 
 _OPENCLAW_GATEWAY_PROBE = """\
@@ -408,46 +210,92 @@ except Exception:
 """
 
 _OPENCLAW_AUDIT_PLUGIN = """\
+const crypto = require("node:crypto");
+const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
-const zlib = require("node:zlib");
 
 const auditRoot = path.join(process.env.HOME, ".openclaw", "shellbench-audit");
 const eventPath = path.join(auditRoot, "sessions.jsonl");
+const workspace = process.env.SHELLBENCH_WORKSPACE || process.cwd();
+const exportsByRun = new Map();
 
 function append(event) {
   fs.mkdirSync(auditRoot, { recursive: true });
   fs.appendFileSync(eventPath, `${JSON.stringify(event)}\\n`, { mode: 0o600 });
 }
 
-function materializeTranscript(event) {
-  const source = event.sessionFile;
-  if (typeof source !== "string" || !source || !fs.existsSync(source)) {
-    return undefined;
+async function exportRun(runId, sessionKey) {
+  const cacheKey = `${runId}\\0${sessionKey}`;
+  const cached = exportsByRun.get(cacheKey);
+  if (cached) {
+    return await cached;
   }
-  const transcriptRoot = path.join(auditRoot, "transcripts");
-  fs.mkdirSync(transcriptRoot, { recursive: true });
-  const destination = path.join(transcriptRoot, `${event.sessionId}.jsonl`);
-  try {
-    const content = source.endsWith(".zst")
-      ? zlib.zstdDecompressSync(fs.readFileSync(source))
-      : fs.readFileSync(source);
-    fs.writeFileSync(destination, content, { mode: 0o600 });
-    return path.relative(auditRoot, destination);
-  } catch {
-    return undefined;
-  }
+  const digest = crypto.createHash("sha256").update(cacheKey).digest("hex").slice(0, 16);
+  const output = `shellbench-child-${digest}`;
+  const pending = new Promise((resolve) => {
+    childProcess.execFile(
+      "openclaw",
+      [
+        "sessions",
+        "export-trajectory",
+        "--session-key",
+        sessionKey,
+        "--workspace",
+        workspace,
+        "--output",
+        output,
+        "--json",
+      ],
+      {
+        cwd: workspace,
+        encoding: "utf8",
+        env: process.env,
+        timeout: 120000,
+      },
+      (error, _stdout, stderr) => {
+        resolve({
+          exportOk: !error,
+          exportOutput: output,
+          exportStatus:
+            typeof error?.code === "number" ? error.code : error ? null : 0,
+          exportError: error ? String(error.message || error) : undefined,
+          exportStderr:
+            typeof stderr === "string" && stderr.trim()
+              ? stderr.trim().slice(-4000)
+              : undefined,
+        });
+      },
+    );
+  });
+  exportsByRun.set(cacheKey, pending);
+  return await pending;
 }
 
 module.exports = {
   id: "shellbench-audit",
   register(api) {
+    append({ type: "audit_ready" });
     api.on("subagent_spawned", (event, ctx) => {
       append({
         type: "subagent_spawned",
         sessionKey: event.childSessionKey,
         spawnedBy: ctx.requesterSessionKey,
         runId: event.runId,
+      });
+    });
+    api.on("subagent_progress", async (event, ctx) => {
+      if (event.phase !== "ended") {
+        return;
+      }
+      const exported = await exportRun(event.runId, event.childSessionKey);
+      append({
+        type: "subagent_exported",
+        sessionKey: event.childSessionKey,
+        spawnedBy: ctx.requesterSessionKey,
+        runId: event.runId,
+        status: event.outcome,
+        ...exported,
       });
     });
     api.on("subagent_ended", (event, ctx) => {
@@ -458,24 +306,6 @@ module.exports = {
         runId: event.runId,
         status: event.outcome,
         reason: event.reason,
-      });
-    });
-    api.on("session_start", (event) => {
-      append({
-        type: "session_start",
-        sessionKey: event.sessionKey,
-        sessionId: event.sessionId,
-      });
-    });
-    api.on("session_end", (event) => {
-      const auditTranscript = materializeTranscript(event);
-      append({
-        type: "session_end",
-        sessionKey: event.sessionKey,
-        sessionId: event.sessionId,
-        reason: event.reason,
-        transcriptArchived: event.transcriptArchived,
-        auditTranscript,
       });
     });
   },
@@ -532,6 +362,8 @@ def _openclaw(
 ) -> HarnessCommand:
     provider = "openai"
     model = f"{provider}/{run.model_id}"
+    thinking = run.reasoning_effort or "off"
+    tool_mode = run.openclaw_tool_mode or "direct"
     home = "/tmp/shellbench-openclaw"
     audit_plugin_root = f"{home}/.openclaw/shellbench-audit"
     gateway_token = secrets.token_urlsafe(32)
@@ -553,7 +385,8 @@ def _openclaw(
                 "workspace": ".",
                 "skipBootstrap": True,
                 "model": {"primary": model},
-                "subagents": {"model": model},
+                "thinkingDefault": thinking,
+                "subagents": {"model": model, "thinking": thinking},
             }
         },
         "gateway": {
@@ -593,19 +426,19 @@ def _openclaw(
     if servers:
         config["mcp"] = {"servers": servers}
     config_json = shlex.quote(json.dumps(config, separators=(",", ":")))
-    completion_probe = shlex.quote(_OPENCLAW_COMPLETION_PROBE)
-    session_probe = shlex.quote(_OPENCLAW_SESSION_PROBE)
+    child_exports_ready = shlex.quote(_OPENCLAW_CHILD_EXPORTS_READY)
+    export_ready = shlex.quote(_OPENCLAW_EXPORT_READY)
     gateway_probe = shlex.quote(_OPENCLAW_GATEWAY_PROBE)
     audit_plugin = shlex.quote(_OPENCLAW_AUDIT_PLUGIN)
     audit_manifest = shlex.quote(json.dumps(_OPENCLAW_AUDIT_PLUGIN_MANIFEST, separators=(",", ":")))
     setup = (
-        f"export PATH={_base_path()}; export HOME={home}; "
+        f"set -eu; export PATH={_base_path()}; export HOME={home}; "
         'rm -rf "$HOME"; mkdir -p "$HOME/.openclaw/shellbench-audit"; '
         f'printf %s {audit_plugin} > "$HOME/.openclaw/shellbench-audit/index.cjs"; '
         f"printf %s {audit_manifest} "
         '> "$HOME/.openclaw/shellbench-audit/openclaw.plugin.json"; '
         f'printf %s {config_json} > "$HOME/.openclaw/openclaw.json"; '
-        "openclaw setup --baseline --skip-bootstrap --workspace . "
+        "openclaw setup --baseline --workspace . "
         ">/logs/agent/setup.log 2>&1; "
         "rm -f AGENTS.md BOOTSTRAP.md HEARTBEAT.md IDENTITY.md "
         "SOUL.md TOOLS.md USER.md; "
@@ -614,6 +447,7 @@ def _openclaw(
     run_command = (
         f"export PATH={_base_path()}; export HOME={home}; "
         f"export OPENCLAW_GATEWAY_TOKEN={shlex.quote(gateway_token)}; "
+        "export SHELLBENCH_WORKSPACE=\"$PWD\"; "
         "log=/logs/agent/openclaw.txt; "
         "gateway_log=/logs/agent/openclaw-gateway.txt; "
         'openclaw gateway --port 18789 >"$gateway_log" 2>&1 & gateway_pid=$!; '
@@ -624,93 +458,66 @@ def _openclaw(
         'kill "$gateway_pid" 2>/dev/null || true; '
         'wait "$gateway_pid" 2>/dev/null || true; '
         'cat "$gateway_log" >&2; exit 70; fi; '
-        "openclaw agent --json --agent main --thinking off "
+        "openclaw agent --json --agent main "
+        f"--thinking {shlex.quote(thinking)} "
         f"--model {shlex.quote(model)} "
         '--message "$(cat /tmp/shellbench-instruction.md)" '
-        '>"$log" 2>&1 </dev/null & pid=$!; '
-        "reaped=0; status=0; "
-        'while kill -0 "$pid" 2>/dev/null; do '
-        f'if python3 -c {completion_probe} "$log"; then '
-        'sleep 1; kill "$pid" 2>/dev/null || true; sleep 1; '
-        'kill -KILL "$pid" 2>/dev/null || true; '
-        'wait "$pid" 2>/dev/null || true; reaped=1; break; '
-        "fi; sleep 1; done; "
-        'if [ "$reaped" -ne 1 ]; then wait "$pid"; status=$?; fi; '
-        'session_ready=0; if [ "$status" -eq 0 ]; then '
-        "for _ in $(seq 1 60); do "
-        f"if python3 -c {session_probe} "
-        '"$HOME/.openclaw/agents/main/sessions" '
-        '"$HOME/.openclaw/shellbench-audit"; then '
-        "session_ready=1; break; fi; "
-        'if ! kill -0 "$gateway_pid" 2>/dev/null; then status=70; break; fi; '
+        '>"$log" 2>&1 </dev/null; status=$?; '
+        'if [ "$status" -eq 0 ]; then '
+        "export_ok=0; for _ in $(seq 1 10); do "
+        'rm -rf .openclaw/trajectory-exports/shellbench-root; '
+        "if openclaw sessions export-trajectory "
+        '--session-key "agent:main:main" --workspace . '
+        '--output shellbench-root --json >>"$log" 2>&1 '
+        f"&& python3 -c {export_ready} "
+        '".openclaw/trajectory-exports/shellbench-root" '
+        f"{shlex.quote(tool_mode)} root; then "
+        "export_ok=1; break; fi; sleep 1; done; "
+        'if [ "$export_ok" -ne 1 ]; then '
+        "echo 'OpenClaw root trajectory export failed' >>\"$log\"; status=71; fi; "
+        "fi; "
+        'if [ "$status" -eq 0 ]; then '
+        "child_wait=0; while true; do "
+        f"python3 -c {child_exports_ready} "
+        '"$HOME/.openclaw/shellbench-audit/sessions.jsonl" '
+        ">/tmp/shellbench-openclaw-child-exports.txt 2>>\"$log\"; "
+        "child_state=$?; "
+        'if [ "$child_state" -eq 0 ]; then break; fi; '
+        'if [ "$child_state" -eq 2 ]; then status=71; break; fi; '
+        'if ! kill -0 "$gateway_pid" 2>/dev/null; then '
+        "echo 'OpenClaw gateway exited while child exports were pending' "
+        '>>"$log"; status=70; break; fi; '
+        "child_wait=$((child_wait + 1)); "
+        'if [ "$child_wait" -ge 300 ]; then '
+        "echo 'OpenClaw child trajectory exports did not settle within 300s' "
+        '>>"$log"; status=71; break; fi; '
         "sleep 1; done; fi; "
-        'if [ "$status" -eq 0 ] && [ "$session_ready" -ne 1 ]; then '
-        "echo 'OpenClaw terminal session evidence did not stabilize within 60 seconds' "
-        '>>"$log"; status=71; fi; '
+        'if [ "$status" -eq 0 ]; then '
+        "while IFS= read -r output; do "
+        '[ -n "$output" ] || continue; '
+        f"if ! python3 -c {export_ready} "
+        '".openclaw/trajectory-exports/$output" '
+        f"{shlex.quote(tool_mode)} child; then "
+        'echo "OpenClaw child trajectory validation failed: $output" '
+        '>>"$log"; status=71; break; fi; '
+        "done </tmp/shellbench-openclaw-child-exports.txt; fi; "
         'kill "$gateway_pid" 2>/dev/null || true; '
         'wait "$gateway_pid" 2>/dev/null || true; '
         'cat "$gateway_log" >>"$log"; cat "$log"; exit "$status"'
     )
-    # Keep this archive path aligned with the pinned OpenClaw 2026.7.1-2
-    # sessions.json/JSONL contract used by the completion probe above.
     cleanup = (
         "python3 - <<'PY'\n"
-        "import json, pathlib, shutil\n"
-        "p=pathlib.Path('/logs/agent/openclaw.txt')\n"
-        "agents=pathlib.Path('/tmp/shellbench-openclaw/.openclaw/agents')\n"
-        "sessions=agents/'main'/'sessions'\n"
+        "import pathlib, shutil\n"
         "archive=pathlib.Path('/logs/agent/openclaw.sessions')\n"
         "audit=pathlib.Path('/tmp/shellbench-openclaw/.openclaw/shellbench-audit')\n"
-        "if agents.is_dir():\n"
-        " for agent in agents.iterdir():\n"
-        "  source=agent/'sessions'\n"
-        "  if not source.is_dir(): continue\n"
-        "  target=archive if agent.name=='main' else archive/'agents'/agent.name\n"
-        "  shutil.copytree(source, target, dirs_exist_ok=True)\n"
+        "exports=pathlib.Path('.openclaw/trajectory-exports')\n"
+        "if exports.is_dir():\n"
+        " shutil.copytree(exports, archive/'exports', dirs_exist_ok=True)\n"
         "if audit.is_dir():\n"
         " shutil.copytree(audit, archive/'audit', dirs_exist_ok=True)\n"
         "if archive.is_dir():\n"
         " for item in [archive, *archive.rglob('*')]:\n"
         "  item.chmod(0o755 if item.is_dir() else 0o644)\n"
-        "sources=[]\n"
-        "try:\n"
-        " raw=p.read_text(encoding='utf-8', errors='replace').strip()\n"
-        " dec=json.JSONDecoder(); d=None\n"
-        " for start in range(len(raw)-1, -1, -1):\n"
-        "  if raw[start] != '{': continue\n"
-        "  try: candidate, _ = dec.raw_decode(raw[start:])\n"
-        "  except (json.JSONDecodeError, ValueError): continue\n"
-        "  if isinstance(candidate, dict) and "
-        "isinstance(candidate.get('meta'), dict):\n"
-        "   d=candidate; break\n"
-        " if d:\n"
-        "  src=((d.get('meta') or {}).get('agentMeta') or {}).get('sessionFile')\n"
-        "  if isinstance(src, str) and src: sources.append(src)\n"
-        "except Exception:\n"
-        " pass\n"
-        "if sessions.is_dir():\n"
-        " try:\n"
-        "  store=json.loads((sessions/'sessions.json').read_text())\n"
-        "  entry=store.get('agent:main:main') if isinstance(store, dict) else None\n"
-        "  if isinstance(entry, dict):\n"
-        "   session_file=entry.get('sessionFile')\n"
-        "   if isinstance(session_file, str) and session_file:\n"
-        "    sources.append(session_file)\n"
-        "   if entry.get('sessionId'):\n"
-        "    sources.append(str(sessions/f\"{entry['sessionId']}.jsonl\"))\n"
-        " except Exception:\n"
-        "  pass\n"
-        "source=None\n"
-        "for src in sources:\n"
-        " candidate=pathlib.Path(src)\n"
-        " if not candidate.is_absolute(): candidate=sessions/candidate\n"
-        " if candidate.is_file():\n"
-        "  source=candidate\n"
-        "  break\n"
-        "if source and source.is_file():\n"
-        " destination=pathlib.Path('/logs/agent/openclaw.session.jsonl')\n"
-        " shutil.copy2(source, destination)\n"
-        " destination.chmod(0o644)\n"
         "PY"
     )
     return HarnessCommand(
