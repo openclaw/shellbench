@@ -697,7 +697,7 @@ def test_bootstrap_retries_external_installer_downloads() -> None:
         Path(__file__).resolve().parents[1] / "scripts/native_eval/bootstrap_beast.sh"
     ).read_text(encoding="utf-8")
 
-    assert script.count("--retry 5 --retry-delay 2 --retry-all-errors --retry-max-time 60") == 2
+    assert script.count("--retry 5 --retry-delay 2 --retry-all-errors --retry-max-time 60") == 3
 
 
 def test_bootstrap_uses_managed_python_for_litellm() -> None:
@@ -720,6 +720,18 @@ def test_bootstrap_scopes_harness_installation() -> None:
     assert "harness_enabled codex" in script
     assert "harness_enabled claude-code" in script
     assert "if harness_enabled hermes; then" in script
+
+
+def test_bootstrap_pins_codex_model_catalogs() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts/native_eval/bootstrap_beast.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "25af12f7e61572b0bc18ddb1008be543b91519b0" in script
+    assert "497d7653bb22358baa29ebd4a70be55ce990b73a64896848a59179485b37db9d" in script
+    assert 'codex-models-$mode.json' in script
+    assert ".models |= map(.tool_mode = $tool_mode)" in script
+    assert 'tool_modes: ["direct", "code_mode_only"]' in script
 
 
 def test_candidate_package_rejects_wrong_npm_identity_before_leasing(

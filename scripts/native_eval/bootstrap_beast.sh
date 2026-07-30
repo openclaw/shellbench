@@ -5,6 +5,8 @@ TOOLCHAIN_ROOT="${TOOLCHAIN_ROOT:-/opt/shellbench-native}"
 NODE_VERSION="${NODE_VERSION:-22.23.1}"
 OPENCLAW_VERSION="${OPENCLAW_VERSION:-2026.7.1-2}"
 CODEX_VERSION="${CODEX_VERSION:-0.145.0}"
+CODEX_MODELS_COMMIT="${CODEX_MODELS_COMMIT:-25af12f7e61572b0bc18ddb1008be543b91519b0}"
+CODEX_MODELS_SHA256="${CODEX_MODELS_SHA256:-497d7653bb22358baa29ebd4a70be55ce990b73a64896848a59179485b37db9d}"
 CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.220}"
 HERMES_COMMIT="${HERMES_COMMIT:-cb06017b1d6e1b9ae0cb35f99a48ffa6bcbaa828}"
 LITELLM_VERSION="${LITELLM_VERSION:-1.93.0}"
@@ -19,6 +21,8 @@ if [[ "$(id -u)" -ne 0 ]]; then
     NODE_VERSION="$NODE_VERSION" \
     OPENCLAW_VERSION="$OPENCLAW_VERSION" \
     CODEX_VERSION="$CODEX_VERSION" \
+    CODEX_MODELS_COMMIT="$CODEX_MODELS_COMMIT" \
+    CODEX_MODELS_SHA256="$CODEX_MODELS_SHA256" \
     CLAUDE_CODE_VERSION="$CLAUDE_CODE_VERSION" \
     HERMES_COMMIT="$HERMES_COMMIT" \
     LITELLM_VERSION="$LITELLM_VERSION" \
@@ -135,6 +139,28 @@ install_node_tools() {
   fi
 }
 
+install_codex_model_catalogs() {
+  local source=/tmp/shellbench-codex-models.json
+  local url="https://raw.githubusercontent.com/openai/codex/$CODEX_MODELS_COMMIT/codex-rs/models-manager/models.json"
+  local mode
+  if ! harness_enabled codex; then
+    return
+  fi
+
+  curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --retry-max-time 60 \
+    "$url" -o "$source"
+  printf '%s  %s\n' "$CODEX_MODELS_SHA256" "$source" | sha256sum -c -
+  for mode in direct code_mode_only; do
+    jq --arg tool_mode "$mode" \
+      '.models |= map(.tool_mode = $tool_mode)' \
+      "$source" > "$TOOLCHAIN_ROOT/codex-models-$mode.json"
+    jq -e --arg tool_mode "$mode" \
+      '.models | length > 0 and all(.[]; .tool_mode == $tool_mode)' \
+      "$TOOLCHAIN_ROOT/codex-models-$mode.json" >/dev/null
+  done
+  rm -f "$source"
+}
+
 install_uv() {
   install -d -m 0755 "$TOOLCHAIN_ROOT/bin"
   if [[ ! -x "$TOOLCHAIN_ROOT/bin/uv" ]]; then
@@ -217,6 +243,8 @@ write_manifest() {
     --arg harness_scope "$SHELLBENCH_HARNESS" \
     --arg openclaw "$openclaw" \
     --arg codex "$codex" \
+    --arg codex_models_commit "$CODEX_MODELS_COMMIT" \
+    --arg codex_models_sha256 "$CODEX_MODELS_SHA256" \
     --arg claude_code "$claude_code" \
     --arg hermes "$hermes" \
     --arg litellm "$("$TOOLCHAIN_ROOT/litellm-venv/bin/python" -c 'from importlib.metadata import version; print(version("litellm"))')" \
@@ -238,6 +266,11 @@ write_manifest() {
         artifact_filename: (if $openclaw_artifact_filename == "" then null else $openclaw_artifact_filename end)
       } end),
       codex: (if $codex == "" then null else $codex end),
+      codex_model_catalog: (if $codex == "" then null else {
+        source_commit: $codex_models_commit,
+        source_sha256: $codex_models_sha256,
+        tool_modes: ["direct", "code_mode_only"]
+      } end),
       claude_code: (if $claude_code == "" then null else $claude_code end),
       hermes: (if $hermes == "" then null else $hermes end),
       hermes_commit: (if $hermes == "" then null else $hermes_commit end),
@@ -249,6 +282,7 @@ write_manifest() {
 install_base_packages
 install_docker
 install_node_tools
+install_codex_model_catalogs
 install_uv
 if harness_enabled hermes; then
   install_hermes
