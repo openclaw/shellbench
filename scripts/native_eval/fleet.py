@@ -228,6 +228,7 @@ class FleetConfig:
     checkpoint_poll_seconds: int = 30
     warmup_capacity_attempts: int = 12
     warmup_capacity_backoff_seconds: float = 5.0
+    warmup_timeout_seconds: float = 15 * 60
     runner_archive: Path | None = None
     runner_commit: str | None = None
     harbor_reference_commit: str = ""
@@ -339,6 +340,8 @@ class FleetController:
             raise ValueError("warmup_capacity_attempts must be at least 1")
         if config.warmup_capacity_backoff_seconds < 0:
             raise ValueError("warmup_capacity_backoff_seconds cannot be negative")
+        if config.warmup_timeout_seconds <= 0:
+            raise ValueError("warmup_timeout_seconds must be positive")
         _validate_model_values(config.model_max_runs, "model_max_runs")
         _validate_model_values(config.provider_max_runs, "provider_max_runs")
         _validate_model_values(config.model_task_concurrency, "model_task_concurrency")
@@ -646,6 +649,7 @@ class FleetController:
                 "warmup_capacity_backoff_seconds": (
                     self.config.warmup_capacity_backoff_seconds
                 ),
+                "warmup_timeout_seconds": self.config.warmup_timeout_seconds,
                 "crabbox_cli_version": self.crabbox_cli_version,
                 "controller_started_at_utc": utc_now(),
             }
@@ -818,7 +822,11 @@ class FleetController:
 
     def _warmup_lease(self, command: Sequence[str], slug: str) -> None:
         for attempt in range(1, self.config.warmup_capacity_attempts + 1):
-            result = self.executor.run(command, capture_output=True)
+            result = self.executor.run_with_timeout(
+                command,
+                capture_output=True,
+                timeout=self.config.warmup_timeout_seconds,
+            )
             if result.returncode == 0:
                 return
             detail = (result.stderr or result.stdout or "").strip()
@@ -1883,6 +1891,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-poll-seconds", type=int, default=30)
     parser.add_argument("--warmup-capacity-attempts", type=int, default=12)
     parser.add_argument("--warmup-capacity-backoff-seconds", type=float, default=5.0)
+    parser.add_argument("--warmup-timeout-seconds", type=float, default=15 * 60)
     parser.add_argument("--runner-archive", type=Path)
     parser.add_argument("--runner-commit")
     parser.add_argument("--harbor-reference-commit", default="")
@@ -1945,6 +1954,7 @@ def main(argv: list[str] | None = None) -> int:
         checkpoint_poll_seconds=args.checkpoint_poll_seconds,
         warmup_capacity_attempts=args.warmup_capacity_attempts,
         warmup_capacity_backoff_seconds=args.warmup_capacity_backoff_seconds,
+        warmup_timeout_seconds=args.warmup_timeout_seconds,
         runner_archive=args.runner_archive,
         runner_commit=args.runner_commit,
         harbor_reference_commit=args.harbor_reference_commit,

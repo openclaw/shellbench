@@ -328,6 +328,7 @@ class FakeExecutor:
         self.dispatch_attempts: dict[str, int] = {}
         self.leases: dict[str, dict[str, object]] = {}
         self.commands: list[list[str]] = []
+        self.timeout_calls: list[tuple[list[str], float]] = []
         self.events: list[tuple[str, str]] = []
         self.dispatches: list[str] = []
         self.dispatch_concurrency: dict[str, int] = {}
@@ -495,6 +496,16 @@ class FakeExecutor:
 
         return _result(argv, 0)
 
+    def run_with_timeout(
+        self,
+        command: Sequence[str],
+        *,
+        capture_output: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        self.timeout_calls.append((list(command), timeout))
+        return self.run(command, capture_output=capture_output)
+
     def wait_for_dispatch(self, run_label: str, timeout: float) -> bool:
         with self._dispatch_condition:
             return self._dispatch_condition.wait_for(
@@ -530,6 +541,7 @@ def _config(
     model_task_concurrency: dict[str, int] | None = None,
     warmup_capacity_attempts: int = 12,
     warmup_capacity_backoff_seconds: float = 0,
+    warmup_timeout_seconds: float = 15 * 60,
     parity_validated_routes: frozenset[tuple[str, str]] = frozenset(),
     openclaw_package_tarball: Path | None = None,
 ) -> FleetConfig:
@@ -557,6 +569,7 @@ def _config(
         checkpoint_poll_seconds=1,
         warmup_capacity_attempts=warmup_capacity_attempts,
         warmup_capacity_backoff_seconds=warmup_capacity_backoff_seconds,
+        warmup_timeout_seconds=warmup_timeout_seconds,
         parity_validated_routes=parity_validated_routes,
     )
 
@@ -1039,6 +1052,12 @@ def test_capacity_warmup_retries_same_run_without_recovery_churn(
         "capacity-retry": 3,
         "untouched": 1,
     }
+    assert [timeout for _command, timeout in executor.timeout_calls[:4]] == [
+        15 * 60,
+        15 * 60,
+        15 * 60,
+        15 * 60,
+    ]
     assert executor.dispatches == [retry_label, untouched_label]
 
 
