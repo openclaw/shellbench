@@ -628,7 +628,10 @@ def test_controller_rejects_retired_openclaw_tool_search_mode(
     config = _config(tmp_path, run_index)
 
     with pytest.raises(FleetError, match="replace it with openclaw_tool_mode"):
-        FleetController(config, executor=FakeExecutor(config.local_root))
+        FleetController(
+            config,
+            executor=FakeExecutor(config.local_root, expected_counts={label: 2}),
+        ).run()
 
 
 def test_controller_accepts_empty_retired_openclaw_tool_search_mode(
