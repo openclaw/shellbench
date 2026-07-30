@@ -428,7 +428,9 @@ def _openclaw(
             }
         },
         "plugins": {
+            "allow": ["openai", "shellbench-audit"],
             "load": {"paths": [audit_plugin_root]},
+            "slots": {"memory": "none"},
             "entries": {"shellbench-audit": {"enabled": True}},
         },
         "tools": {
@@ -451,6 +453,7 @@ def _openclaw(
     audit_manifest = shlex.quote(json.dumps(_OPENCLAW_AUDIT_PLUGIN_MANIFEST, separators=(",", ":")))
     setup = (
         f"set -eu; export PATH={_base_path()}; export HOME={home}; "
+        'export OPENCLAW_STATE_DIR="$HOME/.openclaw"; '
         'rm -rf "$HOME"; mkdir -p "$HOME/.openclaw/shellbench-audit"; '
         f'printf %s {audit_plugin} > "$HOME/.openclaw/shellbench-audit/index.cjs"; '
         f"printf %s {audit_manifest} "
@@ -464,6 +467,7 @@ def _openclaw(
     )
     run_command = (
         f"export PATH={_base_path()}; export HOME={home}; "
+        'export OPENCLAW_STATE_DIR="$HOME/.openclaw"; '
         f"export OPENCLAW_GATEWAY_TOKEN={shlex.quote(gateway_token)}; "
         "export SHELLBENCH_WORKSPACE=\"$PWD\"; "
         "log=/logs/agent/openclaw.txt; "

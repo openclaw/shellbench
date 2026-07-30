@@ -113,12 +113,17 @@ def write_openclaw_trajectory(
     elif not terminal_event_seen and envelope is not None:
         terminal_event_seen = _openclaw_envelope_terminal(envelope)
     visible_tools = export_metadata.get("export_visible_tools")
+    provider_transcript_used = (
+        export_metadata.get("export_branch_used") is True
+        or export_metadata.get("export_snapshot_used") is True
+    )
     tool_mode_observed = (
         export_metadata.get("export_provider_visible_tools_recorded") is True
         and isinstance(visible_tools, list)
         and {"exec", "wait"} <= set(visible_tools)
         and not _OPENCLAW_CODE_MODE_HIDDEN_TOOLS & set(visible_tools)
-        and export_metadata.get("export_snapshot_used") is True
+        and export_metadata.get("export_snapshot_available") is True
+        and provider_transcript_used
         if run.openclaw_tool_mode == "code" and export_metadata
         else True
     )
@@ -128,6 +133,12 @@ def write_openclaw_trajectory(
         if export_metadata
         else True
     )
+    provider_transcript_complete = (
+        export_metadata.get("export_provider_outcome") != "unresolved_tool_call"
+        and export_metadata.get("export_provider_pending_tool_call_count", 0) == 0
+        if export_metadata.get("export_branch_used") is True
+        else snapshot_complete
+    )
     if (
         export_metadata.get("export_valid") is False
         or (
@@ -135,6 +146,7 @@ def write_openclaw_trajectory(
             and export_metadata.get("export_terminal_status") != "success"
         )
         or not snapshot_complete
+        or not provider_transcript_complete
         or not tool_mode_observed
         or session_tree_validation["session_tree_complete"] is not True
     ):
@@ -146,6 +158,7 @@ def write_openclaw_trajectory(
             extra_validation={
                 "terminal_event_seen": terminal_event_seen,
                 "snapshot_complete": snapshot_complete,
+                "provider_transcript_complete": provider_transcript_complete,
                 "tool_mode_observed": tool_mode_observed,
                 "parent_models": sorted(parent_models),
                 "child_models": sorted(normalized_child_models),
@@ -742,14 +755,17 @@ def _openclaw_session_records(path: Path) -> list[dict[str, Any]]:
         if bundle is None:
             return []
         _, branch, events = bundle
-        records = _openclaw_export_snapshot_records(events)
+        # The exported branch is the provider-visible transcript. The runtime
+        # snapshot also contains Code Mode's nested bridge calls so the agent
+        # can resume them, but those are not separate model tool calls.
+        entries = branch.get("entries")
+        records = (
+            [entry for entry in entries if isinstance(entry, dict)]
+            if isinstance(entries, list)
+            else []
+        )
         if not records:
-            entries = branch.get("entries")
-            records = (
-                [entry for entry in entries if isinstance(entry, dict)]
-                if isinstance(entries, list)
-                else []
-            )
+            records = _openclaw_export_snapshot_records(events)
         header = branch.get("header")
         return [header, *records] if isinstance(header, dict) else records
     records: list[dict[str, Any]] = []
@@ -943,7 +959,7 @@ def _openclaw_export_metadata(path: Path) -> dict[str, Any]:
     bundle = _openclaw_export_bundle(path)
     if bundle is None:
         return {"export_valid": False}
-    manifest, _, events = bundle
+    manifest, branch, events = bundle
     terminal, completion, context = _openclaw_export_runtime_turn(events)
     completion_data = completion.get("data") if isinstance(completion, dict) else None
     context_data = context.get("data") if isinstance(context, dict) else None
@@ -952,6 +968,16 @@ def _openclaw_export_metadata(path: Path) -> dict[str, Any]:
     )
     snapshot_records = _openclaw_export_snapshot_records(events)
     snapshot_diagnostics = _openclaw_export_snapshot_diagnostics(snapshot_records)
+    entries = branch.get("entries")
+    branch_records = (
+        [entry for entry in entries if isinstance(entry, dict)]
+        if isinstance(entries, list)
+        else []
+    )
+    branch_diagnostics = {
+        key.replace("export_snapshot_", "export_provider_"): value
+        for key, value in _openclaw_export_snapshot_diagnostics(branch_records).items()
+    }
     provider_visible_tools_recorded = (
         isinstance(context_data, dict) and "providerVisibleTools" in context_data
     )
@@ -985,8 +1011,11 @@ def _openclaw_export_metadata(path: Path) -> dict[str, Any]:
             else None
         ),
         "export_snapshot_recorded": snapshot_recorded,
-        "export_snapshot_used": bool(snapshot_records),
+        "export_snapshot_available": bool(snapshot_records),
+        "export_snapshot_used": bool(snapshot_records) and not bool(branch_records),
         **snapshot_diagnostics,
+        "export_branch_used": bool(branch_records),
+        **branch_diagnostics,
         "export_provider_visible_tools_recorded": provider_visible_tools_recorded,
         "export_visible_tools": visible_tool_names,
         "export_model": completion.get("modelId") if isinstance(completion, dict) else None,

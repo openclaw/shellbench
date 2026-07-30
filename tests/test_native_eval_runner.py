@@ -1012,8 +1012,11 @@ def test_openclaw_harness_uses_direct_tools_by_default() -> None:
     assert '"codeMode":false' in command.setup_command
     assert '"toolSearch":false' in command.setup_command
     assert '"allow":["group:runtime","group:fs","bundle-mcp"]' in command.setup_command
+    assert '"allow":["openai","shellbench-audit"]' in command.setup_command
+    assert '"slots":{"memory":"none"}' in command.setup_command
+    assert 'export OPENCLAW_STATE_DIR="$HOME/.openclaw"' in command.setup_command
+    assert 'export OPENCLAW_STATE_DIR="$HOME/.openclaw"' in command.run_command
     assert '"deny":["message","computer"]' not in command.setup_command
-    assert '"deny":["message","computer"]' in command.setup_command
 
 
 def test_openclaw_harness_configures_code_mode() -> None:
@@ -2361,11 +2364,14 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
     assert metadata["trajectory_validation"]["trace_fidelity"] == "session"
     assert metadata["trajectory_validation"]["session_tree_session_count"] == 1
     assert metadata["trajectory_validation"]["export_snapshot_recorded"] is True
-    assert metadata["trajectory_validation"]["export_snapshot_used"] is True
+    assert metadata["trajectory_validation"]["export_snapshot_used"] is False
+    assert metadata["trajectory_validation"]["export_branch_used"] is True
     assert metadata["trajectory_validation"]["export_snapshot_outcome"] == "assistant_text"
     assert metadata["trajectory_validation"]["export_snapshot_tool_call_count"] == 2
     assert metadata["trajectory_validation"]["export_snapshot_tool_result_count"] == 2
     assert metadata["trajectory_validation"]["export_snapshot_tool_error_count"] == 0
+    assert metadata["trajectory_validation"]["export_provider_tool_call_count"] == 1
+    assert metadata["trajectory_validation"]["export_provider_tool_result_count"] == 1
     assert (
         metadata["trajectory_validation"]["export_snapshot_pending_tool_call_count"]
         == 0
@@ -2379,9 +2385,14 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
     ]
     assert metadata["trajectory_validation"]["tool_mode_observed"] is True
     assert trajectory["session_id"] == "session-export-123"
+    assert len(trajectory["steps"]) == 3
     assert trajectory["steps"][1]["tool_calls"][0]["function_name"] == "exec"
-    assert trajectory["steps"][2]["tool_calls"][0]["function_name"] == "shell"
-    assert trajectory["steps"][2]["observation"]["results"][0]["content"] == "/app"
+    assert trajectory["steps"][1]["observation"]["results"][0]["content"] == "code completed"
+    assert all(
+        call["function_name"] != "shell"
+        for step in trajectory["steps"]
+        for call in step.get("tool_calls", [])
+    )
     assert trajectory["steps"][-1]["message"] == "done"
     assert trajectory["final_metrics"]["total_prompt_tokens"] == 22
     assert trajectory["final_metrics"]["total_completion_tokens"] == 5
