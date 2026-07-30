@@ -397,6 +397,7 @@ def _openclaw(
             "defaults": {
                 "workspace": ".",
                 "skipBootstrap": True,
+                "skills": [],
                 "model": {"primary": model},
                 "thinkingDefault": thinking,
                 "subagents": {"model": model, "thinking": thinking},

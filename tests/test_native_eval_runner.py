@@ -1011,6 +1011,7 @@ def test_openclaw_harness_uses_direct_tools_by_default() -> None:
 
     assert '"codeMode":false' in command.setup_command
     assert '"toolSearch":false' in command.setup_command
+    assert '"skills":[]' in command.setup_command
     assert '"allow":["group:runtime","group:fs","bundle-mcp"]' in command.setup_command
     assert '"allow":["openai","shellbench-audit"]' in command.setup_command
     assert '"slots":{"memory":"none"}' in command.setup_command
