@@ -315,6 +315,7 @@ module.exports = {
 
 _OPENCLAW_AUDIT_PLUGIN_MANIFEST = {
     "id": "shellbench-audit",
+    "activation": {"onCapabilities": ["hook"]},
     "configSchema": {
         "type": "object",
         "additionalProperties": False,
@@ -475,6 +476,16 @@ def _openclaw(
         'kill "$gateway_pid" 2>/dev/null || true; '
         'wait "$gateway_pid" 2>/dev/null || true; '
         'cat "$gateway_log" >&2; exit 70; fi; '
+        "audit_ready=0; for _ in $(seq 1 10); do "
+        f"if python3 -c {child_exports_ready} "
+        '"$HOME/.openclaw/shellbench-audit/sessions.jsonl" '
+        ">/tmp/shellbench-openclaw-child-exports.txt 2>>\"$gateway_log\"; then "
+        "audit_ready=1; break; fi; sleep 1; done; "
+        'if [ "$audit_ready" -ne 1 ]; then '
+        "echo 'OpenClaw ShellBench audit plugin did not start' >>\"$gateway_log\"; "
+        'kill "$gateway_pid" 2>/dev/null || true; '
+        'wait "$gateway_pid" 2>/dev/null || true; '
+        'cat "$gateway_log" >&2; exit 72; fi; '
         "openclaw agent --json --agent main "
         f"--thinking {shlex.quote(thinking)} "
         f"--model {shlex.quote(model)} "

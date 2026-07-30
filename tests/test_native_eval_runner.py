@@ -958,6 +958,7 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
             assert '"agentRuntime":{"id":"openclaw"}' in command.setup_command
             assert '"shellbench-audit":{"enabled":true}' in command.setup_command
             assert "openclaw.plugin.json" in command.setup_command
+            assert '"activation":{"onCapabilities":["hook"]}' in command.setup_command
             assert '"configSchema":{"type":"object"' in command.setup_command
             assert 'api.on("subagent_spawned"' in command.setup_command
             assert 'api.on("subagent_progress"' in command.setup_command
@@ -968,6 +969,9 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
             assert "exportsByRun" in command.setup_command
             assert "zstdDecompressSync" not in command.setup_command
             assert "shellbench-openclaw-child-exports.txt" in command.run_command
+            assert "audit_ready=0" in command.run_command
+            assert "ShellBench audit plugin did not start" in command.run_command
+            assert "exit 72" in command.run_command
             assert 'kill -0 "$gateway_pid"' in command.run_command
             assert "child_wait" in command.run_command
             assert "did not settle within 300s" in command.run_command
