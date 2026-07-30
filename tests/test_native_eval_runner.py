@@ -2014,7 +2014,13 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
             "runId": "run-1",
             "data": {
                 "tools": [{"name": "shell"}, {"name": "read"}],
-                "providerVisibleTools": [{"name": "exec"}, {"name": "wait"}],
+                "providerVisibleTools": [
+                    {"name": "computer"},
+                    {"name": "exec"},
+                    {"name": "image"},
+                    {"name": "sessions_yield"},
+                    {"name": "wait"},
+                ],
             },
         },
         {
@@ -2152,8 +2158,24 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
     assert metadata["trajectory_status"] == "real"
     assert metadata["trajectory_validation"]["trace_fidelity"] == "session"
     assert metadata["trajectory_validation"]["session_tree_session_count"] == 1
+    assert metadata["trajectory_validation"]["export_snapshot_recorded"] is True
     assert metadata["trajectory_validation"]["export_snapshot_used"] is True
-    assert metadata["trajectory_validation"]["export_visible_tools"] == ["exec", "wait"]
+    assert metadata["trajectory_validation"]["export_snapshot_outcome"] == "assistant_text"
+    assert metadata["trajectory_validation"]["export_snapshot_tool_call_count"] == 2
+    assert metadata["trajectory_validation"]["export_snapshot_tool_result_count"] == 2
+    assert metadata["trajectory_validation"]["export_snapshot_tool_error_count"] == 0
+    assert (
+        metadata["trajectory_validation"]["export_snapshot_pending_tool_call_count"]
+        == 0
+    )
+    assert metadata["trajectory_validation"]["export_provider_visible_tools_recorded"] is True
+    assert metadata["trajectory_validation"]["export_visible_tools"] == [
+        "computer",
+        "exec",
+        "image",
+        "sessions_yield",
+        "wait",
+    ]
     assert metadata["trajectory_validation"]["tool_mode_observed"] is True
     assert trajectory["session_id"] == "session-export-123"
     assert trajectory["steps"][1]["tool_calls"][0]["function_name"] == "exec"
@@ -2177,8 +2199,139 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
         ).returncode
         == 0
     )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "direct",
+                "root",
+            ],
+            check=False,
+        ).returncode
+        == 0
+    )
     latest_completion = runtime_events[2]
     terminal_event = runtime_events[3]
+    bookkeeping = {"role": "system", "content": "runtime bookkeeping"}
+    latest_completion["data"]["messagesSnapshot"] = [*snapshot, bookkeeping]
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    bookkeeping_metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    assert bookkeeping_metadata["trajectory_status"] == "real"
+    assert (
+        bookkeeping_metadata["trajectory_validation"]["export_snapshot_outcome"]
+        == "assistant_text"
+    )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "root",
+            ],
+            check=False,
+        ).returncode
+        == 0
+    )
+    failed_exec_result = {**exec_result, "isError": True}
+    latest_completion["data"]["messagesSnapshot"] = [
+        user,
+        exec_call,
+        failed_exec_result,
+        bookkeeping,
+    ]
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    failed_tool_metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    assert failed_tool_metadata["trajectory_status"] == "real"
+    assert (
+        failed_tool_metadata["trajectory_validation"]["export_snapshot_outcome"]
+        == "tool_error"
+    )
+    assert (
+        failed_tool_metadata["trajectory_validation"]["export_snapshot_tool_error_count"]
+        == 1
+    )
+    for tool_mode in ("direct", "code"):
+        assert (
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    _OPENCLAW_EXPORT_READY,
+                    str(bundle),
+                    tool_mode,
+                    "root",
+                ],
+                check=False,
+            ).returncode
+            == 0
+        )
+    latest_completion["data"]["messagesSnapshot"] = [
+        user,
+        exec_call,
+        failed_exec_result,
+        final,
+        bookkeeping,
+    ]
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    recovered_tool_metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    assert recovered_tool_metadata["trajectory_status"] == "real"
+    assert (
+        recovered_tool_metadata["trajectory_validation"]["export_snapshot_outcome"]
+        == "assistant_text"
+    )
+    assert (
+        recovered_tool_metadata["trajectory_validation"]["export_snapshot_tool_error_count"]
+        == 1
+    )
+    latest_completion["data"]["messagesSnapshot"] = [user, exec_call, bookkeeping]
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    unresolved_tool_metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    assert unresolved_tool_metadata["trajectory_status"] == "real"
+    assert (
+        unresolved_tool_metadata["trajectory_validation"]["export_snapshot_outcome"]
+        == "unresolved_tool_call"
+    )
+    assert (
+        unresolved_tool_metadata["trajectory_validation"][
+            "export_snapshot_pending_tool_call_count"
+        ]
+        == 1
+    )
+    latest_completion["data"]["messagesSnapshot"] = snapshot
     terminal_event["data"] = {"status": "error"}
     (bundle / "events.jsonl").write_text(
         "".join(json.dumps(event) + "\n" for event in events),
@@ -2271,9 +2424,76 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
         agent_dir,
     )
     assert empty_visible_metadata["trajectory_status"] == "unavailable"
+    assert (
+        empty_visible_metadata["trajectory_validation"][
+            "export_provider_visible_tools_recorded"
+        ]
+        is True
+    )
     assert empty_visible_metadata["trajectory_validation"]["export_visible_tools"] == []
     assert empty_visible_metadata["trajectory_validation"]["tool_mode_observed"] is False
     runtime_events[0]["data"]["tools"] = [{"name": "shell"}, {"name": "read"}]
+    runtime_events[0]["data"].pop("providerVisibleTools")
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "root",
+            ],
+            check=False,
+        ).returncode
+        == 1
+    )
+    missing_visible_metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    assert missing_visible_metadata["trajectory_status"] == "unavailable"
+    assert (
+        missing_visible_metadata["trajectory_validation"][
+            "export_provider_visible_tools_recorded"
+        ]
+        is False
+    )
+    runtime_events[0]["data"]["providerVisibleTools"] = [
+        {"name": "exec"},
+        {"name": "tool_search"},
+        {"name": "wait"},
+    ]
+    (bundle / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "root",
+            ],
+            check=False,
+        ).returncode
+        == 1
+    )
+    visible_search_metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    assert visible_search_metadata["trajectory_status"] == "unavailable"
+    assert visible_search_metadata["trajectory_validation"]["tool_mode_observed"] is False
     runtime_events[0]["data"]["providerVisibleTools"] = [
         {"name": "exec"},
         {"name": "wait"},

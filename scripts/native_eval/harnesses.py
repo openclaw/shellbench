@@ -170,19 +170,20 @@ if mode == "code" and completion is not None:
         None,
     )
     data = context.get("data") if isinstance(context, dict) else None
-    tools = None
-    if isinstance(data, dict):
-        tools = (
-            data.get("providerVisibleTools")
-            if "providerVisibleTools" in data
-            else data.get("tools")
-        )
+    if not isinstance(data, dict) or "providerVisibleTools" not in data:
+        sys.exit(1)
+    tools = data.get("providerVisibleTools")
     names = sorted(
         tool.get("name")
         for tool in tools
         if isinstance(tool, dict) and isinstance(tool.get("name"), str)
     ) if isinstance(tools, list) else []
-    if names != ["exec", "wait"]:
+    name_set = set(names)
+    if (
+        not {"exec", "wait"} <= name_set
+        or name_set
+        & {"tool_search_code", "tool_search", "tool_describe", "tool_call"}
+    ):
         sys.exit(1)
 """
 

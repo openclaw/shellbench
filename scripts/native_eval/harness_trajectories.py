@@ -16,6 +16,12 @@ _OPENCLAW_FATAL_EXPORT_WARNINGS = {
     "cyclic-session-branch",
     "incomplete-session-branch",
 }
+_OPENCLAW_CODE_MODE_HIDDEN_TOOLS = {
+    "tool_call",
+    "tool_describe",
+    "tool_search",
+    "tool_search_code",
+}
 
 
 def load_openclaw_envelope(path: Path) -> dict[str, Any] | None:
@@ -108,7 +114,10 @@ def write_openclaw_trajectory(
         terminal_event_seen = _openclaw_envelope_terminal(envelope)
     visible_tools = export_metadata.get("export_visible_tools")
     tool_mode_observed = (
-        visible_tools == ["exec", "wait"]
+        export_metadata.get("export_provider_visible_tools_recorded") is True
+        and isinstance(visible_tools, list)
+        and {"exec", "wait"} <= set(visible_tools)
+        and not _OPENCLAW_CODE_MODE_HIDDEN_TOOLS & set(visible_tools)
         and export_metadata.get("export_snapshot_used") is True
         if run.openclaw_tool_mode == "code" and export_metadata
         else True
@@ -864,6 +873,59 @@ def _openclaw_export_snapshot_records(
     return records
 
 
+def _openclaw_export_snapshot_diagnostics(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    pending: set[str] = set()
+    tool_call_count = 0
+    tool_result_count = 0
+    tool_error_count = 0
+    terminal_outcome = "unknown"
+    for record in records:
+        message = record.get("message")
+        if record.get("type") != "message" or not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "assistant":
+            text, tools = _openclaw_assistant_content(message.get("content"))
+            for tool in tools:
+                call_id = tool.get("tool_call_id")
+                if isinstance(call_id, str) and call_id:
+                    pending.add(call_id)
+                tool_call_count += 1
+            terminal_assistant_text = (
+                bool(text.strip())
+                and not tools
+                and str(message.get("stopReason") or "").lower() in {"end_turn", "stop"}
+            )
+            terminal_outcome = (
+                "assistant_text"
+                if terminal_assistant_text
+                else "unresolved_tool_call"
+                if tools
+                else "unknown"
+            )
+        elif role == "toolResult":
+            tool_result_count += 1
+            call_id = message.get("toolCallId")
+            if isinstance(call_id, str) and call_id:
+                pending.discard(call_id)
+            is_error = message.get("isError") is True
+            if is_error:
+                tool_error_count += 1
+            terminal_outcome = "tool_error" if is_error else "resolved_tool_result"
+        elif role in {"user"}:
+            terminal_outcome = "unknown"
+    outcome = "unresolved_tool_call" if pending else terminal_outcome
+    return {
+        "export_snapshot_outcome": outcome,
+        "export_snapshot_tool_call_count": tool_call_count,
+        "export_snapshot_tool_result_count": tool_result_count,
+        "export_snapshot_tool_error_count": tool_error_count,
+        "export_snapshot_pending_tool_call_count": len(pending),
+    }
+
+
 def _openclaw_export_metadata(path: Path) -> dict[str, Any]:
     if path.name != "session-branch.json":
         return {}
@@ -874,6 +936,14 @@ def _openclaw_export_metadata(path: Path) -> dict[str, Any]:
     terminal, completion, context = _openclaw_export_runtime_turn(events)
     completion_data = completion.get("data") if isinstance(completion, dict) else None
     context_data = context.get("data") if isinstance(context, dict) else None
+    snapshot_recorded = (
+        isinstance(completion_data, dict) and "messagesSnapshot" in completion_data
+    )
+    snapshot_records = _openclaw_export_snapshot_records(events)
+    snapshot_diagnostics = _openclaw_export_snapshot_diagnostics(snapshot_records)
+    provider_visible_tools_recorded = (
+        isinstance(context_data, dict) and "providerVisibleTools" in context_data
+    )
     visible_tools = None
     if isinstance(context_data, dict):
         visible_tools = (
@@ -903,7 +973,10 @@ def _openclaw_export_metadata(path: Path) -> dict[str, Any]:
             if isinstance(terminal, dict) and isinstance(terminal.get("data"), dict)
             else None
         ),
-        "export_snapshot_used": bool(_openclaw_export_snapshot_records(events)),
+        "export_snapshot_recorded": snapshot_recorded,
+        "export_snapshot_used": bool(snapshot_records),
+        **snapshot_diagnostics,
+        "export_provider_visible_tools_recorded": provider_visible_tools_recorded,
         "export_visible_tools": visible_tool_names,
         "export_model": completion.get("modelId") if isinstance(completion, dict) else None,
         "export_usage": (
