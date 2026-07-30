@@ -122,12 +122,19 @@ def write_openclaw_trajectory(
         if run.openclaw_tool_mode == "code" and export_metadata
         else True
     )
+    snapshot_complete = (
+        export_metadata.get("export_snapshot_outcome") != "unresolved_tool_call"
+        and export_metadata.get("export_snapshot_pending_tool_call_count", 0) == 0
+        if export_metadata
+        else True
+    )
     if (
         export_metadata.get("export_valid") is False
         or (
             export_metadata
             and export_metadata.get("export_terminal_status") != "success"
         )
+        or not snapshot_complete
         or not tool_mode_observed
         or session_tree_validation["session_tree_complete"] is not True
     ):
@@ -138,6 +145,7 @@ def write_openclaw_trajectory(
             observed_models=observed_models,
             extra_validation={
                 "terminal_event_seen": terminal_event_seen,
+                "snapshot_complete": snapshot_complete,
                 "tool_mode_observed": tool_mode_observed,
                 "parent_models": sorted(parent_models),
                 "child_models": sorted(normalized_child_models),

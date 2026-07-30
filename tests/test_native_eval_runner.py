@@ -931,6 +931,7 @@ def test_openclaw_harness_uses_direct_tools_by_default() -> None:
 
     assert '"codeMode":false' in command.setup_command
     assert '"toolSearch":false' in command.setup_command
+    assert '"deny":["message","computer"]' in command.setup_command
 
 
 def test_openclaw_harness_configures_code_mode() -> None:
@@ -2068,7 +2069,6 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
             "data": {
                 "tools": [{"name": "shell"}, {"name": "read"}],
                 "providerVisibleTools": [
-                    {"name": "computer"},
                     {"name": "exec"},
                     {"name": "image"},
                     {"name": "sessions_yield"},
@@ -2223,7 +2223,6 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
     )
     assert metadata["trajectory_validation"]["export_provider_visible_tools_recorded"] is True
     assert metadata["trajectory_validation"]["export_visible_tools"] == [
-        "computer",
         "exec",
         "image",
         "sessions_yield",
@@ -2373,7 +2372,7 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
         run,
         agent_dir,
     )
-    assert unresolved_tool_metadata["trajectory_status"] == "real"
+    assert unresolved_tool_metadata["trajectory_status"] == "unavailable"
     assert (
         unresolved_tool_metadata["trajectory_validation"]["export_snapshot_outcome"]
         == "unresolved_tool_call"
@@ -2383,6 +2382,9 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
             "export_snapshot_pending_tool_call_count"
         ]
         == 1
+    )
+    assert (
+        unresolved_tool_metadata["trajectory_validation"]["snapshot_complete"] is False
     )
     latest_completion["data"]["messagesSnapshot"] = snapshot
     terminal_event["data"] = {"status": "error"}
