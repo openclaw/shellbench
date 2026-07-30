@@ -14,6 +14,12 @@ TOOLCHAIN_ROOT = PurePosixPath("/opt/shellbench-native")
 NODE_BIN = TOOLCHAIN_ROOT / "node" / "bin"
 NPM_BIN = TOOLCHAIN_ROOT / "npm-packages" / "node_modules" / ".bin"
 HERMES_BIN = TOOLCHAIN_ROOT / "home" / ".local" / "bin"
+_CODEX_MODELS_URL = (
+    "https://raw.githubusercontent.com/openai/codex/"
+    "25af12f7e61572b0bc18ddb1008be543b91519b0/"
+    "codex-rs/models-manager/models.json"
+)
+_CODEX_MODELS_SHA256 = "497d7653bb22358baa29ebd4a70be55ce990b73a64896848a59179485b37db9d"
 
 _OPENCLAW_CHILD_EXPORTS_READY = """\
 import json
@@ -644,8 +650,18 @@ def _codex(
     mcp_servers: tuple[McpServer, ...],
 ) -> HarnessCommand:
     home = "/tmp/shellbench-codex"
-    code_mode_flag = "--enable code_mode_only " if run.codex_tool_mode == "code" else ""
-    config_lines = [f'openai_base_url = "{proxy_url.rstrip("/")}/v1"']
+    models_source = f"{home}/models-upstream.json"
+    models_path = f"{home}/models.json"
+    tool_mode = "code_mode_only" if run.codex_tool_mode == "code" else "direct"
+    mode_flags = (
+        "--enable code_mode_only "
+        if run.codex_tool_mode == "code"
+        else "--disable code_mode_only --disable code_mode "
+    )
+    config_lines = [
+        f'openai_base_url = "{proxy_url.rstrip("/")}/v1"',
+        f'model_catalog_json = "{models_path}"',
+    ]
     for server in mcp_servers:
         config_lines.append(f"[mcp_servers.{server.name}]")
         if server.transport == "stdio":
@@ -658,6 +674,15 @@ def _codex(
     setup = (
         f"export PATH={_base_path()}; export CODEX_HOME={home}; "
         'rm -rf "$CODEX_HOME"; mkdir -p "$CODEX_HOME"; '
+        f"curl -fsSL {_CODEX_MODELS_URL} -o {models_source}; "
+        f"printf '%s  %s\\n' {_CODEX_MODELS_SHA256} {models_source} "
+        "| sha256sum -c -; "
+        f"jq --arg model {shlex.quote(run.model_id)} "
+        f"--arg tool_mode {shlex.quote(tool_mode)} "
+        "'{models: [.models[] | select(.slug == $model) "
+        "| .tool_mode = $tool_mode]}' "
+        f"{models_source} > {models_path}; "
+        f'test "$(jq ".models | length" {models_path})" -eq 1; '
         f'printf %s {auth_json} > "$CODEX_HOME/auth.json"; '
         f'printf %s {config_text} > "$CODEX_HOME/config.toml"'
     )
@@ -665,7 +690,7 @@ def _codex(
         f"export PATH={_base_path()}; export CODEX_HOME={home}; "
         "codex exec --dangerously-bypass-approvals-and-sandbox "
         "--skip-git-repo-check "
-        f"{code_mode_flag}"
+        f"{mode_flags}"
         f"--model {shlex.quote(run.model_id)} "
         "--json --enable unified_exec -- "
         '"$(cat /tmp/shellbench-instruction.md)" '

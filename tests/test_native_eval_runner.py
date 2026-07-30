@@ -1091,6 +1091,11 @@ def test_codex_harness_configures_code_mode() -> None:
     )
 
     assert "--enable code_mode_only" in command.run_command
+    assert "--arg tool_mode code_mode_only" in command.setup_command
+    assert 'model_catalog_json = \\"/tmp/shellbench-codex/models.json\\"' in command.setup_command
+    assert "497d7653bb22358baa29ebd4a70be55ce990b73a64896848a59179485b37db9d" in (
+        command.setup_command
+    )
 
 
 def test_codex_harness_uses_direct_tools_by_default() -> None:
@@ -1114,7 +1119,8 @@ def test_codex_harness_uses_direct_tools_by_default() -> None:
         mcp_servers=(),
     )
 
-    assert "--enable code_mode_only" not in command.run_command
+    assert "--disable code_mode_only --disable code_mode" in command.run_command
+    assert "--arg tool_mode direct" in command.setup_command
 
 
 def test_openclaw_child_exports_wait_for_every_spawned_session(
