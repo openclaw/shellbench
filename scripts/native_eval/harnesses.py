@@ -582,12 +582,10 @@ def _openclaw(
         },
         "tools": {
             "deny": ["message"],
+            "codeMode": run.openclaw_tool_mode == "code",
             "toolSearch": (
-                {
-                    "enabled": True,
-                    "mode": run.openclaw_tool_search_mode,
-                }
-                if run.openclaw_tool_search_mode
+                {"enabled": True, "mode": "directory"}
+                if run.openclaw_tool_mode == "directory"
                 else False
             ),
         },
