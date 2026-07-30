@@ -33,6 +33,7 @@ from scripts.native_eval.models import (
 from scripts.native_eval import plan as native_plan
 from scripts.native_eval.proxy import JUDGE_PROXY_MODEL_NAME, write_proxy_config
 from scripts.native_eval.run_job import (
+    _execution_acceptance,
     _git_commit,
     _run_manifest,
     build_run_spec,
@@ -40,8 +41,10 @@ from scripts.native_eval.run_job import (
 )
 from scripts.native_eval.runtime import (
     DockerTaskEnvironment,
+    NonZeroAgentExitCodeError,
     build_judge_env,
     collect_agent_metrics,
+    execution_outcome,
     read_reward,
     write_agent_trajectory,
 )
@@ -57,6 +60,48 @@ def test_matrix_plan_contains_only_requested_models_and_harnesses() -> None:
     assert {run.harness for run in plan} == {harness.name for harness in HARNESSES}
     assert {run.model_slug for run in plan} == {model.slug for model in MODELS}
     assert {run.repetition for run in plan} == {1, 2, 3}
+
+
+def test_openclaw_terminal_evidence_exit_is_a_harness_error() -> None:
+    outcome = execution_outcome(
+        harness="openclaw",
+        exception=NonZeroAgentExitCodeError("Agent exited with code 71"),
+        agent_exit_code=71,
+    )
+
+    assert outcome == {
+        "kind": "harness_error",
+        "exit_code": 71,
+        "reason": "terminal_session_evidence_unavailable",
+    }
+
+
+def test_all_harness_errors_reject_run_but_agent_errors_do_not() -> None:
+    rejected = _execution_acceptance(
+        [
+            {"execution_outcome": {"kind": "harness_error"}},
+            {"execution_outcome": {"kind": "infra_error"}},
+        ],
+        2,
+    )
+    accepted = _execution_acceptance(
+        [
+            {"execution_outcome": {"kind": "clean"}},
+            {"execution_outcome": {"kind": "agent_error"}},
+        ],
+        2,
+    )
+
+    assert rejected == {
+        "accepted": False,
+        "reason": "all_trials_harness_or_infrastructure_errors",
+        "outcome_counts": {"harness_error": 1, "infra_error": 1},
+    }
+    assert accepted == {
+        "accepted": True,
+        "reason": None,
+        "outcome_counts": {"agent_error": 1, "clean": 1},
+    }
 
 
 def test_run_index_records_agent_and_judge_reasoning(

@@ -509,6 +509,48 @@ def test_native_identity_checks_ignore_unavailable_agent_exit_trajectory(
     assert run["eligible"] is True
 
 
+def test_all_openclaw_harness_errors_preserve_rewards_but_reject_run(
+    tmp_path: Path,
+):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "openclaw-gpt55-terminal-evidence-failure",
+        expected_task_count=2,
+        results=[
+            _result(
+                "a",
+                reward=0.25,
+                exception_type="NonZeroAgentExitCodeError",
+                exception_message="Agent exited with code 71",
+            ),
+            _result(
+                "b",
+                reward=0.75,
+                exception_type="NonZeroAgentExitCodeError",
+                exception_message="Agent exited with code 71",
+            ),
+        ],
+        harness="openclaw",
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    run = report["runs"][0]
+    assert run["score"] == pytest.approx(0.5)
+    assert run["nonzero"] == 2
+    assert run["run_accepted"] is False
+    assert run["run_acceptance_reason"] == (
+        "all_trials_harness_or_infrastructure_errors"
+    )
+    assert run["eligible"] is False
+    assert run["exclusion_reason"] == "infra_dominated"
+    with (summaries_dir / "per_task_results.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert {row["execution_outcome"] for row in rows} == {"harness_error"}
+
+
 def test_native_identity_checks_real_agent_exit_trajectory(tmp_path: Path):
     jobs_root = tmp_path / "native"
     summaries_dir = tmp_path / "summaries"
