@@ -9,6 +9,8 @@ from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from scripts.native_eval.checkpoint_loop import (
     count_result_json,
     next_checkpoint_sequence,
