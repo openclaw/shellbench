@@ -114,7 +114,9 @@ install_node_tools() {
 install_uv() {
   install -d -m 0755 "$TOOLCHAIN_ROOT/bin"
   if [[ ! -x "$TOOLCHAIN_ROOT/bin/uv" ]]; then
-    curl -LsSf https://astral.sh/uv/install.sh -o /tmp/install-uv.sh
+    curl -LsSf --retry 5 --retry-delay 2 --retry-all-errors --retry-max-time 60 \
+      https://astral.sh/uv/install.sh \
+      -o /tmp/install-uv.sh
     UV_UNMANAGED_INSTALL="$TOOLCHAIN_ROOT/bin" sh /tmp/install-uv.sh
     rm -f /tmp/install-uv.sh
   fi
@@ -129,7 +131,7 @@ install_hermes() {
   export PATH="$TOOLCHAIN_ROOT/node/bin:$TOOLCHAIN_ROOT/bin:$PATH"
   install -d -m 0755 "$HOME" "$HERMES_HOME"
 
-  curl -fsSL \
+  curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --retry-max-time 60 \
     "https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_COMMIT/scripts/install.sh" \
     -o /tmp/install-hermes.sh
   bash /tmp/install-hermes.sh \
