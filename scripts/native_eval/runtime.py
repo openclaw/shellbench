@@ -52,6 +52,12 @@ class RewardFileNotFoundError(NativeEvalError):
     pass
 
 
+OPENCLAW_HARNESS_EXIT_REASONS = {
+    70: "gateway_start_failed",
+    71: "terminal_session_evidence_unavailable",
+}
+
+
 CODEX_DIAGNOSTIC_LINE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\S+\s+"
     r"(?:TRACE|DEBUG|INFO|WARN|ERROR)\s+codex[\w:.-]*:"
@@ -473,6 +479,7 @@ async def run_trial(
         toolchain_root=toolchain_root,
     )
     recorded_exception: BaseException | None = None
+    agent_exit_code: int | None = None
     agent_command = build_harness_command(
         run,
         proxy_url=proxy_url,
@@ -517,6 +524,7 @@ async def run_trial(
                 stderr_path=trial_dir / "agent" / "stderr.txt",
             )
             if agent.returncode:
+                agent_exit_code = agent.returncode
                 raise NonZeroAgentExitCodeError(
                     f"Agent exited with code {agent.returncode}"
                 )
@@ -584,6 +592,11 @@ async def run_trial(
             if recorded_exception is None:
                 recorded_exception = exc
         result["finished_at"] = utc_now()
+        result["execution_outcome"] = execution_outcome(
+            harness=run.harness,
+            exception=recorded_exception,
+            agent_exit_code=agent_exit_code,
+        )
         if recorded_exception is not None:
             result["exception_info"] = exception_info(recorded_exception)
             (trial_dir / "exception.txt").write_text(
@@ -640,6 +653,11 @@ def _initial_trial_result(
         },
         "agent_result": None,
         "verifier_result": None,
+        "execution_outcome": {
+            "kind": "pending",
+            "exit_code": None,
+            "reason": None,
+        },
         "verifier_environment_mode": "shared",
         "exception_info": None,
         "started_at": started_at,
@@ -1284,6 +1302,42 @@ def exception_info(exc: BaseException) -> dict[str, str]:
             traceback.format_exception(type(exc), exc, exc.__traceback__)
         ),
         "occurred_at": utc_now(),
+    }
+
+
+def execution_outcome(
+    *,
+    harness: str,
+    exception: BaseException | None,
+    agent_exit_code: int | None,
+) -> dict[str, Any]:
+    if exception is None:
+        return {"kind": "clean", "exit_code": None, "reason": None}
+    if (
+        harness == "openclaw"
+        and agent_exit_code in OPENCLAW_HARNESS_EXIT_REASONS
+    ):
+        return {
+            "kind": "harness_error",
+            "exit_code": agent_exit_code,
+            "reason": OPENCLAW_HARNESS_EXIT_REASONS[agent_exit_code],
+        }
+    if isinstance(exception, NonZeroAgentExitCodeError):
+        return {
+            "kind": "agent_error",
+            "exit_code": agent_exit_code,
+            "reason": str(exception),
+        }
+    if isinstance(exception, (AgentSetupError, AgentSetupTimeoutError)):
+        kind = "harness_error"
+    elif isinstance(exception, RewardFileNotFoundError):
+        kind = "verifier_error"
+    else:
+        kind = "infra_error"
+    return {
+        "kind": kind,
+        "exit_code": agent_exit_code,
+        "reason": str(exception),
     }
 
 

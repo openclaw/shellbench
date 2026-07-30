@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import uuid
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -128,9 +129,12 @@ async def run_job(
     state["finished_at"] = utc_now()
     state["updated_at"] = state["finished_at"]
     _update_job_result(state, results, len(tasks))
+    acceptance = _execution_acceptance(results, len(tasks))
+    state["execution_acceptance"] = acceptance
     atomic_write_json(job_dir / "result.json", state)
     manifest["finished_at_utc"] = state["finished_at"]
     manifest["result_json_count"] = len(results)
+    manifest["execution_acceptance"] = acceptance
     agent_results = [
         result.get("agent_result")
         for result in results
@@ -203,6 +207,30 @@ def _update_job_result(
         ]
         stats[field] = sum(values) if values else None
     state["updated_at"] = utc_now()
+
+
+def _execution_acceptance(
+    results: list[dict[str, Any]],
+    total: int,
+) -> dict[str, Any]:
+    kinds = Counter(
+        str((result.get("execution_outcome") or {}).get("kind") or "unknown")
+        for result in results
+    )
+    invalid_kinds = {"harness_error", "infra_error", "verifier_error"}
+    invalid_count = sum(kinds[kind] for kind in invalid_kinds)
+    accepted = len(results) == total and invalid_count < total
+    if len(results) != total:
+        reason = "incomplete_result_coverage"
+    elif invalid_count == total and total:
+        reason = "all_trials_harness_or_infrastructure_errors"
+    else:
+        reason = None
+    return {
+        "accepted": accepted,
+        "reason": reason,
+        "outcome_counts": dict(sorted(kinds.items())),
+    }
 
 
 def _run_manifest(
@@ -302,6 +330,11 @@ def _run_manifest(
         "started_at_utc": started_at,
         "finished_at_utc": None,
         "result_json_count": 0,
+        "execution_acceptance": {
+            "accepted": None,
+            "reason": "run_in_progress",
+            "outcome_counts": {},
+        },
     }
 
 
@@ -458,6 +491,8 @@ def main() -> None:
         )
     )
     print(json.dumps(state, indent=2))
+    if state["execution_acceptance"]["accepted"] is not True:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

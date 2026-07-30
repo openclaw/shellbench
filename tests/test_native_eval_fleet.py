@@ -1345,7 +1345,7 @@ def test_recovery_required_resumes_existing_remote_run(tmp_path: Path) -> None:
     assert final["status"] == "completed"
 
 
-def test_recovery_infers_success_from_verified_full_archive_and_done_log(
+def test_recovery_does_not_infer_success_from_result_count(
     tmp_path: Path,
 ) -> None:
     label = "openclaw-gpt55-full-2-r1-20260727"
@@ -1359,7 +1359,7 @@ def test_recovery_infers_success_from_verified_full_archive_and_done_log(
     }
     run_index = tmp_path / "manifests" / "run_index.json"
     _write_index(run_index, [run])
-    config = _config(tmp_path, run_index)
+    config = _config(tmp_path, run_index, max_attempts=1)
     _write_final(config.local_root, label, 2)
     checkpoint_log = config.local_root / "logs" / f"{label}.checkpoints.log"
     checkpoint_log.parent.mkdir(parents=True, exist_ok=True)
@@ -1381,13 +1381,12 @@ def test_recovery_infers_success_from_verified_full_archive_and_done_log(
     }
     executor.active_leases = 1
 
-    assert FleetController(config, executor=executor).run() == 0
+    assert FleetController(config, executor=executor).run() == 1
 
     recovered = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
-    assert recovered["status"] == "completed"
-    assert recovered["run_exit_code"] == 0
-    assert recovered["run_exit_code_source"] == "recovered_full_coverage_remote_done"
-    assert "inferred zero" in recovered["run_exit_code_inference"]
+    assert recovered["status"] == "failed"
+    assert recovered.get("run_exit_code") is None
+    assert recovered["last_error"] == "run exit unknown; result coverage 2/2"
 
 
 def test_recovery_preserves_archived_nonzero_exit_status(tmp_path: Path) -> None:
