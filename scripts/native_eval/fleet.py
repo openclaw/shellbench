@@ -957,6 +957,8 @@ curl -fsS --max-time 3 \
 
     def _hydrate_lease(self, lease: Lease) -> None:
         assert self.runner_archive is not None
+        run_label = self._run_label_for_lease(lease.lease_id)
+        harness = str(self._store.get(run_label).get("harness") or "")
         remote_runner_archive = f"/tmp/{lease.slug}-runner.tar.gz"
         remote_task_archive = f"/tmp/{lease.slug}-tasks.tar.gz"
         remote_env = f"/tmp/{lease.slug}-provider.env"
@@ -1005,6 +1007,8 @@ candidate_archive=$7
 candidate_sha256=$8
 candidate_version=$9
 shift 9
+harness=$1
+shift
 printf '%s  %s\n' "$runner_sha256" "$runner_archive" | sha256sum -c -
 printf '%s  %s\n' "$task_sha256" "$task_archive" | sha256sum -c -
 if [ -n "$candidate_archive" ]; then
@@ -1024,9 +1028,11 @@ if [ -n "$candidate_archive" ]; then
     OPENCLAW_PACKAGE_TARBALL="$candidate_archive" \
     OPENCLAW_PACKAGE_SHA256="$candidate_sha256" \
     OPENCLAW_PACKAGE_VERSION="$candidate_version" \
+    SHELLBENCH_HARNESS="$harness" \
     bash "$root/runner/scripts/native_eval/bootstrap_beast.sh"
 else
-  bash "$root/runner/scripts/native_eval/bootstrap_beast.sh"
+  env SHELLBENCH_HARNESS="$harness" \
+    bash "$root/runner/scripts/native_eval/bootstrap_beast.sh"
 fi
 """
         candidate_sha256 = (
@@ -1054,6 +1060,7 @@ fi
                     remote_openclaw_package,
                     candidate_sha256,
                     candidate_version,
+                    harness,
                 ],
             ),
             capture_output=False,

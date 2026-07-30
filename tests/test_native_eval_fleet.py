@@ -612,6 +612,8 @@ def test_candidate_package_is_validated_staged_and_bootstrapped(
     )
     assert identity["sha256"] in bootstrap[-1]
     assert identity["package_version"] in bootstrap[-1]
+    assert 'SHELLBENCH_HARNESS="$harness"' in bootstrap[-1]
+    assert bootstrap[-1].endswith("openclaw")
     assert "TOPSECRET" not in bootstrap[-1]
 
 
@@ -655,6 +657,36 @@ def test_bootstrap_preserves_candidate_identity_across_sudo(tmp_path: Path) -> N
     assert f"OPENCLAW_PACKAGE_TARBALL={candidate}" in result.stdout
     assert "OPENCLAW_PACKAGE_SHA256=candidate-sha256" in result.stdout
     assert "OPENCLAW_PACKAGE_VERSION=2026.7.2" in result.stdout
+    assert "SHELLBENCH_HARNESS=all" in result.stdout
+
+
+def test_bootstrap_preserves_explicit_harness_across_sudo(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_id = fake_bin / "id"
+    fake_id.write_text("#!/bin/sh\nprintf '1000\\n'\n", encoding="utf-8")
+    fake_id.chmod(0o755)
+    fake_sudo = fake_bin / "sudo"
+    fake_sudo.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_sudo.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", "scripts/native_eval/bootstrap_beast.sh"],
+        cwd=Path(__file__).resolve().parents[1],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "SHELLBENCH_HARNESS": "openclaw",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "SHELLBENCH_HARNESS=openclaw" in result.stdout
 
 
 def test_bootstrap_retries_external_installer_downloads() -> None:
@@ -674,6 +706,17 @@ def test_bootstrap_uses_managed_python_for_litellm() -> None:
     assert '"$TOOLCHAIN_ROOT/bin/uv" python install 3.12' in script
     assert '"$TOOLCHAIN_ROOT/bin/uv" python find --managed-python 3.12' in script
     assert '"$TOOLCHAIN_ROOT/bin/uv" venv --clear --python "$python_bin" "$venv"' in script
+
+
+def test_bootstrap_scopes_harness_installation() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts/native_eval/bootstrap_beast.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "harness_enabled openclaw" in script
+    assert "harness_enabled codex" in script
+    assert "harness_enabled claude-code" in script
+    assert "if harness_enabled hermes; then" in script
 
 
 def test_candidate_package_rejects_wrong_npm_identity_before_leasing(

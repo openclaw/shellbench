@@ -11,6 +11,7 @@ LITELLM_VERSION="${LITELLM_VERSION:-1.93.0}"
 OPENCLAW_PACKAGE_TARBALL="${OPENCLAW_PACKAGE_TARBALL:-}"
 OPENCLAW_PACKAGE_SHA256="${OPENCLAW_PACKAGE_SHA256:-}"
 OPENCLAW_PACKAGE_VERSION="${OPENCLAW_PACKAGE_VERSION:-}"
+SHELLBENCH_HARNESS="${SHELLBENCH_HARNESS:-all}"
 
 if [[ "$(id -u)" -ne 0 ]]; then
   exec sudo -E env \
@@ -24,11 +25,24 @@ if [[ "$(id -u)" -ne 0 ]]; then
     OPENCLAW_PACKAGE_TARBALL="$OPENCLAW_PACKAGE_TARBALL" \
     OPENCLAW_PACKAGE_SHA256="$OPENCLAW_PACKAGE_SHA256" \
     OPENCLAW_PACKAGE_VERSION="$OPENCLAW_PACKAGE_VERSION" \
+    SHELLBENCH_HARNESS="$SHELLBENCH_HARNESS" \
     bash "$0" "$@"
 fi
 
 export DEBIAN_FRONTEND=noninteractive
 install -d -m 0755 "$TOOLCHAIN_ROOT"
+
+harness_enabled() {
+  [[ "$SHELLBENCH_HARNESS" == "all" || "$SHELLBENCH_HARNESS" == "$1" ]]
+}
+
+case "$SHELLBENCH_HARNESS" in
+  all | openclaw | codex | claude-code | hermes) ;;
+  *)
+    printf 'unsupported SHELLBENCH_HARNESS: %s\n' "$SHELLBENCH_HARNESS" >&2
+    exit 2
+    ;;
+esac
 
 install_base_packages() {
   apt-get update
@@ -82,6 +96,7 @@ EOF
 install_node_tools() {
   local node_root="$TOOLCHAIN_ROOT/node"
   local openclaw_spec="openclaw@$OPENCLAW_VERSION"
+  local -a packages=()
   if [[ ! -x "$node_root/bin/node" ]] || \
     [[ "$("$node_root/bin/node" --version)" != "v$NODE_VERSION" ]]; then
     rm -rf "$node_root"
@@ -104,11 +119,20 @@ install_node_tools() {
     [[ "$(tar -xOf "$OPENCLAW_PACKAGE_TARBALL" package/package.json | jq -r '.version')" == "$OPENCLAW_PACKAGE_VERSION" ]]
     openclaw_spec="$OPENCLAW_PACKAGE_TARBALL"
   fi
+  if harness_enabled openclaw; then
+    packages+=("$openclaw_spec")
+  fi
+  if harness_enabled codex; then
+    packages+=("@openai/codex@$CODEX_VERSION")
+  fi
+  if harness_enabled claude-code; then
+    packages+=("@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION")
+  fi
   rm -rf "$TOOLCHAIN_ROOT/npm-packages"
-  npm install --prefix "$TOOLCHAIN_ROOT/npm-packages" \
-    "$openclaw_spec" \
-    "@openai/codex@$CODEX_VERSION" \
-    "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+  install -d -m 0755 "$TOOLCHAIN_ROOT/npm-packages"
+  if ((${#packages[@]})); then
+    npm install --prefix "$TOOLCHAIN_ROOT/npm-packages" "${packages[@]}"
+  fi
 }
 
 install_uv() {
@@ -160,6 +184,10 @@ install_litellm() {
 }
 
 write_manifest() {
+  local openclaw=""
+  local codex=""
+  local claude_code=""
+  local hermes=""
   local openclaw_source_kind="registry"
   local openclaw_package_version="$OPENCLAW_VERSION"
   local openclaw_package_sha256=""
@@ -171,13 +199,26 @@ write_manifest() {
     openclaw_artifact_filename="$(basename "$OPENCLAW_PACKAGE_TARBALL")"
   fi
   export PATH="$TOOLCHAIN_ROOT/node/bin:$TOOLCHAIN_ROOT/npm-packages/node_modules/.bin:$TOOLCHAIN_ROOT/home/.local/bin:$PATH"
+  if harness_enabled openclaw; then
+    openclaw="$(openclaw --version | head -1)"
+  fi
+  if harness_enabled codex; then
+    codex="$(codex --version | head -1)"
+  fi
+  if harness_enabled claude-code; then
+    claude_code="$(claude --version | head -1)"
+  fi
+  if harness_enabled hermes; then
+    hermes="$(hermes version | head -1)"
+  fi
   jq -n \
     --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg node "$(node --version)" \
-    --arg openclaw "$(openclaw --version | head -1)" \
-    --arg codex "$(codex --version | head -1)" \
-    --arg claude_code "$(claude --version | head -1)" \
-    --arg hermes "$(hermes version | head -1)" \
+    --arg harness_scope "$SHELLBENCH_HARNESS" \
+    --arg openclaw "$openclaw" \
+    --arg codex "$codex" \
+    --arg claude_code "$claude_code" \
+    --arg hermes "$hermes" \
     --arg litellm "$("$TOOLCHAIN_ROOT/litellm-venv/bin/python" -c 'from importlib.metadata import version; print(version("litellm"))')" \
     --arg hermes_commit "$HERMES_COMMIT" \
     --arg openclaw_source_kind "$openclaw_source_kind" \
@@ -186,19 +227,20 @@ write_manifest() {
     --arg openclaw_artifact_filename "$openclaw_artifact_filename" \
     '{
       created_at_utc: $created_at,
+      harness_scope: $harness_scope,
       node: $node,
-      openclaw: $openclaw,
-      openclaw_package: {
+      openclaw: (if $openclaw == "" then null else $openclaw end),
+      openclaw_package: (if $openclaw == "" then null else {
         source_kind: $openclaw_source_kind,
         package_name: "openclaw",
         package_version: $openclaw_package_version,
         sha256: (if $openclaw_package_sha256 == "" then null else $openclaw_package_sha256 end),
         artifact_filename: (if $openclaw_artifact_filename == "" then null else $openclaw_artifact_filename end)
-      },
-      codex: $codex,
-      claude_code: $claude_code,
-      hermes: $hermes,
-      hermes_commit: $hermes_commit,
+      } end),
+      codex: (if $codex == "" then null else $codex end),
+      claude_code: (if $claude_code == "" then null else $claude_code end),
+      hermes: (if $hermes == "" then null else $hermes end),
+      hermes_commit: (if $hermes == "" then null else $hermes_commit end),
       litellm: $litellm
     }' > "$TOOLCHAIN_ROOT/manifest.json"
   chmod -R a+rX "$TOOLCHAIN_ROOT"
@@ -208,7 +250,9 @@ install_base_packages
 install_docker
 install_node_tools
 install_uv
-install_hermes
+if harness_enabled hermes; then
+  install_hermes
+fi
 install_litellm
 write_manifest
 
