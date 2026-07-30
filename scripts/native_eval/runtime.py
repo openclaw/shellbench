@@ -491,6 +491,7 @@ async def run_trial(
         proxy_url=proxy_url,
         proxy_key=proxy_key,
         mcp_servers=task.mcp_servers,
+        agent_timeout_sec=task.agent_timeout_sec,
     )
 
     try:

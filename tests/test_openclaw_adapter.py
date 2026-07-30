@@ -295,6 +295,48 @@ def test_run_phase_creates_session_subscribes_and_drives_simulator(tmp_path: Pat
     assert send_args["message"] == "Do the task."
 
 
+def test_run_phase_uses_canonical_per_turn_timeout(tmp_path: Path) -> None:
+    task = _coding_task()
+    task.budgets.timeout_seconds = 900
+    task.budgets.per_turn_timeout_seconds = 600
+    task.phases[0].timeout_seconds = None
+    adapter, gateway = _make_adapter_and_gateway()
+
+    async def _go() -> None:
+        async with adapter:
+            ctx = _make_ctx(task, tmp_path)
+            await adapter.setup(ctx)
+            await adapter.run_phase(task.phases[0], ctx)
+
+    asyncio.run(_go())
+
+    send_args = next(args for name, args in gateway.calls if name == "send_and_wait")
+    assert send_args["timeout"] == 600
+
+
+def test_run_phase_honors_explicit_adapter_timeout_cap(tmp_path: Path) -> None:
+    task = _coding_task()
+    task.budgets.timeout_seconds = 900
+    task.budgets.per_turn_timeout_seconds = 600
+    task.phases[0].timeout_seconds = None
+    gateway = _StubGateway()
+    adapter = OpenClawAdapter(
+        OpenClawAdapterConfig(model="test-model", turn_timeout_seconds=120)
+    )
+    adapter._client_factory = lambda: gateway  # type: ignore[assignment]
+
+    async def _go() -> None:
+        async with adapter:
+            ctx = _make_ctx(task, tmp_path)
+            await adapter.setup(ctx)
+            await adapter.run_phase(task.phases[0], ctx)
+
+    asyncio.run(_go())
+
+    send_args = next(args for name, args in gateway.calls if name == "send_and_wait")
+    assert send_args["timeout"] == 120
+
+
 def test_run_phase_routes_openai_codex_runtime_to_codex_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

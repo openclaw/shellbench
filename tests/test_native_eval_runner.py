@@ -969,10 +969,12 @@ def test_openclaw_harness_configures_code_mode() -> None:
         proxy_url="http://host.docker.internal:4000",
         proxy_key="local-proxy-key",
         mcp_servers=(),
+        agent_timeout_sec=3600,
     )
 
     assert '"codeMode":true' in command.setup_command
     assert '"toolSearch":false' in command.setup_command
+    assert '"timeoutSeconds":3600' in command.setup_command
 
 
 def test_openclaw_harness_configures_tool_directory_mode() -> None:

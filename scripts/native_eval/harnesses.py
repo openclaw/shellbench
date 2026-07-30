@@ -337,6 +337,7 @@ def build_harness_command(
     proxy_url: str,
     proxy_key: str,
     mcp_servers: tuple[McpServer, ...],
+    agent_timeout_sec: float | None = None,
 ) -> HarnessCommand:
     builders = {
         "openclaw": _openclaw,
@@ -348,6 +349,14 @@ def build_harness_command(
         builder = builders[run.harness]
     except KeyError as exc:
         raise ValueError(f"Unsupported harness: {run.harness}") from exc
+    if run.harness == "openclaw":
+        return _openclaw(
+            run,
+            proxy_url,
+            proxy_key,
+            mcp_servers,
+            agent_timeout_sec=agent_timeout_sec,
+        )
     return builder(run, proxy_url, proxy_key, mcp_servers)
 
 
@@ -360,6 +369,8 @@ def _openclaw(
     proxy_url: str,
     proxy_key: str,
     mcp_servers: tuple[McpServer, ...],
+    *,
+    agent_timeout_sec: float | None,
 ) -> HarnessCommand:
     provider = "openai"
     model = f"{provider}/{run.model_id}"
@@ -388,6 +399,11 @@ def _openclaw(
                 "model": {"primary": model},
                 "thinkingDefault": thinking,
                 "subagents": {"model": model, "thinking": thinking},
+                **(
+                    {"timeoutSeconds": max(1, int(agent_timeout_sec))}
+                    if agent_timeout_sec is not None
+                    else {}
+                ),
             }
         },
         "gateway": {

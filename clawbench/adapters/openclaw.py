@@ -61,9 +61,9 @@ class OpenClawAdapterConfig(AdapterConfig):
 
     gateway: GatewayConfig | None = None
     prompt_variant: str = PromptVariant.CLEAR.value
-    # Default per-turn timeout passed to `send_and_wait` when the
-    # phase does not override it. Matches the existing harness default.
-    turn_timeout_seconds: float = 180.0
+    # Optional adapter-level cap. Canonical task and phase budgets own the
+    # timeout unless an operator explicitly supplies a narrower ceiling.
+    turn_timeout_seconds: float | None = None
 
 
 @register_adapter
@@ -236,8 +236,13 @@ class OpenClawAdapter(AgentAdapter):
             prompt_variant=self._config.prompt_variant,
         )
 
-        turn_timeout = float(phase.timeout_seconds or ctx.task.budgets.timeout_seconds)
-        turn_timeout = min(turn_timeout, self._config.turn_timeout_seconds)
+        turn_timeout = float(
+            phase.timeout_seconds
+            or ctx.task.budgets.per_turn_timeout_seconds
+            or ctx.task.budgets.timeout_seconds
+        )
+        if self._config.turn_timeout_seconds is not None:
+            turn_timeout = min(turn_timeout, self._config.turn_timeout_seconds)
 
         appended: list = []
         turns_sent = 0
