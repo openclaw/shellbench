@@ -14,6 +14,10 @@ PROVENANCE_FIELDS = (
     "harbor_reference_commit",
     "judge_model_id",
 )
+REQUIRED_PROVENANCE_FIELDS = (
+    "execution_mode",
+    "judge_model_id",
+)
 
 
 def _read_object(path: Path) -> dict[str, Any]:
@@ -44,7 +48,10 @@ def build_metadata_supplements(
         raise ValueError("run index is missing fleet metadata")
 
     provenance = {field: fleet.get(field) for field in PROVENANCE_FIELDS}
-    missing = [field for field, value in provenance.items() if value in (None, "")]
+    required_fields = list(REQUIRED_PROVENANCE_FIELDS)
+    if provenance["execution_mode"] != "native":
+        required_fields.append("harbor_reference_commit")
+    missing = [field for field in required_fields if provenance[field] in (None, "")]
     if missing:
         raise ValueError(f"fleet metadata is missing: {', '.join(missing)}")
     expected_candidate = fleet.get("openclaw_package")
@@ -61,13 +68,14 @@ def build_metadata_supplements(
 
         additions: dict[str, Any] = {}
         for field, expected in provenance.items():
+            if expected in (None, ""):
+                continue
             archived = manifest.get(field)
             if archived in (None, ""):
                 additions[field] = expected
             elif archived != expected:
                 raise ValueError(
-                    f"{run_label} has conflicting {field}: "
-                    f"archive={archived!r}, fleet={expected!r}"
+                    f"{run_label} has conflicting {field}: archive={archived!r}, fleet={expected!r}"
                 )
         candidate_status = _candidate_status(
             expected_candidate,

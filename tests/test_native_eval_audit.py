@@ -59,6 +59,61 @@ def test_build_metadata_supplements_only_adds_missing_provenance(tmp_path: Path)
     assert json.loads(output.read_text())["runs"][0]["run_label"] == "older"
 
 
+def test_build_metadata_supplements_allows_native_without_harbor_reference(
+    tmp_path: Path,
+):
+    run_index = tmp_path / "run_index.json"
+    extracted = tmp_path / "extracted"
+    _write_json(
+        run_index,
+        {
+            "fleet": {
+                "execution_mode": "native",
+                "harbor_reference_commit": "",
+                "judge_model_id": "gpt-5.5",
+            }
+        },
+    )
+    _write_json(
+        extracted / "run" / "shellbench_meta-run" / "run_manifest.json",
+        {"run_label": "run"},
+    )
+
+    report = build_metadata_supplements(run_index, extracted)
+
+    assert report["provenance"]["harbor_reference_commit"] == ""
+    assert report["runs"] == [
+        {
+            "run_label": "run",
+            "archived_manifest": "run/shellbench_meta-run/run_manifest.json",
+            "supplements": {
+                "execution_mode": "native",
+                "judge_model_id": "gpt-5.5",
+            },
+        }
+    ]
+
+
+def test_build_metadata_supplements_requires_non_native_harbor_reference(
+    tmp_path: Path,
+):
+    run_index = tmp_path / "run_index.json"
+    extracted = tmp_path / "extracted"
+    _write_json(
+        run_index,
+        {
+            "fleet": {
+                "execution_mode": "harbor",
+                "harbor_reference_commit": "",
+                "judge_model_id": "gpt-5.5",
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="harbor_reference_commit"):
+        build_metadata_supplements(run_index, extracted)
+
+
 def test_build_metadata_supplements_rejects_conflicting_provenance(tmp_path: Path):
     run_index = tmp_path / "run_index.json"
     extracted = tmp_path / "extracted"
@@ -133,9 +188,7 @@ def test_build_metadata_supplements_classifies_openclaw_candidate(
         "judge_model_id": "gpt-5.5",
     }
     if observed is not None:
-        manifest["openclaw_package"] = (
-            candidate if observed == "expected" else observed
-        )
+        manifest["openclaw_package"] = candidate if observed == "expected" else observed
     _write_json(
         extracted / "run" / "shellbench_meta-candidate-run" / "run_manifest.json",
         manifest,
