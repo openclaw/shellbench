@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import time
@@ -49,6 +50,10 @@ class NonZeroAgentExitCodeError(NativeEvalError):
 
 
 class RewardFileNotFoundError(NativeEvalError):
+    pass
+
+
+class VerifierRewardContractError(NativeEvalError):
     pass
 
 
@@ -467,6 +472,7 @@ async def run_trial(
 
     started_at = utc_now()
     result = _initial_trial_result(task, run, trial_name, trial_dir, started_at)
+    result["verifier_contract"] = None
     atomic_write_json(trial_dir / "config.json", result["config"])
     atomic_write_json(trial_dir / "lock.json", _trial_lock(task, run))
     atomic_write_json(trial_dir / "result.json", result)
@@ -488,6 +494,8 @@ async def run_trial(
     )
 
     try:
+        result["verifier_contract"] = load_reward_contract(task.path)
+        atomic_write_json(trial_dir / "result.json", result)
         env_start = await environment.start()
         result["environment_setup"] = _timing(env_start)
         atomic_write_json(trial_dir / "result.json", result)
@@ -578,6 +586,10 @@ async def run_trial(
         }
         reward = read_reward(trial_dir / "verifier")
         result["verifier_result"] = {"rewards": reward}
+        try:
+            validate_reward_contract(result["verifier_contract"], reward)
+        except VerifierRewardContractError as exc:
+            recorded_exception = exc
         if verifier.returncode and recorded_exception is None and not reward:
             recorded_exception = RewardFileNotFoundError(
                 f"Verifier exited {verifier.returncode} without a reward"
@@ -721,6 +733,87 @@ def read_reward(verifier_dir: Path) -> dict[str, float | int]:
     raise RewardFileNotFoundError(
         f"No reward file found under {verifier_dir}"
     )
+
+
+def load_reward_contract(task_dir: Path) -> dict[str, Any] | None:
+    rubrics_path = task_dir / "tests" / "rubrics.json"
+    if not rubrics_path.is_file():
+        return None
+    try:
+        value = json.loads(rubrics_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise VerifierRewardContractError(
+            f"Unable to read reward contract from {rubrics_path}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise VerifierRewardContractError(
+            f"{rubrics_path} must contain a JSON object"
+        )
+    reward = value.get("reward")
+    if not isinstance(reward, dict):
+        return None
+    scoring = reward.get("scoring")
+    pass_reward = reward.get("pass_reward")
+    fail_reward = reward.get("fail_reward")
+    if scoring == "all_or_nothing":
+        for name, endpoint in (
+            ("pass_reward", pass_reward),
+            ("fail_reward", fail_reward),
+        ):
+            if (
+                isinstance(endpoint, bool)
+                or not isinstance(endpoint, (int, float))
+                or (isinstance(endpoint, float) and not math.isfinite(endpoint))
+            ):
+                raise VerifierRewardContractError(
+                    f"{rubrics_path} all_or_nothing contract requires numeric {name}"
+                )
+        if pass_reward == fail_reward:
+            raise VerifierRewardContractError(
+                f"{rubrics_path} all_or_nothing reward endpoints must differ"
+            )
+    contract = {
+        "source": "tests/rubrics.json",
+        "scoring": scoring,
+        "pass_reward": pass_reward,
+        "fail_reward": fail_reward,
+    }
+    return {
+        key: contract_value
+        for key, contract_value in contract.items()
+        if contract_value is not None
+    }
+
+
+def validate_reward_contract(
+    contract: dict[str, Any] | None,
+    rewards: dict[str, float | int],
+) -> None:
+    if not contract or contract.get("scoring") != "all_or_nothing":
+        return
+    reward = rewards.get("reward")
+    if reward is None:
+        return
+    if (
+        isinstance(reward, bool)
+        or not isinstance(reward, (int, float))
+        or (isinstance(reward, float) and not math.isfinite(reward))
+    ):
+        raise VerifierRewardContractError(
+            f"Verifier emitted non-numeric reward {reward!r} "
+            "for all_or_nothing contract"
+        )
+    allowed = tuple(
+        value
+        for value in (contract.get("pass_reward"), contract.get("fail_reward"))
+        if isinstance(value, (int, float))
+    )
+    if allowed and reward not in allowed:
+        allowed_text = ", ".join(str(value) for value in sorted(allowed))
+        raise VerifierRewardContractError(
+            "Verifier emitted reward "
+            f"{reward} for all_or_nothing contract; expected one of {allowed_text}"
+        )
 
 
 def collect_agent_metrics(harness: str, agent_dir: Path) -> dict[str, Any]:
@@ -1330,7 +1423,10 @@ def execution_outcome(
         }
     if isinstance(exception, (AgentSetupError, AgentSetupTimeoutError)):
         kind = "harness_error"
-    elif isinstance(exception, RewardFileNotFoundError):
+    elif isinstance(
+        exception,
+        (RewardFileNotFoundError, VerifierRewardContractError),
+    ):
         kind = "verifier_error"
     else:
         kind = "infra_error"

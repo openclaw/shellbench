@@ -45,10 +45,13 @@ from scripts.native_eval.run_job import (
 from scripts.native_eval.runtime import (
     DockerTaskEnvironment,
     NonZeroAgentExitCodeError,
+    VerifierRewardContractError,
     build_judge_env,
     collect_agent_metrics,
     execution_outcome,
+    load_reward_contract,
     read_reward,
+    validate_reward_contract,
     write_agent_trajectory,
 )
 from scripts.native_eval import runtime as native_runtime
@@ -4352,6 +4355,86 @@ def test_reward_json_takes_precedence_over_text(tmp_path: Path) -> None:
     )
 
     assert read_reward(tmp_path) == {"reward": 0.75, "safety": 1}
+
+
+def test_all_or_nothing_reward_contract_rejects_partial_reward(
+    tmp_path: Path,
+) -> None:
+    rubrics_dir = tmp_path / "tests"
+    rubrics_dir.mkdir()
+    (rubrics_dir / "rubrics.json").write_text(
+        json.dumps(
+            {
+                "reward": {
+                    "scoring": "all_or_nothing",
+                    "pass_reward": 1.0,
+                    "fail_reward": 0.0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    contract = load_reward_contract(tmp_path)
+
+    assert contract == {
+        "source": "tests/rubrics.json",
+        "scoring": "all_or_nothing",
+        "pass_reward": 1.0,
+        "fail_reward": 0.0,
+    }
+    validate_reward_contract(contract, {"reward": 0})
+    validate_reward_contract(contract, {"reward": 1})
+    with pytest.raises(
+        VerifierRewardContractError,
+        match="all_or_nothing contract",
+    ):
+        validate_reward_contract(contract, {"reward": 0.5})
+
+
+def test_all_or_nothing_reward_contract_requires_numeric_endpoints(
+    tmp_path: Path,
+) -> None:
+    rubrics_dir = tmp_path / "tests"
+    rubrics_dir.mkdir()
+    (rubrics_dir / "rubrics.json").write_text(
+        json.dumps({"reward": {"scoring": "all_or_nothing"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        VerifierRewardContractError,
+        match="requires numeric pass_reward",
+    ):
+        load_reward_contract(tmp_path)
+
+
+def test_all_or_nothing_reward_contract_preserves_exact_integer_equality() -> None:
+    contract = {
+        "scoring": "all_or_nothing",
+        "pass_reward": 9_007_199_254_740_992,
+        "fail_reward": 0,
+    }
+
+    with pytest.raises(VerifierRewardContractError):
+        validate_reward_contract(
+            contract,
+            {"reward": 9_007_199_254_740_993},
+        )
+
+
+def test_malformed_reward_contract_is_classified_as_contract_error(
+    tmp_path: Path,
+) -> None:
+    rubrics_dir = tmp_path / "tests"
+    rubrics_dir.mkdir()
+    (rubrics_dir / "rubrics.json").write_text("{", encoding="utf-8")
+
+    with pytest.raises(
+        VerifierRewardContractError,
+        match="Unable to read reward contract",
+    ):
+        load_reward_contract(tmp_path)
 
 
 def test_checkpoint_helpers_count_only_trials_and_never_reuse_sequence(

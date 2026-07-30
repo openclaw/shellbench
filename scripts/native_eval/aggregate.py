@@ -44,6 +44,7 @@ INFRA_EXCEPTION_TYPES = {
     "InvalidResultError",
     "MissingResultError",
     "VerifierJudgeInfraError",
+    "VerifierRewardContractError",
     "VerifierTimeoutError",
 }
 
@@ -67,6 +68,10 @@ INFRA_MESSAGE_PATTERNS = (
 MISSING_REWARD_EXCEPTION_TYPES = {
     "RewardFileEmptyError",
     "RewardFileNotFoundError",
+}
+
+INVALID_REWARD_CONTRACT_EXCEPTION_TYPES = {
+    "VerifierRewardContractError",
 }
 
 # Compatibility for manifests created before parity scopes were recorded.
@@ -140,6 +145,7 @@ RUN_FIELDS = (
     "agent_exits",
     "clean_completed",
     "missing_reward",
+    "verifier_contract_violations",
     "clean_coverage",
     "incomplete",
     "infra_dominated",
@@ -292,7 +298,11 @@ def _classify(
     if execution_kind in {"harness_error", "infra_error"}:
         return "infra"
     if execution_kind == "verifier_error":
-        return "verifier_missing_reward"
+        return (
+            "verifier_missing_reward"
+            if exception_type in MISSING_REWARD_EXCEPTION_TYPES
+            else "infra"
+        )
     if execution_kind == "agent_error":
         return "agent_exit"
     if exception_type in MISSING_REWARD_EXCEPTION_TYPES:
@@ -336,6 +346,8 @@ def _execution_fields(
     ):
         return "harness_error", exit_code, exception_message
     if exception_type in MISSING_REWARD_EXCEPTION_TYPES:
+        return "verifier_error", exit_code, exception_message
+    if exception_type in INVALID_REWARD_CONTRACT_EXCEPTION_TYPES:
         return "verifier_error", exit_code, exception_message
     if exception_type and _is_infra(exception_type, exception_message):
         return "infra_error", exit_code, exception_message
@@ -631,6 +643,9 @@ def _normalize_result(
         "_valid_result": True,
         "_completed_result": bool(result.get("finished_at")),
         "_scorable": True,
+        "_reward_contract_valid": (
+            exception_type not in INVALID_REWARD_CONTRACT_EXCEPTION_TYPES
+        ),
     }
     for field in TIMING_FIELDS:
         timing = result.get(field)
@@ -902,7 +917,14 @@ def _summarize_run(
 ) -> dict[str, Any]:
     scored_rows = [row for row in rows if row.get("_scorable")]
     classifications = [str(row["classification"]) for row in scored_rows]
-    rewards = [_number(row.get("reward")) for row in scored_rows]
+    rewards = [
+        (
+            _number(row.get("reward"))
+            if row.get("_reward_contract_valid", True)
+            else None
+        )
+        for row in scored_rows
+    ]
     all_classifications = [str(row["classification"]) for row in rows]
     execution_kinds = [
         str(row.get("execution_outcome") or "")
@@ -919,6 +941,10 @@ def _summarize_run(
     infra = all_classifications.count("infra")
     agent_exits = classifications.count("agent_exit")
     missing_reward = classifications.count("verifier_missing_reward")
+    verifier_contract_violations = sum(
+        not row.get("_reward_contract_valid", True)
+        for row in scored_rows
+    )
     clean_completed = sum(
         classification in {"clean_fail", "partial", "pass"}
         for classification in classifications
@@ -958,8 +984,12 @@ def _summarize_run(
             and len(execution_kinds) == expected_count
             and all(kind in invalid_execution_kinds for kind in execution_kinds)
         )
+    if verifier_contract_violations:
+        run_accepted = False
     run_acceptance_reason = str(acceptance.get("reason") or "")
-    if not run_accepted and not run_acceptance_reason:
+    if verifier_contract_violations:
+        run_acceptance_reason = "verifier_reward_contract_violation"
+    elif not run_accepted and not run_acceptance_reason:
         run_acceptance_reason = "all_trials_harness_or_infrastructure_errors"
     native_run = (
         manifest.get("runner") == "shellbench-native"
@@ -1047,6 +1077,7 @@ def _summarize_run(
         "agent_exits": agent_exits,
         "clean_completed": clean_completed,
         "missing_reward": missing_reward,
+        "verifier_contract_violations": verifier_contract_violations,
         "clean_coverage": clean_coverage,
         "incomplete": incomplete,
         "infra_dominated": infra_dominated,

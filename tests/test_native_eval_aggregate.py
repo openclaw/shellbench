@@ -189,6 +189,51 @@ def test_aggregate_classifies_harbor_results_and_writes_all_outputs(tmp_path: Pa
     assert (summaries_dir / "cleaned_leaderboard.md").is_file()
 
 
+def test_invalid_all_or_nothing_reward_rejects_scoring(tmp_path: Path) -> None:
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "invalid-reward-contract",
+        expected_task_count=1,
+        results=[
+            _result(
+                "northgate",
+                reward=0.5,
+                exception_type="VerifierRewardContractError",
+                exception_message=(
+                    "Verifier emitted reward 0.5 for all_or_nothing contract"
+                ),
+                execution_outcome={
+                    "kind": "verifier_error",
+                    "exit_code": None,
+                    "reason": "invalid reward contract",
+                },
+                verifier_contract={
+                    "source": "tests/rubrics.json",
+                    "scoring": "all_or_nothing",
+                    "pass_reward": 1.0,
+                    "fail_reward": 0.0,
+                },
+            )
+        ],
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    run = report["runs"][0]
+    assert run["score"] == 0
+    assert run["incomplete"] is False
+    assert run["run_accepted"] is False
+    assert run["run_acceptance_reason"] == "verifier_reward_contract_violation"
+    assert run["verifier_contract_violations"] == 1
+    assert run["eligible"] is False
+    with (summaries_dir / "per_task_results.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["classification"] == "infra"
+    assert rows[0]["reward"] == "0.5"
+
+
 def test_aggregate_uses_task_path_for_canonical_task_name(tmp_path: Path):
     jobs_root = tmp_path / "native"
     summaries_dir = tmp_path / "summaries"
