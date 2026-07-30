@@ -415,7 +415,7 @@ def test_run_manifest_records_native_audit_metadata(
     assert manifest["parity_validated"] is False
     assert manifest["parity_validation"] is None
     assert manifest["legacy_parity_validated_claim"] is False
-    assert manifest["openclaw_tool_search_mode"] is None
+    assert manifest["openclaw_tool_mode"] is None
 
 
 def test_run_manifest_excludes_r0_from_leaderboard(
@@ -613,10 +613,10 @@ def test_run_spec_preserves_explicit_planned_identity() -> None:
     assert run.proxy_model_name == "planned-proxy-name"
 
 
-def test_run_spec_normalizes_empty_tool_search_mode(
+def test_run_spec_normalizes_empty_openclaw_tool_mode(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("SHELLBENCH_OPENCLAW_TOOL_SEARCH_MODE", "")
+    monkeypatch.setenv("SHELLBENCH_OPENCLAW_TOOL_MODE", "")
 
     run = build_run_spec(
         Namespace(
@@ -633,7 +633,97 @@ def test_run_spec_normalizes_empty_tool_search_mode(
         )
     )
 
-    assert run.openclaw_tool_search_mode is None
+    assert run.openclaw_tool_mode is None
+
+
+def test_run_spec_rejects_retired_openclaw_tool_search_mode(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SHELLBENCH_OPENCLAW_TOOL_SEARCH_MODE", "code")
+
+    with pytest.raises(
+        ValueError,
+        match="SHELLBENCH_OPENCLAW_TOOL_SEARCH_MODE is retired",
+    ):
+        build_run_spec(
+            Namespace(
+                run_label="openclaw-tool-search-code",
+                harness="openclaw",
+                harness_version="planned-version",
+                model_slug="gpt55",
+                model_id="gpt-5.5",
+                model_provider="openai",
+                proxy_model_name="gpt-5.5",
+                repetition=1,
+                expected_task_count=3,
+                run_date="20260729",
+            )
+        )
+
+
+def test_run_spec_accepts_empty_retired_openclaw_tool_search_mode(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SHELLBENCH_OPENCLAW_TOOL_SEARCH_MODE", "")
+
+    run = build_run_spec(
+        Namespace(
+            run_label="openclaw-tool-search-off",
+            harness="openclaw",
+            harness_version="planned-version",
+            model_slug="gpt55",
+            model_id="gpt-5.5",
+            model_provider="openai",
+            proxy_model_name="gpt-5.5",
+            repetition=1,
+            expected_task_count=3,
+            run_date="20260730",
+        )
+    )
+
+    assert run.openclaw_tool_mode is None
+
+
+def test_run_spec_rejects_invalid_openclaw_tool_mode(monkeypatch) -> None:
+    monkeypatch.setenv("SHELLBENCH_OPENCLAW_TOOL_MODE", "cod")
+
+    with pytest.raises(ValueError, match="must be one of"):
+        build_run_spec(
+            Namespace(
+                run_label="openclaw-tool-mode-invalid",
+                harness="openclaw",
+                harness_version="planned-version",
+                model_slug="gpt55",
+                model_id="gpt-5.5",
+                model_provider="openai",
+                proxy_model_name="gpt-5.5",
+                repetition=1,
+                expected_task_count=3,
+                run_date="20260730",
+            )
+        )
+
+
+def test_run_spec_rejects_openclaw_tool_mode_for_other_harness(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SHELLBENCH_OPENCLAW_TOOL_MODE", "code")
+
+    with pytest.raises(ValueError, match="requires the OpenClaw harness"):
+        build_run_spec(
+            Namespace(
+                run_label="codex-tool-mode-invalid",
+                harness="codex",
+                harness_version="planned-version",
+                model_slug="gpt55",
+                model_id="gpt-5.5",
+                model_provider="openai",
+                proxy_model_name="gpt-5.5",
+                repetition=1,
+                expected_task_count=3,
+                run_date="20260730",
+            )
+        )
 
 
 def test_harness_commands_preserve_canonical_model_identity() -> None:
@@ -703,7 +793,7 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
             assert "cat /logs/agent/codex-stderr.txt >&2" in command.run_command
 
 
-def test_openclaw_harness_disables_tool_search_by_default() -> None:
+def test_openclaw_harness_uses_direct_tools_by_default() -> None:
     run = RunSpec(
         run_label="openclaw-tool-search-off",
         harness="openclaw",
@@ -724,10 +814,11 @@ def test_openclaw_harness_disables_tool_search_by_default() -> None:
         mcp_servers=(),
     )
 
+    assert '"codeMode":false' in command.setup_command
     assert '"toolSearch":false' in command.setup_command
 
 
-def test_openclaw_harness_configures_tool_search_code_mode() -> None:
+def test_openclaw_harness_configures_code_mode() -> None:
     run = RunSpec(
         run_label="openclaw-tool-search-code",
         harness="openclaw",
@@ -739,7 +830,7 @@ def test_openclaw_harness_configures_tool_search_code_mode() -> None:
         repetition=1,
         expected_task_count=4,
         run_date="20260729",
-        openclaw_tool_search_mode="code",
+        openclaw_tool_mode="code",
     )
 
     command = build_harness_command(
@@ -749,7 +840,34 @@ def test_openclaw_harness_configures_tool_search_code_mode() -> None:
         mcp_servers=(),
     )
 
-    assert '"toolSearch":{"enabled":true,"mode":"code"}' in command.setup_command
+    assert '"codeMode":true' in command.setup_command
+    assert '"toolSearch":false' in command.setup_command
+
+
+def test_openclaw_harness_configures_tool_directory_mode() -> None:
+    run = RunSpec(
+        run_label="openclaw-tool-directory",
+        harness="openclaw",
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=4,
+        run_date="20260729",
+        openclaw_tool_mode="directory",
+    )
+
+    command = build_harness_command(
+        run,
+        proxy_url="http://host.docker.internal:4000",
+        proxy_key="local-proxy-key",
+        mcp_servers=(),
+    )
+
+    assert '"codeMode":false' in command.setup_command
+    assert '"toolSearch":{"enabled":true,"mode":"directory"}' in command.setup_command
 
 
 def test_openclaw_completion_probe_accepts_markerless_final_envelope(

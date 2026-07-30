@@ -5,6 +5,9 @@ from datetime import date
 from typing import Iterable
 
 
+OPENCLAW_TOOL_MODES = frozenset({"direct", "directory", "code"})
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     slug: str
@@ -32,7 +35,7 @@ class RunSpec:
     repetition: int
     expected_task_count: int
     run_date: str
-    openclaw_tool_search_mode: str | None = None
+    openclaw_tool_mode: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
