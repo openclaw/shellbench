@@ -1098,7 +1098,7 @@ def test_codex_harness_configures_code_mode() -> None:
     ) in command.setup_command
     assert "curl " not in command.setup_command
     assert "jq " not in command.setup_command
-    assert 'model_catalog_json = \\"/tmp/shellbench-codex/models.json\\"' in command.setup_command
+    assert 'model_catalog_json = "/tmp/shellbench-codex/models.json"' in command.setup_command
 
 
 def test_codex_harness_uses_direct_tools_by_default() -> None:
