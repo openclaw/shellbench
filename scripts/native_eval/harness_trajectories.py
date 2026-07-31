@@ -122,7 +122,6 @@ def write_openclaw_trajectory(
         and isinstance(visible_tools, list)
         and {"exec", "wait"} <= set(visible_tools)
         and not _OPENCLAW_CODE_MODE_HIDDEN_TOOLS & set(visible_tools)
-        and export_metadata.get("export_snapshot_available") is True
         and provider_transcript_used
         if run.openclaw_tool_mode == "code" and export_metadata
         else True

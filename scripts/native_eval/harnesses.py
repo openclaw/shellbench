@@ -84,6 +84,7 @@ mode = sys.argv[2]
 scope = sys.argv[3]
 try:
     manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    branch = json.loads((bundle / "session-branch.json").read_text(encoding="utf-8"))
     events = [
         json.loads(line)
         for line in (bundle / "events.jsonl").read_text(encoding="utf-8").splitlines()
@@ -114,6 +115,22 @@ if any(
     for warning in manifest.get("warnings", [])
 ):
     sys.exit(1)
+entries = branch.get("entries") if isinstance(branch, dict) else None
+if not isinstance(entries, list) or not entries or not all(
+    isinstance(entry, dict) for entry in entries
+):
+    sys.exit(1)
+provider_messages = [
+    entry.get("message")
+    for entry in entries
+    if entry.get("type") == "message" and isinstance(entry.get("message"), dict)
+]
+if not {"user", "assistant"} <= {
+    message.get("role")
+    for message in provider_messages
+    if isinstance(message.get("role"), str)
+}:
+    sys.exit(1)
 runtime = [event for event in events if event.get("source") == "runtime"]
 terminal = next(
     (event for event in reversed(runtime) if event.get("type") == "session.ended"),
@@ -141,24 +158,24 @@ if completion is None:
     if scope != "child" or terminal_status not in {"error", "interrupted"}:
         sys.exit(1)
 if mode == "code" and completion is not None:
-    completion_data = completion.get("data")
-    snapshot = (
-        completion_data.get("messagesSnapshot")
-        if isinstance(completion_data, dict)
-        else None
-    )
-    if (
-        not isinstance(completion_data, dict)
-        or completion_data.get("truncated") is True
-        or not isinstance(snapshot, list)
-        or not snapshot
-        or not all(isinstance(message, dict) for message in snapshot)
-        or not {"user", "assistant"} <= {
-            message.get("role")
-            for message in snapshot
-            if isinstance(message.get("role"), str)
-        }
-    ):
+    pending = set()
+    for message in provider_messages:
+        role = message.get("role")
+        if role == "assistant":
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "toolCall":
+                    continue
+                call_id = part.get("id")
+                if isinstance(call_id, str) and call_id:
+                    pending.add(call_id)
+        elif role == "toolResult":
+            call_id = message.get("toolCallId")
+            if isinstance(call_id, str) and call_id:
+                pending.discard(call_id)
+    if pending:
         sys.exit(1)
     context = next(
         (

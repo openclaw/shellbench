@@ -2572,6 +2572,20 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
         ]
         is False
     )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "root",
+            ],
+            check=False,
+        ).returncode
+        == 1
+    )
     branch_payload["entries"] = records
     branch_payload["leafId"] = records[-1]["id"]
     (bundle / "session-branch.json").write_text(
@@ -2609,7 +2623,7 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
             ],
             check=False,
         ).returncode
-        == 1
+        == 0
     )
     latest_completion["data"]["messagesSnapshot"] = snapshot
     latest_completion["data"].pop("messagesSnapshot")
@@ -2622,9 +2636,27 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
         run,
         agent_dir,
     )
-    assert incomplete_metadata["trajectory_status"] == "unavailable"
+    assert incomplete_metadata["trajectory_status"] == "real"
     assert incomplete_metadata["trajectory_validation"]["export_snapshot_used"] is False
-    assert incomplete_metadata["trajectory_validation"]["tool_mode_observed"] is False
+    assert incomplete_metadata["trajectory_validation"]["tool_mode_observed"] is True
+    assert (
+        incomplete_metadata["trajectory_validation"]["provider_transcript_complete"]
+        is True
+    )
+    assert (
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPENCLAW_EXPORT_READY,
+                str(bundle),
+                "code",
+                "root",
+            ],
+            check=False,
+        ).returncode
+        == 0
+    )
     latest_completion["data"]["messagesSnapshot"] = snapshot
     runtime_events[0]["data"]["providerVisibleTools"] = [{"name": "exec"}]
     (bundle / "events.jsonl").write_text(
