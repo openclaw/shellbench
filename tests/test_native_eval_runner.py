@@ -1046,6 +1046,8 @@ def test_openclaw_harness_configures_code_mode() -> None:
     assert '"codeMode":true' in command.setup_command
     assert '"toolSearch":false' in command.setup_command
     assert '"timeoutSeconds":3600' in command.setup_command
+    assert '"reasoning":true' in command.setup_command
+    assert '"input":["text","image"]' in command.setup_command
 
 
 def test_openclaw_harness_configures_tool_directory_mode() -> None:

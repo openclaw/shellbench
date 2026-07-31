@@ -423,6 +423,8 @@ def _openclaw(
                         {
                             "id": run.model_id,
                             "name": run.model_id,
+                            "reasoning": True,
+                            "input": ["text", "image"],
                         }
                     ],
                 }
