@@ -145,7 +145,8 @@ def write_openclaw_trajectory(
             export_metadata
             and export_metadata.get("export_terminal_status") != "success"
         )
-        or not snapshot_complete
+        # The provider branch is authoritative when present. Code-mode snapshots can
+        # lag on hidden nested calls that are not part of the public trajectory.
         or not provider_transcript_complete
         or not tool_mode_observed
         or session_tree_validation["session_tree_complete"] is not True
@@ -264,6 +265,8 @@ def write_openclaw_trajectory(
             "aborted": meta.get("aborted"),
             "terminal_event_seen": terminal_event_seen,
             "tool_mode_observed": tool_mode_observed,
+            "snapshot_complete": snapshot_complete,
+            "provider_transcript_complete": provider_transcript_complete,
             "cache_write_tokens": cache_write or None,
             **export_metadata,
             **session_tree_validation,
@@ -285,6 +288,8 @@ def write_openclaw_trajectory(
             "session_id": session_id,
             "terminal_event_seen": terminal_event_seen,
             "tool_mode_observed": tool_mode_observed,
+            "snapshot_complete": snapshot_complete,
+            "provider_transcript_complete": provider_transcript_complete,
             **export_metadata,
             **session_tree_validation,
         },

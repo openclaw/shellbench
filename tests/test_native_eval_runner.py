@@ -2535,7 +2535,7 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
         run,
         agent_dir,
     )
-    assert unresolved_tool_metadata["trajectory_status"] == "unavailable"
+    assert unresolved_tool_metadata["trajectory_status"] == "real"
     assert (
         unresolved_tool_metadata["trajectory_validation"]["export_snapshot_outcome"]
         == "unresolved_tool_call"
@@ -2548,6 +2548,35 @@ def test_openclaw_exported_trajectory_bundle_converts_to_atif(
     )
     assert (
         unresolved_tool_metadata["trajectory_validation"]["snapshot_complete"] is False
+    )
+    assert (
+        unresolved_tool_metadata["trajectory_validation"]["provider_transcript_complete"]
+        is True
+    )
+    branch_payload = json.loads((bundle / "session-branch.json").read_text())
+    branch_payload["entries"] = records[:2]
+    branch_payload["leafId"] = records[1]["id"]
+    (bundle / "session-branch.json").write_text(
+        json.dumps(branch_payload),
+        encoding="utf-8",
+    )
+    incomplete_provider_metadata = write_agent_trajectory(
+        _trajectory_task(tmp_path, "do the task"),
+        run,
+        agent_dir,
+    )
+    assert incomplete_provider_metadata["trajectory_status"] == "unavailable"
+    assert (
+        incomplete_provider_metadata["trajectory_validation"][
+            "provider_transcript_complete"
+        ]
+        is False
+    )
+    branch_payload["entries"] = records
+    branch_payload["leafId"] = records[-1]["id"]
+    (bundle / "session-branch.json").write_text(
+        json.dumps(branch_payload),
+        encoding="utf-8",
     )
     latest_completion["data"]["messagesSnapshot"] = snapshot
     terminal_event["data"] = {"status": "error"}
