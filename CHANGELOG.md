@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Time out hung `docker kill` and `docker compose down` cleanup so a stuck
+  Docker CLI cannot stall a native eval trial.
 - Record and enforce GPT reasoning effort in native runs, preserve it across
   reruns, and stabilize OpenClaw and Hermes trace completion.
 - Export OpenClaw and Hermes sessions reliably and convert their native traces
