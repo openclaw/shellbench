@@ -103,14 +103,17 @@ class DockerTaskEnvironment:
     def artifacts_dir(self) -> Path:
         return self.trial_dir / "artifacts"
 
-    async def start(self) -> CommandResult:
+    def prepare_trial_dirs(self) -> None:
         for path in (
             self.agent_dir,
             self.verifier_dir,
             self.artifacts_dir / "logs" / "artifacts",
         ):
             path.mkdir(parents=True, exist_ok=True)
-            path.chmod(0o777)
+            path.chmod(0o755)
+
+    async def start(self) -> CommandResult:
+        self.prepare_trial_dirs()
 
         started_at = utc_now()
         try:
