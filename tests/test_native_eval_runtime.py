@@ -123,3 +123,26 @@ def test_run_process_kills_and_reaps_hung_child(tmp_path: Path) -> None:
     while time.monotonic() < deadline and _pid_alive(pid):
         time.sleep(0.05)
     assert not _pid_alive(pid), f"child {pid} still running after cleanup timeout"
+
+
+def test_reap_process_returns_when_wait_hangs_after_kill() -> None:
+    class _StuckProcess:
+        returncode = None
+
+        def terminate(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            return None
+
+        async def wait(self) -> int:
+            await asyncio.Event().wait()
+            return 0
+
+    async def run() -> float:
+        started = time.monotonic()
+        await native_runtime._reap_process(_StuckProcess())
+        return time.monotonic() - started
+
+    elapsed = asyncio.run(run())
+    assert elapsed < 6

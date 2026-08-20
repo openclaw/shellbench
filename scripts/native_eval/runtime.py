@@ -1298,6 +1298,9 @@ def _timing(result: CommandResult) -> dict[str, str]:
     }
 
 
+REAP_WAIT_SEC = 2
+
+
 async def _reap_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
@@ -1306,14 +1309,18 @@ async def _reap_process(process: asyncio.subprocess.Process) -> None:
     except ProcessLookupError:
         return
     try:
-        async with asyncio.timeout(2):
+        async with asyncio.timeout(REAP_WAIT_SEC):
             await process.wait()
     except TimeoutError:
         try:
             process.kill()
         except ProcessLookupError:
             return
-        await process.wait()
+        try:
+            async with asyncio.timeout(REAP_WAIT_SEC):
+                await process.wait()
+        except TimeoutError:
+            return
 
 
 async def run_process(
