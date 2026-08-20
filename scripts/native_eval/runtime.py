@@ -1298,6 +1298,24 @@ def _timing(result: CommandResult) -> dict[str, str]:
     }
 
 
+async def _reap_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        async with asyncio.timeout(2):
+            await process.wait()
+    except TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        await process.wait()
+
+
 async def run_process(
     args: list[str],
     *,
@@ -1310,12 +1328,16 @@ async def run_process(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    await asyncio.gather(
-        _drain(process.stdout, stdout_path),
-        _drain(process.stderr, stderr_path),
-    )
-    returncode = await process.wait()
-    return CommandResult(returncode, started_at, utc_now())
+    try:
+        await asyncio.gather(
+            _drain(process.stdout, stdout_path),
+            _drain(process.stderr, stderr_path),
+        )
+        returncode = await process.wait()
+        return CommandResult(returncode, started_at, utc_now())
+    except (TimeoutError, asyncio.CancelledError):
+        await _reap_process(process)
+        raise
 
 
 async def capture_process(args: list[str]) -> str:
