@@ -564,7 +564,7 @@ class FleetController:
                 if self._local_artifacts(run.run_label):
                     raise FleetError("local artifacts exist but the remote run state is missing")
                 if not entry.get("bootstrapped_at_utc"):
-                    self._hydrate_lease(lease)
+                    self._hydrate_lease(lease, run)
                 self._dispatch(lease, run)
             elif remote_state == "stale":
                 raise FleetError("remote run state is stale and cannot be overwritten")
@@ -823,7 +823,7 @@ curl -fsS --max-time 3 \
             region=region,
         )
 
-    def _hydrate_lease(self, lease: Lease) -> None:
+    def _hydrate_lease(self, lease: Lease, run: RunSpec) -> None:
         assert self.runner_archive is not None
         remote_runner_archive = f"/tmp/{lease.slug}-runner.tar.gz"
         remote_task_archive = f"/tmp/{lease.slug}-tasks.tar.gz"
@@ -856,6 +856,7 @@ source_env=$4
 runner_commit=$5
 runner_sha256=$6
 task_sha256=$7
+harness=$8
 printf '%s  %s\n' "$runner_sha256" "$runner_archive" | sha256sum -c -
 printf '%s  %s\n' "$task_sha256" "$task_archive" | sha256sum -c -
 rm -rf "$root/runner.new" "$root/public-tasks.new"
@@ -868,7 +869,7 @@ mv "$root/runner.new" "$root/runner"
 mv "$root/public-tasks.new" "$root/public-tasks"
 printf '%s\n' "$runner_commit" > "$root/runner.commit"
 rm -f "$runner_archive" "$task_archive" "$source_env"
-bash "$root/runner/scripts/native_eval/bootstrap_beast.sh"
+bash "$root/runner/scripts/native_eval/bootstrap_beast.sh" "$harness"
 """
         self._checked(
             self._ssh_command(
@@ -885,6 +886,7 @@ bash "$root/runner/scripts/native_eval/bootstrap_beast.sh"
                     self.runner_commit,
                     self.runner_archive_sha256,
                     self.task_archive_sha256,
+                    run.harness,
                 ],
             ),
             capture_output=False,
