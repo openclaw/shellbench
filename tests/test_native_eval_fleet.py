@@ -1292,6 +1292,86 @@ def test_recovery_required_resumes_existing_remote_run(tmp_path: Path) -> None:
     assert final["status"] == "completed"
 
 
+@pytest.mark.parametrize("bootstrap_id,remote_state,hydrations", [
+    (None, "missing", 1),
+    ("cbx_old", "missing", 1),
+    ("cbx_1", "missing", 0),
+    (None, "running", 0),
+])
+def test_recovery_binds_bootstrap_to_lease_identity(
+    tmp_path: Path,
+    bootstrap_id: str | None,
+    remote_state: str,
+    hydrations: int,
+) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = _planned(_run_spec(label))
+    run.update(
+        {
+            "status": "recovery_required",
+            "requested_lease_slug": "replacement",
+            "bootstrapped_at_utc": "2026-07-27T00:00:00Z",
+        }
+    )
+    if bootstrap_id is not None:
+        run["bootstrapped_lease_id"] = bootstrap_id
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+    executor.remote_states[label] = remote_state
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    final = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
+    assert final["status"] == "completed"
+    assert final.get("bootstrapped_lease_id") == ("cbx_1" if hydrations else bootstrap_id)
+    assert sum(
+        command and command[0] == "ssh" and "fleet-hydrate" in " ".join(command)
+        for command in executor.commands
+    ) == hydrations
+    assert executor.dispatches == ([label] if remote_state == "missing" else [])
+    if not hydrations:
+        assert final["bootstrapped_at_utc"] == "2026-07-27T00:00:00Z"
+
+
+def test_recovery_retries_failed_hydration_before_binding_lease(tmp_path: Path) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = {
+        **_planned(_run_spec(label)),
+        "status": "recovery_required",
+        "requested_lease_slug": "replacement",
+        "bootstrapped_at_utc": "2026-07-27T00:00:00Z",
+    }
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+
+    class HydrationFailureExecutor(FakeExecutor):
+        attempts = 0
+
+        def run(self, command, *, capture_output=False):
+            result = super().run(command, capture_output=capture_output)
+            if command[0] == "ssh" and "fleet-hydrate" in " ".join(command):
+                self.attempts += 1
+                if self.attempts == 1:
+                    return _result(command, 1, stderr="bootstrap failed")
+            return result
+
+    executor = HydrationFailureExecutor(config.local_root, expected_counts={label: 2})
+    assert FleetController(config, executor=executor).run() == 1
+    failed = json.loads(run_index.read_text())["runs"][0]
+    assert failed["status"] == "recovery_required"
+    assert "bootstrapped_lease_id" not in failed
+    assert executor.dispatches == []
+
+    assert FleetController(config, executor=executor).run() == 0
+    recovered = json.loads(run_index.read_text())["runs"][0]
+    assert recovered["bootstrapped_lease_id"] == "cbx_1"
+    assert executor.attempts == 2
+    assert executor.dispatches == [label]
+
+
 def test_recovery_infers_success_from_verified_full_archive_and_done_log(
     tmp_path: Path,
 ) -> None:

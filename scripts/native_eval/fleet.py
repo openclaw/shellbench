@@ -563,7 +563,8 @@ class FleetController:
             if remote_state == "missing":
                 if self._local_artifacts(run.run_label):
                     raise FleetError("local artifacts exist but the remote run state is missing")
-                if not entry.get("bootstrapped_at_utc"):
+                current = self._store.get(run.run_label)
+                if current.get("bootstrapped_lease_id") != lease.lease_id:
                     self._hydrate_lease(lease, run)
                 self._dispatch(lease, run)
             elif remote_state == "stale":
@@ -896,6 +897,7 @@ bash "$root/runner/scripts/native_eval/bootstrap_beast.sh" "$harness"
             self._run_label_for_lease(lease.lease_id),
             status="ready",
             bootstrapped_at_utc=utc_now(),
+            bootstrapped_lease_id=lease.lease_id,
         )
 
     def _probe_remote(self, lease: Lease, run_label: str) -> str:
