@@ -91,6 +91,9 @@ PER_TASK_FIELDS = (
     "trial_name",
     "result_path",
     "classification",
+    "execution_outcome",
+    "execution_exit_code",
+    "execution_reason",
     "reward",
     "exception_type",
     "exception_message",
@@ -142,6 +145,8 @@ RUN_FIELDS = (
     "infra_dominated",
     "harness_wide_failure",
     "harness_wide_failure_signature",
+    "run_accepted",
+    "run_acceptance_reason",
     "canonical_model_identity",
     "trajectory_complete",
     "parity_validated",
@@ -278,8 +283,18 @@ def _is_infra(exception_type: str, exception_message: str) -> bool:
     return any(pattern in combined for pattern in INFRA_MESSAGE_PATTERNS)
 
 
-def _classify(result: dict[str, Any], reward: int | float | None) -> str:
+def _classify(
+    result: dict[str, Any],
+    reward: int | float | None,
+    execution_kind: str,
+) -> str:
     exception_type, exception_message, _ = _exception_fields(result)
+    if execution_kind in {"harness_error", "infra_error"}:
+        return "infra"
+    if execution_kind == "verifier_error":
+        return "verifier_missing_reward"
+    if execution_kind == "agent_error":
+        return "agent_exit"
     if exception_type in MISSING_REWARD_EXCEPTION_TYPES:
         return "verifier_missing_reward"
     if exception_type:
@@ -293,6 +308,40 @@ def _classify(result: dict[str, Any], reward: int | float | None) -> str:
     if reward < 1:
         return "partial"
     return "pass"
+
+
+def _execution_fields(
+    result: dict[str, Any],
+    *,
+    harness: str,
+) -> tuple[str, int | None, str]:
+    outcome = result.get("execution_outcome")
+    if isinstance(outcome, dict):
+        kind = str(outcome.get("kind") or "")
+        if kind and kind != "pending":
+            exit_code = _number(outcome.get("exit_code"))
+            return (
+                kind,
+                int(exit_code) if exit_code is not None else None,
+                str(outcome.get("reason") or ""),
+            )
+
+    exception_type, exception_message, _ = _exception_fields(result)
+    exit_match = re.search(r"\bcode\s+(\d+)\b", exception_message)
+    exit_code = int(exit_match.group(1)) if exit_match else None
+    if (
+        harness == "openclaw"
+        and exception_type == "NonZeroAgentExitCodeError"
+        and exit_code in {70, 71}
+    ):
+        return "harness_error", exit_code, exception_message
+    if exception_type in MISSING_REWARD_EXCEPTION_TYPES:
+        return "verifier_error", exit_code, exception_message
+    if exception_type and _is_infra(exception_type, exception_message):
+        return "infra_error", exit_code, exception_message
+    if exception_type:
+        return "agent_error", exit_code, exception_message
+    return "clean", None, ""
 
 
 def _scorecard_infra_error(trial_dir: Path) -> tuple[str, str] | None:
@@ -525,6 +574,7 @@ def _normalize_result(
     run_label: str,
     pair_label: str,
     repetition: int | None,
+    harness: str,
 ) -> dict[str, Any]:
     task_name, task_path, trial_name = _task_identity(result, result_path.parent)
     reward = _reward(result)
@@ -532,6 +582,13 @@ def _normalize_result(
     scorecard_infra = _scorecard_infra_error(result_path.parent)
     if scorecard_infra is not None:
         exception_type, exception_message = scorecard_infra
+    execution_kind, execution_exit_code, execution_reason = _execution_fields(
+        result,
+        harness=harness,
+    )
+    if scorecard_infra is not None:
+        execution_kind = "infra_error"
+        execution_reason = exception_message
     agent_result = result.get("agent_result")
     agent_result = agent_result if isinstance(agent_result, dict) else {}
     row: dict[str, Any] = {
@@ -543,8 +600,13 @@ def _normalize_result(
         "trial_name": trial_name,
         "result_path": str(result_path),
         "classification": (
-            "infra" if scorecard_infra is not None else _classify(result, reward)
+            "infra"
+            if scorecard_infra is not None
+            else _classify(result, reward, execution_kind)
         ),
+        "execution_outcome": execution_kind,
+        "execution_exit_code": execution_exit_code,
+        "execution_reason": execution_reason,
         "reward": reward,
         "exception_type": exception_type,
         "exception_message": exception_message,
@@ -654,6 +716,7 @@ def _load_run(
     run_label = str(manifest.get("run_label") or run_label)
     pair_label = _pair_label(manifest, run_label)
     repetition = _repetition(manifest, run_label)
+    harness = str(manifest.get("harness") or "")
 
     rows: list[dict[str, Any]] = []
     trial_dirs = sorted(path for path in run_dir.iterdir() if path.is_dir())
@@ -699,6 +762,7 @@ def _load_run(
                 run_label=run_label,
                 pair_label=pair_label,
                 repetition=repetition,
+                harness=harness,
             )
         )
 
@@ -840,6 +904,10 @@ def _summarize_run(
     classifications = [str(row["classification"]) for row in scored_rows]
     rewards = [_number(row.get("reward")) for row in scored_rows]
     all_classifications = [str(row["classification"]) for row in rows]
+    execution_kinds = [
+        str(row.get("execution_outcome") or "")
+        for row in scored_rows
+    ]
     result_file_count = sum(bool(row.get("_has_result_file")) for row in rows)
     valid_result_count = sum(bool(row.get("_valid_result")) for row in rows)
     completed_result_count = sum(bool(row.get("_completed_result")) for row in rows)
@@ -874,6 +942,25 @@ def _summarize_run(
         rows,
         expected_count,
     )
+    acceptance = manifest.get("execution_acceptance")
+    acceptance = acceptance if isinstance(acceptance, dict) else {}
+    accepted_value = acceptance.get("accepted")
+    if isinstance(accepted_value, bool):
+        run_accepted = accepted_value
+    else:
+        invalid_execution_kinds = {
+            "harness_error",
+            "infra_error",
+            "verifier_error",
+        }
+        run_accepted = not (
+            expected_count > 0
+            and len(execution_kinds) == expected_count
+            and all(kind in invalid_execution_kinds for kind in execution_kinds)
+        )
+    run_acceptance_reason = str(acceptance.get("reason") or "")
+    if not run_accepted and not run_acceptance_reason:
+        run_acceptance_reason = "all_trials_harness_or_infrastructure_errors"
     native_run = (
         manifest.get("runner") == "shellbench-native"
         or any(row.get("source") == "shellbench-native" for row in rows)
@@ -917,6 +1004,7 @@ def _summarize_run(
     ) = _parity_validation(manifest, native_run=native_run)
     eligible = (
         not incomplete
+        and run_accepted
         and not infra_dominated
         and not harness_wide_failure
         and canonical_model_identity
@@ -926,6 +1014,8 @@ def _summarize_run(
         exclusion_reason = "incomplete"
     elif infra_dominated:
         exclusion_reason = "infra_dominated"
+    elif not run_accepted:
+        exclusion_reason = "run_rejected"
     elif harness_wide_failure:
         exclusion_reason = "harness_wide_failure"
     elif not canonical_model_identity:
@@ -962,6 +1052,8 @@ def _summarize_run(
         "infra_dominated": infra_dominated,
         "harness_wide_failure": harness_wide_failure,
         "harness_wide_failure_signature": harness_wide_failure_signature,
+        "run_accepted": run_accepted,
+        "run_acceptance_reason": run_acceptance_reason,
         "canonical_model_identity": canonical_model_identity,
         "trajectory_complete": trajectory_complete,
         "parity_validated": parity_validated,
@@ -1184,9 +1276,9 @@ def _write_leaderboard(path: Path, pairs: Sequence[dict[str, Any]]) -> None:
     lines = [
         "# Cleaned Native ShellBench Leaderboard",
         "",
-        "Incomplete, infra-dominated, harness-wide failure, identity-invalid, and "
-        "trajectory-incomplete repetitions are excluded. Harbor parity validation is "
-        "reported separately and is not an eligibility gate.",
+        "Incomplete, rejected, infra-dominated, harness-wide failure, identity-invalid, "
+        "and trajectory-incomplete repetitions are excluded. Harbor parity validation "
+        "is reported separately and is not an eligibility gate.",
         "",
         "| Rank | Pair | Repetitions | Parity validated | Mean | Stdev | Min | Max | Mean exact passes | Pass rate | Clean complete |",
         "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
