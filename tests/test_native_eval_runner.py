@@ -495,6 +495,7 @@ def test_run_manifest_records_native_audit_metadata(
         repetition=1,
         expected_task_count=2,
         run_date="20260727",
+        reasoning_effort="high",
     )
 
     manifest = _run_manifest(
@@ -787,6 +788,96 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
         if harness.name == "codex":
             assert "2>/logs/agent/codex-stderr.txt" in command.run_command
             assert "cat /logs/agent/codex-stderr.txt >&2" in command.run_command
+
+
+@pytest.mark.parametrize("effort", ("low", "medium", "high", "xhigh"))
+@pytest.mark.parametrize("harness", ("openclaw", "hermes", "codex", "claude-code"))
+def test_harness_commands_apply_native_reasoning_effort(
+    harness: str,
+    effort: str,
+) -> None:
+    run = RunSpec(
+        run_label=f"{harness}-{effort}",
+        harness=harness,
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=116,
+        run_date="20260729",
+        reasoning_effort=effort,
+    )
+
+    command = build_harness_command(
+        run,
+        proxy_url="http://host.docker.internal:4000",
+        proxy_key="local-proxy-key",
+        mcp_servers=(),
+    )
+
+    if harness == "openclaw":
+        assert f"--thinking {effort}" in command.run_command
+    elif harness == "hermes":
+        assert f'"reasoning_effort":"{effort}"' in command.setup_command
+    elif harness == "codex":
+        assert f'model_reasoning_effort="{effort}"' in command.run_command
+    else:
+        expected_effort = "max" if effort == "xhigh" else effort
+        assert f"--effort {expected_effort}" in command.run_command
+
+
+def test_harness_commands_preserve_defaults_without_reasoning_effort() -> None:
+    commands = {}
+    for harness in ("openclaw", "hermes", "codex", "claude-code"):
+        run = RunSpec(
+            run_label=f"{harness}-default",
+            harness=harness,
+            harness_version="test",
+            model_slug="gpt55",
+            model_id="gpt-5.5",
+            provider="openai",
+            proxy_model_name="gpt-5.5",
+            repetition=1,
+            expected_task_count=116,
+            run_date="20260729",
+        )
+        commands[harness] = build_harness_command(
+            run,
+            proxy_url="http://host.docker.internal:4000",
+            proxy_key="local-proxy-key",
+            mcp_servers=(),
+        )
+
+    assert "--thinking off" in commands["openclaw"].run_command
+    assert '"reasoning_effort"' not in commands["hermes"].setup_command
+    assert "model_reasoning_effort" not in commands["codex"].run_command
+    assert "--effort" not in commands["claude-code"].run_command
+
+
+def test_build_run_spec_records_reasoning_effort_from_environment(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SHELLBENCH_REASONING_EFFORT", "xhigh")
+
+    run = build_run_spec(
+        Namespace(
+            run_label="openclaw-gpt56-sol-xhigh",
+            harness="openclaw",
+            harness_version="test",
+            model_slug="gpt56-sol",
+            model_id=None,
+            model_provider=None,
+            proxy_model_name=None,
+            repetition=1,
+            expected_task_count=116,
+            run_date="20260729",
+            reasoning_effort=None,
+        )
+    )
+
+    assert run.reasoning_effort == "xhigh"
 
 
 def test_openclaw_completion_probe_accepts_markerless_final_envelope(

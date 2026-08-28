@@ -26,6 +26,10 @@ from scripts.native_eval.fleet import (
 from scripts.native_eval.models import RunSpec
 
 
+# Bound deadlocks, not scheduler latency; only the tests release blocked jobs.
+SCHEDULER_TEST_TIMEOUT = 30
+
+
 def _run_spec(
     label: str,
     *,
@@ -109,7 +113,7 @@ def test_remote_run_archives_terminal_status(tmp_path: Path, exit_code: int) -> 
     shell_env = tmp_path / "bash_env"
     shell_env.write_text(
         '''python3() {
-  if [[ "$1" == "-" ]]; then cat >/dev/null; return 0; fi
+  if [[ "$*" == *--prepare-proxy-config* ]]; then printf 'high\\n'; return 0; fi
   mkdir -p "$TEST_ROOT/results/jobs/$TEST_LABEL/task__trial"
   printf '{}\\n' > "$TEST_ROOT/results/jobs/$TEST_LABEL/task__trial/result.json"
   printf '{}\\n' > "$TEST_ROOT/results/jobs/$TEST_LABEL/run_manifest.json"
@@ -1067,12 +1071,12 @@ def test_slow_capped_model_does_not_block_refilling_eligible_slot(
     )
     controller.start()
     try:
-        assert executor.wait_for_dispatch(later_gpt, timeout=2)
+        assert executor.wait_for_dispatch(later_gpt, timeout=SCHEDULER_TEST_TIMEOUT)
         assert capped_fable not in executor.dispatches
         assert not release_slow.is_set()
     finally:
         release_slow.set()
-        controller.join(timeout=5)
+        controller.join(timeout=SCHEDULER_TEST_TIMEOUT)
 
     assert not controller.is_alive()
     assert result == [0]
@@ -1143,7 +1147,9 @@ def test_recovery_pending_entries_respect_capacity_behind_owned_runs(
     )
     controller.start()
     try:
-        assert executor.wait_for_dispatch(pending_labels[0], timeout=2)
+        assert executor.wait_for_dispatch(
+            pending_labels[0], timeout=SCHEDULER_TEST_TIMEOUT
+        )
         assert executor.dispatches == [pending_labels[0]]
         index = json.loads(run_index.read_text(encoding="utf-8"))
         pending_statuses = {
@@ -1155,7 +1161,7 @@ def test_recovery_pending_entries_respect_capacity_behind_owned_runs(
         assert executor.active_leases == 10
     finally:
         release_runs.set()
-        controller.join(timeout=10)
+        controller.join(timeout=SCHEDULER_TEST_TIMEOUT)
 
     assert not controller.is_alive()
     assert result == [0]
