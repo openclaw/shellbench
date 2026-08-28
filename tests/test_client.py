@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from websockets.asyncio.server import serve
 from websockets.datastructures import Headers
 from websockets.exceptions import InvalidMessage, InvalidStatus
 from websockets.http11 import Response
@@ -20,6 +21,48 @@ def test_gateway_config_defaults():
     # spurious empty_response failures.
     assert cfg.connect_timeout == 30.0
     assert cfg.request_timeout == 60.0
+
+
+@pytest.mark.asyncio
+async def test_gateway_client_connects_and_creates_session_over_websocket(monkeypatch):
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    requests = []
+    origins = []
+
+    async def gateway(websocket):
+        origins.append(websocket.request.headers["Origin"])
+        await websocket.send(
+            json.dumps({"type": "event", "event": "connect.challenge", "payload": {"nonce": ""}})
+        )
+        async for raw in websocket:
+            request = json.loads(raw)
+            requests.append(request)
+            payload = (
+                {"type": "hello-ok", "protocol": 3}
+                if request["method"] == "connect"
+                else {"sessionKey": "loopback-session"}
+            )
+            await websocket.send(
+                json.dumps({"type": "res", "id": request["id"], "ok": True, "payload": payload})
+            )
+
+    async with asyncio.timeout(10):
+        async with serve(gateway, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            config = GatewayConfig(
+                url=f"ws://127.0.0.1:{port}", connect_timeout=2, request_timeout=2
+            )
+            async with GatewayClient(config) as client:
+                session = await client.create_session(model="test/model", label="dependency-smoke")
+            assert client._ws is None
+
+    assert session == "loopback-session"
+    assert origins == [f"http://127.0.0.1:{port}"]
+    assert [request["method"] for request in requests] == ["connect", "sessions.create"]
+    assert requests[0]["params"]["minProtocol"] == 3
+    assert requests[0]["params"]["maxProtocol"] == 4
+    assert requests[1]["params"] == {"model": "test/model", "label": "dependency-smoke"}
 
 
 def test_set_session_auth_profile_override_patches_local_store(tmp_path: Path, monkeypatch):
