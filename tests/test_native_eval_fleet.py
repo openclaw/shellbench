@@ -564,6 +564,25 @@ def test_controller_runs_bounded_wave_and_stops_after_verified_export(
     assert "TOPSECRET" not in "\n".join(" ".join(command) for command in executor.commands)
 
 
+@pytest.mark.parametrize("harness", ["openclaw", "codex", "claude-code", "hermes"])
+def test_controller_hydrates_selected_harness(tmp_path: Path, harness: str) -> None:
+    label = f"{harness}-gpt55-full-2-r1-20260727"
+    entry = {**_planned(_run_spec(label)), "harness": harness}
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [entry])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    hydration = next(
+        shlex.split(command[-1]) for command in executor.commands
+        if command[0] == "ssh" and "fleet-hydrate" in command[-1]
+    )
+    assert hydration[-1] == harness
+    assert 'bootstrap_beast.sh" "$harness"' in hydration[2]
+
+
 def test_controller_dispatches_only_matching_parity_scope(tmp_path: Path) -> None:
     label = "openclaw-gpt55-full-2-r1-20260727"
     run_index = tmp_path / "manifests" / "run_index.json"

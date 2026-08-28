@@ -75,6 +75,13 @@ The code source of truth is `scripts/native_eval/models.py` and
 | Node | `22.23.1` |
 | LiteLLM | `1.93.0` |
 
+Fleet bootstrap installs only the harness assigned to each lease, alongside
+shared Docker, Node, uv, and LiteLLM dependencies. The toolchain manifest records
+the selected `harness` and its installed version; unused harness keys are absent.
+For manual bootstrap, pass exactly one harness:
+`bash scripts/native_eval/bootstrap_beast.sh openclaw` (or `codex`, `claude-code`,
+`hermes`). Omitting the selection is an error.
+
 Before every campaign:
 
 1. compare this table with the code pins

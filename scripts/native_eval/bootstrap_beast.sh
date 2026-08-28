@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+HARNESS="${1:-}"
+if [[ $# -ne 1 ]] || [[ ! "$HARNESS" =~ ^(openclaw|codex|claude-code|hermes)$ ]]; then
+  echo "Usage: $0 {openclaw|codex|claude-code|hermes}" >&2
+  exit 2
+fi
+
 TOOLCHAIN_ROOT="${TOOLCHAIN_ROOT:-/opt/shellbench-native}"
 NODE_VERSION="${NODE_VERSION:-22.23.1}"
 OPENCLAW_VERSION="${OPENCLAW_VERSION:-2026.7.1-2}"
@@ -65,7 +71,7 @@ EOF
   docker run --rm hello-world >/dev/null
 }
 
-install_node_tools() {
+install_node() {
   local node_root="$TOOLCHAIN_ROOT/node"
   if [[ ! -x "$node_root/bin/node" ]] || \
     [[ "$("$node_root/bin/node" --version)" != "v$NODE_VERSION" ]]; then
@@ -79,14 +85,11 @@ install_node_tools() {
   fi
 
   export PATH="$node_root/bin:$PATH"
-  rm -rf "$TOOLCHAIN_ROOT/npm-packages"
-  npm install --prefix "$TOOLCHAIN_ROOT/npm-packages" \
-    "openclaw@$OPENCLAW_VERSION" \
-    "@openai/codex@$CODEX_VERSION" \
-    "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
 }
 
 install_uv() {
+  export UV_PYTHON_INSTALL_DIR="$TOOLCHAIN_ROOT/uv-python"
+  export UV_CACHE_DIR="$TOOLCHAIN_ROOT/uv-cache"
   install -d -m 0755 "$TOOLCHAIN_ROOT/bin"
   if [[ ! -x "$TOOLCHAIN_ROOT/bin/uv" ]]; then
     curl -LsSf https://astral.sh/uv/install.sh -o /tmp/install-uv.sh
@@ -99,8 +102,6 @@ install_hermes() {
   export HOME="$TOOLCHAIN_ROOT/home"
   export HERMES_HOME="$TOOLCHAIN_ROOT/hermes-home"
   export HERMES_INSTALL_DIR="$TOOLCHAIN_ROOT/hermes-agent"
-  export UV_PYTHON_INSTALL_DIR="$TOOLCHAIN_ROOT/uv-python"
-  export UV_CACHE_DIR="$TOOLCHAIN_ROOT/uv-cache"
   export PATH="$TOOLCHAIN_ROOT/node/bin:$TOOLCHAIN_ROOT/bin:$PATH"
   install -d -m 0755 "$HOME" "$HERMES_HOME"
 
@@ -124,35 +125,51 @@ install_litellm() {
     "litellm[proxy]==$LITELLM_VERSION"
 }
 
+install_harness() {
+  local package
+  case "$HARNESS" in
+    openclaw) package="openclaw@$OPENCLAW_VERSION" ;;
+    codex) package="@openai/codex@$CODEX_VERSION" ;;
+    claude-code) package="@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" ;;
+    hermes) install_hermes; return ;;
+  esac
+  rm -rf "$TOOLCHAIN_ROOT/npm-packages"
+  npm install --prefix "$TOOLCHAIN_ROOT/npm-packages" "$package"
+}
+
 write_manifest() {
   export PATH="$TOOLCHAIN_ROOT/node/bin:$TOOLCHAIN_ROOT/npm-packages/node_modules/.bin:$TOOLCHAIN_ROOT/home/.local/bin:$PATH"
+  local harness_version
+  case "$HARNESS" in
+    openclaw) harness_version=$(openclaw --version) ;;
+    codex) harness_version=$(codex --version) ;;
+    claude-code) harness_version=$(claude --version) ;;
+    hermes) harness_version=$(hermes version) ;;
+  esac
   jq -n \
     --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg node "$(node --version)" \
-    --arg openclaw "$(openclaw --version | head -1)" \
-    --arg codex "$(codex --version | head -1)" \
-    --arg claude_code "$(claude --version | head -1)" \
-    --arg hermes "$(hermes version | head -1)" \
+    --arg harness "$HARNESS" \
+    --arg harness_key "${HARNESS//-/_}" \
+    --arg harness_version "${harness_version%%$'\n'*}" \
     --arg litellm "$("$TOOLCHAIN_ROOT/litellm-venv/bin/python" -c 'from importlib.metadata import version; print(version("litellm"))')" \
     --arg hermes_commit "$HERMES_COMMIT" \
     '{
       created_at_utc: $created_at,
       node: $node,
-      openclaw: $openclaw,
-      codex: $codex,
-      claude_code: $claude_code,
-      hermes: $hermes,
-      hermes_commit: $hermes_commit,
+      harness: $harness,
+      ($harness_key): $harness_version,
       litellm: $litellm
-    }' > "$TOOLCHAIN_ROOT/manifest.json"
+    } + (if $harness == "hermes" then {hermes_commit: $hermes_commit} else {} end)' \
+    > "$TOOLCHAIN_ROOT/manifest.json"
   chmod -R a+rX "$TOOLCHAIN_ROOT"
 }
 
 install_base_packages
 install_docker
-install_node_tools
+install_node
 install_uv
-install_hermes
+install_harness
 install_litellm
 write_manifest
 
