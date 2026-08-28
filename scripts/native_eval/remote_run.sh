@@ -61,6 +61,8 @@ cleanup() {
 trap cleanup EXIT
 
 umask 077
+# Fleet's planned value takes precedence over defaults in the provider file.
+PLANNED_REASONING_EFFORT="${SHELLBENCH_REASONING_EFFORT:-}"
 set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
@@ -77,11 +79,39 @@ printf '%s\n' "running" > "$RUN_STATE_DIR/state"
 export SHELLBENCH_PROXY_KEY="${SHELLBENCH_PROXY_KEY:-$(openssl rand -hex 32)}"
 
 cd "$ROOT/runner"
-python3 - <<PY
-from pathlib import Path
-from scripts.native_eval.proxy import write_proxy_config
-write_proxy_config(Path(${PROXY_CONFIG@Q}))
-PY
+RUN_COMMAND=(
+  python3 -m scripts.native_eval.run_job
+  --tasks-root "$TASKS_ROOT"
+  --jobs-dir "$ROOT/results/jobs"
+  --run-label "$RUN_LABEL"
+  --harness "$HARNESS"
+  --harness-version "$HARNESS_VERSION"
+  --model-slug "$MODEL_SLUG"
+  --model-id "$MODEL_ID"
+  --model-provider "$MODEL_PROVIDER"
+  --proxy-model-name "$PROXY_MODEL_NAME"
+  --repetition "$REPETITION"
+  --expected-task-count "$EXPECTED_TASK_COUNT"
+  --public-tasks-commit "$PUBLIC_TASKS_COMMIT"
+  --task-suite-path "$TASK_SUITE_PATH"
+  --run-date "$RUN_DATE"
+  --toolchain-root "$TOOLCHAIN_ROOT"
+  --proxy-url "http://host.docker.internal:4000"
+  --concurrency "$CONCURRENCY"
+)
+if [[ -n "$PLANNED_REASONING_EFFORT" ]]; then
+  RUN_COMMAND+=(--reasoning-effort "$PLANNED_REASONING_EFFORT")
+fi
+if [[ -n "$RERUN_OF_CANONICAL_RUN" ]]; then
+  RUN_COMMAND+=(--rerun-of-canonical-run "$RERUN_OF_CANONICAL_RUN")
+fi
+for task_name in "${TASK_NAMES[@]}"; do
+  RUN_COMMAND+=(--task "$task_name")
+done
+
+# Resolve once before proxy startup; the runner must see this same value.
+SHELLBENCH_REASONING_EFFORT=$("${RUN_COMMAND[@]}" --prepare-proxy-config "$PROXY_CONFIG")
+export SHELLBENCH_REASONING_EFFORT
 
 "$TOOLCHAIN_ROOT/litellm-venv/bin/litellm" \
   --config "$PROXY_CONFIG" \
@@ -107,33 +137,6 @@ done
 curl -fsS \
   -H "Authorization: Bearer $SHELLBENCH_PROXY_KEY" \
   http://127.0.0.1:4000/health/liveliness >/dev/null
-
-RUN_COMMAND=(
-  python3 -m scripts.native_eval.run_job
-  --tasks-root "$TASKS_ROOT"
-  --jobs-dir "$ROOT/results/jobs"
-  --run-label "$RUN_LABEL"
-  --harness "$HARNESS"
-  --harness-version "$HARNESS_VERSION"
-  --model-slug "$MODEL_SLUG"
-  --model-id "$MODEL_ID"
-  --model-provider "$MODEL_PROVIDER"
-  --proxy-model-name "$PROXY_MODEL_NAME"
-  --repetition "$REPETITION"
-  --expected-task-count "$EXPECTED_TASK_COUNT"
-  --public-tasks-commit "$PUBLIC_TASKS_COMMIT"
-  --task-suite-path "$TASK_SUITE_PATH"
-  --run-date "$RUN_DATE"
-  --toolchain-root "$TOOLCHAIN_ROOT"
-  --proxy-url "http://host.docker.internal:4000"
-  --concurrency "$CONCURRENCY"
-)
-if [[ -n "$RERUN_OF_CANONICAL_RUN" ]]; then
-  RUN_COMMAND+=(--rerun-of-canonical-run "$RERUN_OF_CANONICAL_RUN")
-fi
-for task_name in "${TASK_NAMES[@]}"; do
-  RUN_COMMAND+=(--task "$task_name")
-done
 
 set +e
 "${RUN_COMMAND[@]}"

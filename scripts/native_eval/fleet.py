@@ -1479,7 +1479,10 @@ printf '%s\n' "$pid"
 
     def _run_spec(self, entry: dict[str, Any]) -> RunSpec:
         try:
-            return RunSpec(**{field: entry[field] for field in RUN_SPEC_FIELDS})
+            return RunSpec(
+                **{field: entry[field] for field in RUN_SPEC_FIELDS},
+                reasoning_effort=entry.get("reasoning_effort"),
+            )
         except KeyError as exc:
             raise FleetError(
                 f"run entry {entry.get('run_label', '<unknown>')} lacks {exc.args[0]}"

@@ -17,6 +17,7 @@ from scripts.native_eval.models import (
     model_by_slug,
     trajectory_mode_for_harness,
 )
+from scripts.native_eval.proxy import REASONING_EFFORTS, write_proxy_config
 from scripts.native_eval.runtime import atomic_write_json, run_trial, utc_now
 from scripts.native_eval.tasks import TaskSpec, validate_suite
 
@@ -298,7 +299,7 @@ def _run_manifest(
             "SHELLBENCH_HARBOR_REFERENCE_COMMIT"
         ),
         "judge_model_id": os.environ.get("SHELLBENCH_JUDGE_MODEL_ID"),
-        "reasoning_effort": os.environ.get("SHELLBENCH_REASONING_EFFORT"),
+        "reasoning_effort": run.reasoning_effort,
         "judge_reasoning_effort": os.environ.get(
             "SHELLBENCH_JUDGE_REASONING_EFFORT"
         ),
@@ -391,6 +392,16 @@ def _runner_patch_hash() -> str:
 def build_run_spec(args: argparse.Namespace) -> RunSpec:
     harness = harness_by_name(args.harness)
     model = model_by_slug(args.model_slug)
+    cli_effort = getattr(args, "reasoning_effort", None)
+    environment_effort = os.environ.get("SHELLBENCH_REASONING_EFFORT", "").strip()
+    if cli_effort and environment_effort and cli_effort != environment_effort:
+        raise ValueError(
+            "--reasoning-effort conflicts with SHELLBENCH_REASONING_EFFORT; "
+            "resolve it with --prepare-proxy-config before starting the proxy"
+        )
+    reasoning_effort = cli_effort or environment_effort or None
+    if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
+        raise ValueError("reasoning effort must be low, medium, high, or xhigh")
     return RunSpec(
         run_label=args.run_label,
         harness=harness.name,
@@ -402,6 +413,7 @@ def build_run_spec(args: argparse.Namespace) -> RunSpec:
         repetition=args.repetition,
         expected_task_count=args.expected_task_count,
         run_date=args.run_date,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -429,6 +441,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task-suite-path", required=True)
     parser.add_argument("--run-date", required=True)
     parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "high", "xhigh"),
+    )
+    parser.add_argument(
+        "--prepare-proxy-config",
+        type=Path,
+        help="Resolve effort, write proxy config, print the effort, and exit before running tasks.",
+    )
+    parser.add_argument(
         "--toolchain-root",
         type=Path,
         default=Path("/opt/shellbench-native"),
@@ -450,12 +471,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # Overrides are safe only while preparing a proxy that has not started yet.
+    if args.prepare_proxy_config and args.reasoning_effort:
+        os.environ["SHELLBENCH_REASONING_EFFORT"] = args.reasoning_effort
+    run = build_run_spec(args)
+    if args.prepare_proxy_config:
+        write_proxy_config(args.prepare_proxy_config)
+        print(run.reasoning_effort)
+        return
     proxy_key = os.environ.get("SHELLBENCH_PROXY_KEY", "")
     state = asyncio.run(
         run_job(
             tasks_root=args.tasks_root,
             jobs_dir=args.jobs_dir,
-            run=build_run_spec(args),
+            run=run,
             public_tasks_commit=args.public_tasks_commit,
             task_suite_path=args.task_suite_path,
             toolchain_root=args.toolchain_root,

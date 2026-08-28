@@ -32,6 +32,7 @@ class RunSpec:
     repetition: int
     expected_task_count: int
     run_date: str
+    reasoning_effort: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -162,6 +163,7 @@ def build_matrix_plan(
                         repetition=repetition,
                         expected_task_count=expected_task_count,
                         run_date=stamp,
+                        reasoning_effort=reasoning_effort,
                     )
                 )
     return plan

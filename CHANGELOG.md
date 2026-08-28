@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Apply planned native reasoning effort to all four harnesses and resolve proxy, runner, and manifest precedence before proxy startup (#53, thanks @vincentkoc).
 - Rehydrate replacement native fleet leases instead of trusting stale bootstrap timestamps (#58, thanks @vincentkoc).
 - Separate native execution validity from diagnostic rewards, reject wholly invalid runs, and preserve terminal exit status in recovery archives (#63, thanks @vincentkoc).
 - Install only the assigned native harness on each fleet lease and record only its version in the toolchain manifest (#65).
