@@ -85,6 +85,22 @@ Before every campaign:
 Do not update a pin during a campaign. Start a new campaign ID when a harness,
 runner, task, provider route, or judge version changes.
 
+For a trusted, unpublished OpenClaw build, pass its npm package tarball to the
+fleet controller:
+
+```sh
+python -m scripts.native_eval.fleet \
+  ... \
+  --openclaw-package-tarball /path/to/openclaw.tgz
+```
+
+Candidate campaigns must contain only OpenClaw runs. The controller validates
+the npm package name and version, stages it as
+`manifests/openclaw-candidate.tgz`, and pins its SHA-256 in campaign, toolchain,
+and run provenance. Resume with the same tarball identity; a missing or changed
+candidate is rejected before leasing. Registry installation remains the
+default when the option is absent.
+
 ## Campaign Identity
 
 Use a stable campaign ID:

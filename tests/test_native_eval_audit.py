@@ -82,3 +82,68 @@ def test_build_metadata_supplements_rejects_conflicting_provenance(tmp_path: Pat
 
     with pytest.raises(ValueError, match="conflicting execution_mode"):
         build_metadata_supplements(run_index, extracted)
+
+
+@pytest.mark.parametrize(
+    ("observed", "status"),
+    [
+        (None, "missing"),
+        (
+            {
+                "source_kind": "npm_tarball",
+                "package_name": "openclaw",
+                "package_version": "different",
+                "sha256": "different",
+                "artifact_filename": "openclaw-candidate.tgz",
+            },
+            "mismatch",
+        ),
+        ("expected", "match"),
+    ],
+)
+def test_build_metadata_supplements_classifies_openclaw_candidate(
+    tmp_path: Path,
+    observed: dict | str | None,
+    status: str,
+) -> None:
+    candidate = {
+        "source_kind": "npm_tarball",
+        "package_name": "openclaw",
+        "package_version": "2026.7.29-candidate.1",
+        "sha256": "candidate-sha",
+        "artifact_filename": "openclaw-candidate.tgz",
+    }
+    run_index = tmp_path / "run_index.json"
+    extracted = tmp_path / "extracted"
+    _write_json(
+        run_index,
+        {
+            "fleet": {
+                "execution_mode": "native",
+                "harbor_reference_commit": "harbor-sha",
+                "judge_model_id": "gpt-5.5",
+                "openclaw_package": candidate,
+            }
+        },
+    )
+    manifest = {
+        "run_label": "candidate-run",
+        "execution_mode": "native",
+        "harbor_reference_commit": "harbor-sha",
+        "judge_model_id": "gpt-5.5",
+    }
+    if observed is not None:
+        manifest["openclaw_package"] = (
+            candidate if observed == "expected" else observed
+        )
+    _write_json(
+        extracted / "run" / "shellbench_meta-candidate-run" / "run_manifest.json",
+        manifest,
+    )
+
+    report = build_metadata_supplements(run_index, extracted)
+
+    assert report["runs"][0]["openclaw_candidate_status"] == status
+    assert report["openclaw_candidate_counts"][status] == 1
+    if status == "missing":
+        assert "openclaw_package" not in report["runs"][0]["supplements"]

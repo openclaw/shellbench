@@ -17,6 +17,11 @@ TRACE_FIELDS = (
     "harness_version",
     "installed_harness_version",
     "harness_version_status",
+    "openclaw_candidate_status",
+    "expected_openclaw_package_version",
+    "expected_openclaw_package_sha256",
+    "installed_openclaw_package_version",
+    "installed_openclaw_package_sha256",
     "model_slug",
     "expected_model_id",
     "reasoning_effort",
@@ -91,6 +96,11 @@ RUN_AUDIT_FIELDS = (
     "harness_version",
     "installed_harness_version",
     "harness_version_status",
+    "openclaw_candidate_status",
+    "expected_openclaw_package_version",
+    "expected_openclaw_package_sha256",
+    "installed_openclaw_package_version",
+    "installed_openclaw_package_sha256",
     "model_slug",
     "expected_model_id",
     "reasoning_effort",
@@ -362,6 +372,22 @@ def _version_status(requested: str, installed: str) -> str:
     return "mismatch"
 
 
+def _candidate_status(
+    *,
+    harness: str,
+    expected: Any,
+    installed: Any,
+    run_manifest: Any,
+) -> str:
+    if harness != "openclaw" or not isinstance(expected, dict):
+        return "not_applicable"
+    if not isinstance(installed, dict) or not isinstance(run_manifest, dict):
+        return "missing"
+    if installed == expected and run_manifest == expected:
+        return "match"
+    return "mismatch"
+
+
 def export_research_tables(
     *,
     run_index_path: Path,
@@ -399,6 +425,44 @@ def export_research_tables(
         harness_version_status = _version_status(
             requested_harness_version,
             installed_harness_version,
+        )
+        expected_openclaw_package = entry.get("openclaw_package")
+        installed_openclaw_package = toolchain.get("openclaw_package")
+        job_manifest = (
+            _read_json(job_dir / "run_manifest.json")
+            if job_dir is not None
+            else None
+        )
+        run_openclaw_package = (
+            job_manifest.get("openclaw_package")
+            if isinstance(job_manifest, dict)
+            else None
+        )
+        openclaw_candidate_status = _candidate_status(
+            harness=harness,
+            expected=expected_openclaw_package,
+            installed=installed_openclaw_package,
+            run_manifest=run_openclaw_package,
+        )
+        expected_candidate_version = (
+            expected_openclaw_package.get("package_version")
+            if isinstance(expected_openclaw_package, dict)
+            else None
+        )
+        expected_candidate_sha256 = (
+            expected_openclaw_package.get("sha256")
+            if isinstance(expected_openclaw_package, dict)
+            else None
+        )
+        installed_candidate_version = (
+            installed_openclaw_package.get("package_version")
+            if isinstance(installed_openclaw_package, dict)
+            else None
+        )
+        installed_candidate_sha256 = (
+            installed_openclaw_package.get("sha256")
+            if isinstance(installed_openclaw_package, dict)
+            else None
         )
         proxy_log_path = proxy_logs.get(run_label)
         counters: Counter[str] = Counter()
@@ -512,6 +576,11 @@ def export_research_tables(
                     "harness_version": requested_harness_version,
                     "installed_harness_version": installed_harness_version,
                     "harness_version_status": harness_version_status,
+                    "openclaw_candidate_status": openclaw_candidate_status,
+                    "expected_openclaw_package_version": expected_candidate_version,
+                    "expected_openclaw_package_sha256": expected_candidate_sha256,
+                    "installed_openclaw_package_version": installed_candidate_version,
+                    "installed_openclaw_package_sha256": installed_candidate_sha256,
                     "model_slug": entry.get("model_slug"),
                     "expected_model_id": expected_model_id,
                     "reasoning_effort": entry.get("reasoning_effort"),
@@ -549,6 +618,7 @@ def export_research_tables(
         passed = result_count > 0 and (
             counters["match"] == result_count
             and counters["real_trace"] == result_count
+            and openclaw_candidate_status in {"match", "not_applicable"}
         )
         run_rows.append(
             {
@@ -557,6 +627,11 @@ def export_research_tables(
                 "harness_version": requested_harness_version,
                 "installed_harness_version": installed_harness_version,
                 "harness_version_status": harness_version_status,
+                "openclaw_candidate_status": openclaw_candidate_status,
+                "expected_openclaw_package_version": expected_candidate_version,
+                "expected_openclaw_package_sha256": expected_candidate_sha256,
+                "installed_openclaw_package_version": installed_candidate_version,
+                "installed_openclaw_package_sha256": installed_candidate_sha256,
                 "model_slug": entry.get("model_slug"),
                 "expected_model_id": entry.get("model_id"),
                 "reasoning_effort": entry.get("reasoning_effort"),
@@ -600,6 +675,15 @@ def export_research_tables(
         ),
         "identity_audit_fail_count": sum(
             row["model_identity_audit_passed"] is not True for row in run_rows
+        ),
+        "openclaw_candidate_match_count": sum(
+            row["openclaw_candidate_status"] == "match" for row in run_rows
+        ),
+        "openclaw_candidate_mismatch_count": sum(
+            row["openclaw_candidate_status"] == "mismatch" for row in run_rows
+        ),
+        "openclaw_candidate_missing_count": sum(
+            row["openclaw_candidate_status"] == "missing" for row in run_rows
         ),
         "r0_run_count": sum(row["phase"] == "r0" for row in run_rows),
         "scoring_run_count": sum(
