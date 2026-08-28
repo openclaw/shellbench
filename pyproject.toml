@@ -6,17 +6,17 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
-    "websockets>=16.1.1,<17",
+    "websockets>=17.1,<18",
     "pydantic>=2.13.4,<3",
     "pyyaml>=6.0.3,<7",
-    "datasets>=5.0.0,<6",
-    "gradio>=6.20.0,<7",
+    "datasets>=5.0.1,<6",
+    "gradio>=6.26.0,<7",
     "pillow>=12.3.0,<13",
     "httpx>=0.28.1,<1",
     "numpy>=2.4.6,<2.5; python_version < '3.12'",
-    "numpy>=2.5.1,<3; python_version >= '3.12'",
+    "numpy>=2.5.2,<3; python_version >= '3.12'",
     "rich>=15.0.0,<16",
-    "click>=8.4.2,<9",
+    "click>=8.5.0,<9",
     # Runtime deps for the task completion verifier. The harness shells out
     # to `pytest -q` / `pytest-asyncio` inside per-task workspaces as the
     # execution check; the container must have them in PATH.
@@ -31,11 +31,11 @@ dev = [
     # benchmark itself runs pytest in task workspaces.
     "pytest>=9.1.1,<10",
     "pytest-asyncio>=1.4.0,<2",
-    "pre-commit>=4.6.1,<5",
-    "ruff>=0.16.0,<1",
+    "pre-commit>=4.6.2,<5",
+    "ruff>=0.16.5,<1",
 ]
 mlflow = [
-    "mlflow>=3.14.0,<4",
+    "mlflow>=3.15.2,<4",
 ]
 hermes = [
     "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main",

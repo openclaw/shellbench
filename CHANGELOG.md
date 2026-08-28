@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Refresh Python runtime, MLflow, lint, and HF mirror dependencies, including websockets 17 with a real gateway socket regression test, while preserving Python 3.11 NumPy support.
 - Record and enforce GPT reasoning effort in native runs, preserve it across
   reruns, and stabilize OpenClaw and Hermes trace completion.
 - Export OpenClaw and Hermes sessions reliably and convert their native traces
