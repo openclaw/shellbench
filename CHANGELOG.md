@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Separate native execution validity from diagnostic rewards, reject wholly invalid runs, and preserve terminal exit status in recovery archives (#63, thanks @vincentkoc).
 - Install only the assigned native harness on each fleet lease and record only its version in the toolchain manifest (#65).
 - Refresh Python runtime, MLflow, lint, and HF mirror dependencies, including websockets 17 with a real gateway socket regression test, while preserving Python 3.11 NumPy support.
 - Record and enforce GPT reasoning effort in native runs, preserve it across

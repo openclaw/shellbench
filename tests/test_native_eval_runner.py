@@ -9,6 +9,8 @@ from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from scripts.native_eval.checkpoint_loop import (
     count_result_json,
     next_checkpoint_sequence,
@@ -33,6 +35,7 @@ from scripts.native_eval.models import (
 from scripts.native_eval import plan as native_plan
 from scripts.native_eval.proxy import JUDGE_PROXY_MODEL_NAME, write_proxy_config
 from scripts.native_eval.run_job import (
+    _execution_acceptance,
     _git_commit,
     _run_manifest,
     build_run_spec,
@@ -40,8 +43,10 @@ from scripts.native_eval.run_job import (
 )
 from scripts.native_eval.runtime import (
     DockerTaskEnvironment,
+    NonZeroAgentExitCodeError,
     build_judge_env,
     collect_agent_metrics,
+    execution_outcome,
     read_reward,
     write_agent_trajectory,
 )
@@ -57,6 +62,111 @@ def test_matrix_plan_contains_only_requested_models_and_harnesses() -> None:
     assert {run.harness for run in plan} == {harness.name for harness in HARNESSES}
     assert {run.model_slug for run in plan} == {model.slug for model in MODELS}
     assert {run.repetition for run in plan} == {1, 2, 3}
+
+
+def test_openclaw_terminal_evidence_exit_is_a_harness_error() -> None:
+    outcome = execution_outcome(
+        harness="openclaw",
+        exception=NonZeroAgentExitCodeError("Agent exited with code 71"),
+        agent_exit_code=71,
+    )
+
+    assert outcome == {
+        "kind": "harness_error",
+        "exit_code": 71,
+        "reason": "terminal_session_evidence_unavailable",
+    }
+
+
+def test_all_harness_errors_reject_run_but_agent_errors_do_not() -> None:
+    rejected = _execution_acceptance(
+        [
+            {"execution_outcome": {"kind": "harness_error"}},
+            {"execution_outcome": {"kind": "infra_error"}},
+        ],
+        2,
+    )
+    accepted = _execution_acceptance(
+        [
+            {"execution_outcome": {"kind": "clean"}},
+            {"execution_outcome": {"kind": "agent_error"}},
+        ],
+        2,
+    )
+
+    assert rejected == {
+        "accepted": False,
+        "reason": "all_trials_harness_or_infrastructure_errors",
+        "outcome_counts": {"harness_error": 1, "infra_error": 1},
+    }
+    assert accepted == {
+        "accepted": True,
+        "reason": None,
+        "outcome_counts": {"agent_error": 1, "clean": 1},
+    }
+
+
+@pytest.mark.parametrize("failure_stage", ["reward", "artifacts", "stop", None])
+def test_trial_does_not_hide_execution_failure_after_agent_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str | None
+) -> None:
+    class Environment:
+        def __init__(self, *, trial_dir: Path, **_kwargs: object) -> None:
+            self.trial_dir = trial_dir
+
+        async def start(self):
+            return native_runtime.CommandResult(0, "start", "end")
+
+        async def copy_instruction(self, _instruction: str) -> None:
+            pass
+
+        async def exec(self, command: str, **_kwargs: object):
+            if command.endswith("/tests/test.sh") and failure_stage != "reward":
+                (self.trial_dir / "verifier" / "reward.txt").write_text("0.5")
+            return native_runtime.CommandResult(int(command == "run"), "start", "end")
+
+        async def collect_artifacts(self) -> None:
+            if failure_stage == "artifacts":
+                raise native_runtime.DockerStartupError("artifact collection failed")
+
+        async def install_tests(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            if failure_stage == "stop":
+                raise native_runtime.DockerStartupError("container cleanup failed")
+
+    monkeypatch.setattr(native_runtime, "DockerTaskEnvironment", Environment)
+    monkeypatch.setattr(
+        native_runtime,
+        "build_harness_command",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            setup_command="setup", run_command="run", cleanup_command="cleanup", env={}
+        ),
+    )
+    run = RunSpec(
+        run_label="trial-validity", harness="openclaw", harness_version="test",
+        model_slug="gpt55", model_id="gpt-5.5", provider="openai",
+        proxy_model_name="sb-gpt55", repetition=1, expected_task_count=1,
+        run_date="20260828",
+    )
+    result = asyncio.run(
+        native_runtime.run_trial(
+            _trajectory_task(tmp_path, "do the task"), run,
+            job_dir=tmp_path / "job", toolchain_root=tmp_path,
+            proxy_url="http://localhost:4000", proxy_key="synthetic-test-key",
+        )
+    )
+
+    assert result["exception_info"]["exception_type"] == "NonZeroAgentExitCodeError"
+    expected_kind = (
+        "verifier_error" if failure_stage == "reward"
+        else "infra_error" if failure_stage else "agent_error"
+    )
+    assert result["execution_outcome"]["kind"] == expected_kind
+    assert _execution_acceptance([result], 1)["accepted"] is (failure_stage is None)
+    if failure_stage in {None, "stop"}:
+        assert result["verifier_result"]["rewards"] == {"reward": 0.5}
 
 
 def test_run_index_records_agent_and_judge_reasoning(

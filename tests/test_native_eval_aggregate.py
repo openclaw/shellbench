@@ -509,6 +509,80 @@ def test_native_identity_checks_ignore_unavailable_agent_exit_trajectory(
     assert run["eligible"] is True
 
 
+@pytest.mark.parametrize(
+    ("kinds", "accepted"),
+    [
+        (("clean", "clean"), True),
+        (("agent_error", "clean"), True),
+        (("harness_error", "clean"), True),
+        (("verifier_error", "verifier_error"), False),
+        (("harness_error", "infra_error"), False),
+    ],
+)
+def test_structured_execution_validity_preserves_diagnostic_scores(
+    tmp_path: Path, kinds: tuple[str, str], accepted: bool
+) -> None:
+    results = []
+    for index, kind in enumerate(kinds):
+        result = _native_result(str(index), reward=0.5)
+        result["execution_outcome"] = {"kind": kind, "exit_code": None, "reason": kind}
+        results.append(result)
+    jobs_root = tmp_path / "native"
+    _write_run(
+        jobs_root, "structured-execution", expected_task_count=2,
+        results=results, native=True,
+    )
+
+    run = aggregate(jobs_root, tmp_path / "summaries")["runs"][0]
+
+    assert run["score"] == pytest.approx(0.5)
+    assert run["nonzero"] == 2
+    assert run["run_accepted"] is accepted
+    assert run["eligible"] is accepted
+
+
+def test_all_openclaw_harness_errors_preserve_rewards_but_reject_run(
+    tmp_path: Path,
+):
+    jobs_root = tmp_path / "native"
+    summaries_dir = tmp_path / "summaries"
+    _write_run(
+        jobs_root,
+        "openclaw-gpt55-terminal-evidence-failure",
+        expected_task_count=2,
+        results=[
+            _result(
+                "a",
+                reward=0.25,
+                exception_type="NonZeroAgentExitCodeError",
+                exception_message="Agent exited with code 71",
+            ),
+            _result(
+                "b",
+                reward=0.75,
+                exception_type="NonZeroAgentExitCodeError",
+                exception_message="Agent exited with code 71",
+            ),
+        ],
+        harness="openclaw",
+    )
+
+    report = aggregate(jobs_root, summaries_dir)
+
+    run = report["runs"][0]
+    assert run["score"] == pytest.approx(0.5)
+    assert run["nonzero"] == 2
+    assert run["run_accepted"] is False
+    assert run["run_acceptance_reason"] == (
+        "all_trials_harness_or_infrastructure_errors"
+    )
+    assert run["eligible"] is False
+    assert run["exclusion_reason"] == "infra_dominated"
+    with (summaries_dir / "per_task_results.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert {row["execution_outcome"] for row in rows} == {"harness_error"}
+
+
 def test_native_identity_checks_real_agent_exit_trajectory(tmp_path: Path):
     jobs_root = tmp_path / "native"
     summaries_dir = tmp_path / "summaries"

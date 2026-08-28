@@ -1248,16 +1248,6 @@ printf '%s\n' "$pid"
             raise FleetError(f"conflicting archived exit_status values for {run_label}")
         return candidates[0] if candidates else None
 
-    def _checkpoint_log_has_final(self, run_label: str) -> bool:
-        log_path = self.config.local_root / "logs" / f"{run_label}.checkpoints.log"
-        if not log_path.is_file():
-            return False
-        for line in log_path.read_text(encoding="utf-8").splitlines():
-            fields = line.split("\t", 4)
-            if len(fields) >= 2 and fields[1] == "final":
-                return True
-        return False
-
     def _finish_exported(self, entry: dict[str, Any], run: RunSpec) -> bool:
         verified, result_count, artifacts = self._verify_final(run.run_label)
         if not verified:
@@ -1283,19 +1273,6 @@ printf '%s\n' "$pid"
                 exit_code_changes = {
                     "run_exit_code": run_exit_code,
                     "run_exit_code_source": "archived_exit_status",
-                }
-            elif (
-                result_count == run.expected_task_count
-                and self._checkpoint_log_has_final(run.run_label)
-            ):
-                run_exit_code = 0
-                exit_code_changes = {
-                    "run_exit_code": 0,
-                    "run_exit_code_source": "recovered_full_coverage_remote_done",
-                    "run_exit_code_inference": (
-                        "inferred zero from verified full-coverage archive and "
-                        "checkpoint final event after remote done"
-                    ),
                 }
         stop_command = [
             self.config.crabbox_bin,

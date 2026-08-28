@@ -141,6 +141,7 @@ RUN_STATUS="$?"
 set -e
 
 META_DIR="/tmp/shellbench_meta-$RUN_LABEL"
+printf '%s\n' "$RUN_STATUS" > "$META_DIR/exit_status"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$META_DIR/exported_at_utc.txt"
 hostname > "$META_DIR/hostname.txt"
 git -C "$ROOT/runner" rev-parse HEAD > "$META_DIR/runner_commit.txt" || true
