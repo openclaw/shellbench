@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.native_eval.models import (
+    OPENCLAW_TOOL_MODES,
     RunSpec,
     harness_by_name,
     model_by_slug,
@@ -270,7 +271,15 @@ def _run_manifest(
             "SHELLBENCH_HARBOR_REFERENCE_COMMIT"
         ),
         "judge_model_id": os.environ.get("SHELLBENCH_JUDGE_MODEL_ID"),
-        "reasoning_effort": os.environ.get("SHELLBENCH_REASONING_EFFORT"),
+        "reasoning_effort": (
+            run.reasoning_effort
+            or os.environ.get("SHELLBENCH_REASONING_EFFORT")
+        ),
+        "openclaw_tool_mode": (
+            run.openclaw_tool_mode
+            or os.environ.get("SHELLBENCH_OPENCLAW_TOOL_MODE")
+            or None
+        ),
         "judge_reasoning_effort": os.environ.get(
             "SHELLBENCH_JUDGE_REASONING_EFFORT"
         ),
@@ -358,6 +367,19 @@ def _runner_patch_hash() -> str:
 def build_run_spec(args: argparse.Namespace) -> RunSpec:
     harness = harness_by_name(args.harness)
     model = model_by_slug(args.model_slug)
+    if os.environ.get("SHELLBENCH_OPENCLAW_TOOL_SEARCH_MODE"):
+        raise ValueError(
+            "SHELLBENCH_OPENCLAW_TOOL_SEARCH_MODE is retired; "
+            "use SHELLBENCH_OPENCLAW_TOOL_MODE"
+        )
+    openclaw_tool_mode = os.environ.get("SHELLBENCH_OPENCLAW_TOOL_MODE") or None
+    if openclaw_tool_mode and harness.name != "openclaw":
+        raise ValueError("SHELLBENCH_OPENCLAW_TOOL_MODE requires the OpenClaw harness")
+    if openclaw_tool_mode and openclaw_tool_mode not in OPENCLAW_TOOL_MODES:
+        raise ValueError(
+            "SHELLBENCH_OPENCLAW_TOOL_MODE must be one of "
+            f"{sorted(OPENCLAW_TOOL_MODES)}"
+        )
     return RunSpec(
         run_label=args.run_label,
         harness=harness.name,
@@ -369,6 +391,8 @@ def build_run_spec(args: argparse.Namespace) -> RunSpec:
         repetition=args.repetition,
         expected_task_count=args.expected_task_count,
         run_date=args.run_date,
+        reasoning_effort=os.environ.get("SHELLBENCH_REASONING_EFFORT") or None,
+        openclaw_tool_mode=openclaw_tool_mode,
     )
 
 

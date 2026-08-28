@@ -305,6 +305,7 @@ class FakeExecutor:
         self.dispatch_concurrency: dict[str, int] = {}
         self.dispatch_arguments: dict[str, list[str]] = {}
         self.dispatch_parity_validation: dict[str, str] = {}
+        self.dispatch_tool_mode: dict[str, str] = {}
         self.dispatch_qualification_family: dict[str, str] = {}
         self.dispatch_phase: dict[str, str] = {}
         self.dispatch_leaderboard_eligible: dict[str, str] = {}
@@ -439,7 +440,8 @@ class FakeExecutor:
             leaderboard_eligible = remote_command[dispatch_marker + 17]
             exclusion_reason = remote_command[dispatch_marker + 18]
             parity_validation = remote_command[dispatch_marker + 20]
-            remote_run_args = remote_command[dispatch_marker + 21 :]
+            tool_mode = remote_command[dispatch_marker + 21]
+            remote_run_args = remote_command[dispatch_marker + 22 :]
             with self._dispatch_condition:
                 attempt = self.dispatch_attempts.get(label, 0) + 1
                 self.dispatch_attempts[label] = attempt
@@ -453,6 +455,7 @@ class FakeExecutor:
                 self.dispatch_concurrency[label] = int(remote_run_args[10])
                 self.dispatch_arguments[label] = remote_run_args
                 self.dispatch_parity_validation[label] = parity_validation
+                self.dispatch_tool_mode[label] = tool_mode
                 self.dispatch_qualification_family[label] = qualification_family
                 self.dispatch_phase[label] = run_phase
                 self.dispatch_leaderboard_eligible[label] = leaderboard_eligible
@@ -598,6 +601,52 @@ def test_controller_accepts_xhigh_reasoning_effort(tmp_path: Path) -> None:
     assert completed["status"] == "completed"
     assert completed["reasoning_effort"] == "xhigh"
     assert completed["judge_reasoning_effort"] == "high"
+
+
+def test_controller_dispatches_openclaw_tool_mode(tmp_path: Path) -> None:
+    label = "openclaw-gpt55-high-full-2-r1-20260729"
+    run = _planned(_run_spec(label))
+    run["openclaw_tool_mode"] = "code"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    assert executor.dispatch_tool_mode[label] == "code"
+
+
+def test_controller_rejects_retired_openclaw_tool_search_mode(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-high-full-2-r1-20260729"
+    run = _planned(_run_spec(label))
+    run["openclaw_tool_search_mode"] = "code"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+
+    with pytest.raises(FleetError, match="replace it with openclaw_tool_mode"):
+        FleetController(
+            config,
+            executor=FakeExecutor(config.local_root, expected_counts={label: 2}),
+        ).run()
+
+
+def test_controller_accepts_empty_retired_openclaw_tool_search_mode(
+    tmp_path: Path,
+) -> None:
+    label = "openclaw-gpt55-high-full-2-r1-20260729"
+    run = _planned(_run_spec(label))
+    run["openclaw_tool_search_mode"] = None
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+    assert executor.dispatch_tool_mode[label] == ""
 
 
 def test_controller_dispatches_targeted_repair_tasks_with_lineage(
@@ -1172,6 +1221,29 @@ def test_failed_run_is_preserved_and_suffixed_rerun_completes(
     assert executor.dispatches == [base, rerun]
     assert (config.local_root / "raw" / f"{base}-final-artifacts.tar.gz").is_file()
     assert (config.local_root / "raw" / f"{rerun}-final-artifacts.tar.gz").is_file()
+
+
+def test_failed_run_preserves_openclaw_tool_mode_on_rerun(
+    tmp_path: Path,
+) -> None:
+    base = "openclaw-gpt55-high-full-2-r1-20260729"
+    rerun = f"{base}-rerun1"
+    run = _planned(_run_spec(base))
+    run["openclaw_tool_mode"] = "directory"
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index, max_attempts=2)
+    executor = FakeExecutor(
+        config.local_root,
+        expected_counts={base: 1, rerun: 2},
+        checkpoint_codes={base: 1},
+    )
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    runs = json.loads(run_index.read_text(encoding="utf-8"))["runs"]
+    assert runs[1]["openclaw_tool_mode"] == "directory"
+    assert executor.dispatch_tool_mode[rerun] == "directory"
 
 
 def test_resume_attaches_to_running_lease_without_redispatch(tmp_path: Path) -> None:

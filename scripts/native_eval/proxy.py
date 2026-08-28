@@ -4,11 +4,10 @@ import json
 import os
 from pathlib import Path
 
-from scripts.native_eval.models import LITELLM_VERSION, MODELS
+from scripts.native_eval.models import LITELLM_VERSION, MODELS, REASONING_EFFORTS
 
 
 JUDGE_PROXY_MODEL_NAME = "shellbench-judge"
-REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
 
 
 def write_proxy_config(path: Path) -> None:

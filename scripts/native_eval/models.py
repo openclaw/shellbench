@@ -5,6 +5,10 @@ from datetime import date
 from typing import Iterable
 
 
+OPENCLAW_TOOL_MODES = frozenset({"direct", "directory", "code"})
+REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     slug: str
@@ -32,6 +36,17 @@ class RunSpec:
     repetition: int
     expected_task_count: int
     run_date: str
+    reasoning_effort: str | None = None
+    openclaw_tool_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.reasoning_effort is not None
+            and self.reasoning_effort not in REASONING_EFFORTS
+        ):
+            raise ValueError(
+                "reasoning_effort must be low, medium, high, xhigh, or None"
+            )
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -162,6 +177,7 @@ def build_matrix_plan(
                         repetition=repetition,
                         expected_task_count=expected_task_count,
                         run_date=stamp,
+                        reasoning_effort=reasoning_effort,
                     )
                 )
     return plan
