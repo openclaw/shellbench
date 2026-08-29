@@ -55,6 +55,11 @@ CRABBOX_STOP_TIMEOUT_SECONDS = 6 * 60
 CRABBOX_READY_ATTEMPTS = 30
 CRABBOX_READY_BACKOFF_SECONDS = 10
 CRABBOX_INSPECT_ATTEMPTS = 4
+# Coordinator inspect is a single GET. Bound it so a hung broker cannot
+# pin the fleet controller.
+CRABBOX_INSPECT_TIMEOUT_SECONDS = 45
+# Warmup is the lease create POST. Provision readiness is polled separately.
+CRABBOX_WARMUP_TIMEOUT_SECONDS = 2 * 60
 
 
 class CommandExecutor(Protocol):
@@ -63,6 +68,14 @@ class CommandExecutor(Protocol):
         command: Sequence[str],
         *,
         capture_output: bool = False,
+    ) -> subprocess.CompletedProcess[str]: ...
+
+    def run_with_timeout(
+        self,
+        command: Sequence[str],
+        *,
+        capture_output: bool,
+        timeout: float,
     ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -695,7 +708,11 @@ class FleetController:
 
     def _warmup_lease(self, command: Sequence[str], slug: str) -> None:
         for attempt in range(1, self.config.warmup_capacity_attempts + 1):
-            result = self.executor.run(command, capture_output=True)
+            result = self.executor.run_with_timeout(
+                command,
+                capture_output=True,
+                timeout=CRABBOX_WARMUP_TIMEOUT_SECONDS,
+            )
             if result.returncode == 0:
                 return
             detail = (result.stderr or result.stdout or "").strip()
@@ -728,7 +745,11 @@ class FleetController:
             "--json",
         ]
         for attempt in range(1, CRABBOX_INSPECT_ATTEMPTS + 1):
-            result = self.executor.run(command, capture_output=True)
+            result = self.executor.run_with_timeout(
+                command,
+                capture_output=True,
+                timeout=CRABBOX_INSPECT_TIMEOUT_SECONDS,
+            )
             if result.returncode == 0:
                 break
             detail = (result.stderr or result.stdout or "").strip()
