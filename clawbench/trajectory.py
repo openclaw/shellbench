@@ -67,8 +67,9 @@ MUTATING_SHELL_PATTERNS = [
     r"\bpnpm\s+install\b",
 ]
 NON_MUTATING_REDIRECT_PATTERNS = [
-    r"(?<!\w)2\s*>\s*(?:/dev/null|\$null|&\s*1)\b",
-    r"(?<!\w)\*\s*>\s*\$null\b",
+    r"(?<!\w)2\s*>\s*&\s*1\b",
+    r"(?<!\w)2\s*>>?\s*(?:/dev/null|\$null)\b",
+    r"(?<!\w)\*\s*>>?\s*\$null\b",
 ]
 DANGEROUS_SHELL_PATTERNS = [
     r"\brm\s+-rf\b",

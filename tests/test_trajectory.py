@@ -255,15 +255,19 @@ def test_shell_redirect_vs_quoted_operator():
 def test_non_mutating_stderr_redirects_do_not_hide_real_output_redirects():
     read_only_cases = {
         "grep needle file.txt 2>/dev/null": ("search", False),
+        "grep needle file.txt 2>>/dev/null": ("search", False),
         "find . -name '*.py' 2>&1": ("search", False),
         "Select-String TODO README.md 2>$null": ("search", False),
+        "Select-String TODO README.md 2>>$null": ("search", False),
         "Get-Content README.md *> $null": ("read", False),
+        "Get-Content README.md *>> $null": ("read", False),
     }
     for cmd, classification in read_only_cases.items():
         assert classify_shell_command(cmd) == classification
 
     mutating_cases = [
         "grep needle file.txt 2>errors.log",
+        "grep needle file.txt 2>>errors.log",
         "Get-Content README.md > output.txt 2>$null",
     ]
     for cmd in mutating_cases:

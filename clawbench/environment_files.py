@@ -207,28 +207,35 @@ def evaluate_execution_result(
     if exit_code != spec.expected_exit_code:
         return False, f"Exit code {exit_code} != expected {spec.expected_exit_code}"
 
+    normalized_stdout = _normalize_line_endings(stdout)
+    normalized_stderr = _normalize_line_endings(stderr)
+
     for token in spec.stdout_contains:
-        rendered = render_template(token, runtime_values)
-        if rendered not in stdout:
+        rendered = _normalize_line_endings(render_template(token, runtime_values))
+        if rendered not in normalized_stdout:
             return False, f"stdout missing '{rendered}'"
 
     for token in spec.stdout_not_contains:
-        rendered = render_template(token, runtime_values)
-        if rendered in stdout:
+        rendered = _normalize_line_endings(render_template(token, runtime_values))
+        if rendered in normalized_stdout:
             return False, f"stdout unexpectedly contains '{rendered}'"
 
     for token in spec.stderr_contains:
-        rendered = render_template(token, runtime_values)
-        if rendered not in stderr:
+        rendered = _normalize_line_endings(render_template(token, runtime_values))
+        if rendered not in normalized_stderr:
             return False, f"stderr missing '{rendered}'"
 
     if spec.stdout_matches and not re.search(
-        render_template(spec.stdout_matches, runtime_values), stdout, re.MULTILINE | re.DOTALL
+        _normalize_line_endings(render_template(spec.stdout_matches, runtime_values)),
+        normalized_stdout,
+        re.MULTILINE | re.DOTALL,
     ):
         return False, f"stdout does not match {spec.stdout_matches}"
 
     if spec.stderr_matches and not re.search(
-        render_template(spec.stderr_matches, runtime_values), stderr, re.MULTILINE | re.DOTALL
+        _normalize_line_endings(render_template(spec.stderr_matches, runtime_values)),
+        normalized_stderr,
+        re.MULTILINE | re.DOTALL,
     ):
         return False, f"stderr does not match {spec.stderr_matches}"
 
@@ -236,7 +243,7 @@ def evaluate_execution_result(
         rendered = _normalize_line_endings(
             render_template(spec.expected_stdout, runtime_values).strip()
         )
-        if _normalize_line_endings(stdout.strip()) != rendered:
+        if normalized_stdout.strip() != rendered:
             return False, "stdout did not match expected text"
 
     if spec.expected_stdout_file:
@@ -251,7 +258,7 @@ def evaluate_execution_result(
         expected = _normalize_line_endings(
             expected_path.read_text(encoding="utf-8").strip()
         )
-        if _normalize_line_endings(stdout.strip()) != expected:
+        if normalized_stdout.strip() != expected:
             return False, f"stdout did not match {spec.expected_stdout_file}"
 
     if spec.expected_json is not None:

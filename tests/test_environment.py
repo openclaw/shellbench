@@ -61,6 +61,55 @@ class CompletionClient:
         raise AssertionError(f"Unexpected RPC: {method} {params}")
 
 
+def test_text_assertions_normalize_line_endings_but_not_content(tmp_path: Path):
+    spec = ExecutionCheck(
+        name="text-assertions",
+        command="unused",
+        stdout_contains=["out-first\nout-second"],
+        stdout_not_contains=["forbidden\ntext"],
+        stderr_contains=["err-first\nerr-second"],
+        stdout_matches=r"^out-first\nout-second$",
+        stderr_matches=r"^err-first\nerr-second$",
+    )
+
+    passed, _ = _evaluate_execution_result(
+        spec,
+        tmp_path,
+        {},
+        0,
+        "out-first\r\nout-second",
+        "err-first\r\nerr-second",
+    )
+    excluded, _ = _evaluate_execution_result(
+        ExecutionCheck(
+            name="excluded-text",
+            command="unused",
+            stdout_not_contains=["out-first\nout-second"],
+        ),
+        tmp_path,
+        {},
+        0,
+        "out-first\r\nout-second",
+        "",
+    )
+    different, _ = _evaluate_execution_result(
+        ExecutionCheck(
+            name="different-text",
+            command="unused",
+            stdout_matches=r"^out-first\nwrong$",
+        ),
+        tmp_path,
+        {},
+        0,
+        "out-first\r\nout-second",
+        "",
+    )
+
+    assert passed is True
+    assert excluded is False
+    assert different is False
+
+
 def test_expected_stdout_normalizes_line_endings_but_not_content(tmp_path: Path):
     spec = ExecutionCheck(
         name="stdout",
