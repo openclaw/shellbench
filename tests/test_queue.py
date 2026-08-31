@@ -1,5 +1,7 @@
+import asyncio
 import datetime
 import json
+import threading
 
 import pytest
 
@@ -462,3 +464,118 @@ async def test_reclaim_stale_jobs_requeues_only_expired_evaluations(monkeypatch)
     assert fresh_job.current_task_id == "t1-bugfix-discount"
     assert save_calls == ["saved"]
     assert sync_calls == ["synced"]
+
+
+async def _hold_queue_lock(queue: JobQueue, held: threading.Event, release: threading.Event) -> None:
+    """Hold JobQueue._lock whether it is asyncio.Lock or threading.Lock."""
+    lock = queue._lock
+    if hasattr(lock, "__aenter__"):
+        async with lock:
+            held.set()
+            await asyncio.to_thread(release.wait, 5)
+        return
+    with lock:
+        held.set()
+        await asyncio.to_thread(release.wait, 5)
+
+
+def test_submit_from_second_event_loop_while_worker_holds_lock(tmp_path, monkeypatch):
+    """Space UI uses asyncio.run() on a new loop while EvalWorker holds the queue lock."""
+    monkeypatch.setattr(queue_module, "LOCAL_QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(queue_module, "HF_TOKEN", "")
+    queue = JobQueue()
+
+    held = threading.Event()
+    release = threading.Event()
+    worker_errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            asyncio.run(_hold_queue_lock(queue, held, release))
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+    assert held.wait(timeout=2), "worker never acquired the queue lock"
+
+    outcome: dict[str, Job | BaseException] = {}
+
+    def submit_from_other_loop() -> None:
+        try:
+            outcome["job"] = asyncio.run(
+                queue.submit(SubmissionRequest(model="anthropic/claude-sonnet-4-6", submitter="space-ui"))
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    submit_thread = threading.Thread(target=submit_from_other_loop, daemon=True)
+    submit_thread.start()
+    # Worker still holds the lock. Release after submit is waiting so a
+    # thread lock can proceed; an asyncio.Lock bound to the worker loop
+    # deadlocks or raises instead.
+    release.set()
+    submit_thread.join(timeout=2)
+    worker_thread.join(timeout=2)
+
+    assert worker_errors == []
+    assert not submit_thread.is_alive(), "submit deadlocked across event loops"
+    assert "error" not in outcome, outcome.get("error")
+    job = outcome["job"]
+    assert isinstance(job, Job)
+    assert job.status == JobStatus.PENDING
+    assert job.job_id in queue._jobs
+
+
+def test_submit_does_not_block_on_hub_sync_from_second_loop(tmp_path, monkeypatch):
+    """Hub uploads must not keep the queue lock, or Space submit waits on HF."""
+    monkeypatch.setattr(queue_module, "LOCAL_QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(queue_module, "HF_TOKEN", "")
+    queue = JobQueue()
+
+    sync_started = threading.Event()
+    release_sync = threading.Event()
+
+    async def blocking_sync() -> None:
+        if sync_started.is_set():
+            return
+        sync_started.set()
+        await asyncio.to_thread(release_sync.wait, 5)
+
+    monkeypatch.setattr(queue, "_sync_to_hub", blocking_sync)
+
+    first_errors: list[BaseException] = []
+
+    def first_submit() -> None:
+        try:
+            asyncio.run(queue.submit(SubmissionRequest(model="anthropic/claude-sonnet-4-6", submitter="worker")))
+        except BaseException as exc:
+            first_errors.append(exc)
+
+    first_thread = threading.Thread(target=first_submit, daemon=True)
+    first_thread.start()
+    assert sync_started.wait(timeout=2), "first submit never reached hub sync"
+
+    outcome: dict[str, Job | BaseException] = {}
+
+    def second_submit() -> None:
+        try:
+            outcome["job"] = asyncio.run(
+                queue.submit(SubmissionRequest(model="huggingface/Qwen/Qwen3-32B", submitter="space-ui"))
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    second_thread = threading.Thread(target=second_submit, daemon=True)
+    second_thread.start()
+    second_thread.join(timeout=2)
+    release_sync.set()
+    first_thread.join(timeout=2)
+
+    assert first_errors == []
+    assert not second_thread.is_alive(), "submit waited on hub upload lock"
+    assert "error" not in outcome, outcome.get("error")
+    job = outcome["job"]
+    assert isinstance(job, Job)
+    assert job.request.model == "huggingface/Qwen/Qwen3-32B"
+    assert job.status == JobStatus.PENDING
