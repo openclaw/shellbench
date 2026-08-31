@@ -7,7 +7,7 @@ license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "websockets>=17.1,<18",
-    "pydantic>=2.13.4,<3",
+    "pydantic>=2.13.5,<3",
     "pyyaml>=6.0.3,<7",
     "datasets>=5.0.1,<6",
     "gradio>=6.26.0,<7",
