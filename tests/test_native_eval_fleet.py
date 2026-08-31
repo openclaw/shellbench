@@ -262,6 +262,45 @@ def test_subprocess_timeout_output_is_normalized_to_text(
     assert result.stderr == "partial stderr"
 
 
+@pytest.mark.parametrize("action", ["inspect", "warmup"])
+def test_inspect_and_warmup_honor_subprocess_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            raise AssertionError(f"{action} invoked subprocess.run without a timeout")
+        raise subprocess.TimeoutExpired(
+            args[0] if args else [action],
+            timeout,
+            output=b"",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    controller = object.__new__(FleetController)
+    controller.config = FleetConfig(
+        run_index=Path("/tmp/unused-index"),
+        local_root=Path("/tmp/unused-root"),
+        runner_root=Path("/tmp/unused-runner"),
+        task_archive=Path("/tmp/unused-tasks"),
+        env_file=Path("/tmp/unused.env"),
+        warmup_capacity_attempts=1,
+        warmup_capacity_backoff_seconds=0,
+    )
+    controller.executor = SubprocessExecutor()
+
+    with pytest.raises(FleetError, match="timed out"):
+        if action == "inspect":
+            controller._inspect_lease("cbx_hung", required=True)
+        else:
+            controller._warmup_lease(
+                ["crabbox", "warmup", "--slug", "hung"],
+                "hung",
+            )
+
+
 def test_optional_inspect_treats_stopped_lease_as_absent(tmp_path: Path) -> None:
     run_index = tmp_path / "manifests" / "run_index.json"
     _write_index(run_index, [])
@@ -400,6 +439,16 @@ class FakeExecutor:
         self._next_lease = 0
         self.active_leases = 0
         self.max_active_leases = 0
+
+    def run_with_timeout(
+        self,
+        command: Sequence[str],
+        *,
+        capture_output: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout
+        return self.run(command, capture_output=capture_output)
 
     def run(
         self,
