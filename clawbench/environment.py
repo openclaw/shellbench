@@ -28,6 +28,10 @@ from clawbench.schemas import (
 logger = logging.getLogger(__name__)
 
 
+def _normalize_line_endings(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
 async def verify_completion(
     completion: CompletionSpec,
     *,
@@ -231,8 +235,10 @@ def _evaluate_execution_result(
         return False, f"stderr does not match {spec.stderr_matches}"
 
     if spec.expected_stdout is not None:
-        rendered = render_template(spec.expected_stdout, runtime_values).strip()
-        if stdout.strip() != rendered:
+        rendered = _normalize_line_endings(
+            render_template(spec.expected_stdout, runtime_values).strip()
+        )
+        if _normalize_line_endings(stdout.strip()) != rendered:
             return False, "stdout did not match expected text"
 
     if spec.expected_stdout_file:
@@ -244,7 +250,10 @@ def _evaluate_execution_result(
             )
         except ValueError as exc:
             return False, str(exc)
-        if stdout.strip() != expected_path.read_text(encoding="utf-8").strip():
+        expected = _normalize_line_endings(
+            expected_path.read_text(encoding="utf-8").strip()
+        )
+        if _normalize_line_endings(stdout.strip()) != expected:
             return False, f"stdout did not match {spec.expected_stdout_file}"
 
     if spec.expected_json is not None:

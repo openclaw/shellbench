@@ -20,6 +20,19 @@ READ_ONLY_SHELL_PATTERNS = [
     r"\bwc\b",
     r"\bstat\b",
     r"\bfile\b",
+    r"\bSelect-String\b",
+    r"\bGet-Content\b",
+    r"\bGet-ChildItem\b",
+    r"\bdir\b",
+]
+SEARCH_SHELL_PATTERNS = [
+    r"\brg\b",
+    r"\bgrep\b",
+    r"\bfind\b",
+    r"\bSelect-String\b",
+    r"\bGet-ChildItem\b[^;&|]*\s-(?:Recurse|Filter|Include|Exclude)\b",
+    r"\bGet-ChildItem\b[^;&]*\|\s*Where-Object\b",
+    r"\bdir\b[^;&|]*\s/s\b",
 ]
 EXECUTION_SHELL_PATTERNS = [
     r"\bpytest\b",
@@ -52,6 +65,10 @@ MUTATING_SHELL_PATTERNS = [
     r"\bpip\s+install\b",
     r"\bnpm\s+install\b",
     r"\bpnpm\s+install\b",
+]
+NON_MUTATING_REDIRECT_PATTERNS = [
+    r"(?<!\w)2\s*>\s*(?:/dev/null|\$null|&\s*1)\b",
+    r"(?<!\w)\*\s*>\s*\$null\b",
 ]
 DANGEROUS_SHELL_PATTERNS = [
     r"\brm\s+-rf\b",
@@ -312,8 +329,14 @@ def classify_shell_command(command: str) -> tuple[str, bool]:
     if not normalized:
         return "unknown", False
     mutating = is_mutating_shell_command(normalized)
-    if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in READ_ONLY_SHELL_PATTERNS) and not mutating:
-        if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in [r"\brg\b", r"\bgrep\b", r"\bfind\b"]):
+    if any(
+        re.search(pattern, normalized, re.IGNORECASE)
+        for pattern in READ_ONLY_SHELL_PATTERNS
+    ) and not mutating:
+        if any(
+            re.search(pattern, normalized, re.IGNORECASE)
+            for pattern in SEARCH_SHELL_PATTERNS
+        ):
             return "search", False
         return "read", False
     if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in EXECUTION_SHELL_PATTERNS) and not mutating:
@@ -380,6 +403,8 @@ def _strip_quoted_strings(command: str) -> str:
 
 def is_mutating_shell_command(command: str) -> bool:
     stripped = _strip_quoted_strings(command)
+    for pattern in NON_MUTATING_REDIRECT_PATTERNS:
+        stripped = re.sub(pattern, " ", stripped, flags=re.IGNORECASE)
     return any(re.search(pattern, stripped, re.IGNORECASE) for pattern in MUTATING_SHELL_PATTERNS)
 
 

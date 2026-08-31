@@ -2,8 +2,49 @@ from pathlib import Path
 
 import pytest
 
-from clawbench.environment_files import run_execution_check, verify_file_state
+from clawbench.environment_files import (
+    evaluate_execution_result,
+    run_execution_check,
+    verify_file_state,
+)
 from clawbench.schemas import ExecutionCheck, FileState
+
+
+def test_expected_stdout_normalizes_line_endings_but_not_content(tmp_path: Path):
+    spec = ExecutionCheck(
+        name="stdout",
+        command="unused",
+        expected_stdout="first\nsecond\nthird",
+    )
+
+    passed, _ = evaluate_execution_result(
+        spec, tmp_path, {}, 0, "first\r\nsecond\rthird", ""
+    )
+    different, _ = evaluate_execution_result(
+        spec, tmp_path, {}, 0, "first\r\nsecond\rwrong", ""
+    )
+
+    assert passed is True
+    assert different is False
+
+
+def test_expected_stdout_file_normalizes_line_endings_but_not_content(tmp_path: Path):
+    (tmp_path / "expected.txt").write_bytes(b"first\nsecond\nthird\n")
+    spec = ExecutionCheck(
+        name="stdout-file",
+        command="unused",
+        expected_stdout_file="expected.txt",
+    )
+
+    passed, _ = evaluate_execution_result(
+        spec, tmp_path, {}, 0, "first\rsecond\r\nthird", ""
+    )
+    different, _ = evaluate_execution_result(
+        spec, tmp_path, {}, 0, "first\rsecond\r\nwrong", ""
+    )
+
+    assert passed is True
+    assert different is False
 
 
 def test_verify_file_state_rejects_paths_outside_workspace(tmp_path: Path):

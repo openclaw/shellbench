@@ -252,6 +252,42 @@ def test_shell_redirect_vs_quoted_operator():
         assert mutating, f"redirect not detected: {cmd!r}"
 
 
+def test_non_mutating_stderr_redirects_do_not_hide_real_output_redirects():
+    read_only_cases = {
+        "grep needle file.txt 2>/dev/null": ("search", False),
+        "find . -name '*.py' 2>&1": ("search", False),
+        "Select-String TODO README.md 2>$null": ("search", False),
+        "Get-Content README.md *> $null": ("read", False),
+    }
+    for cmd, classification in read_only_cases.items():
+        assert classify_shell_command(cmd) == classification
+
+    mutating_cases = [
+        "grep needle file.txt 2>errors.log",
+        "Get-Content README.md > output.txt 2>$null",
+    ]
+    for cmd in mutating_cases:
+        _, mutating = classify_shell_command(cmd)
+        assert mutating, f"redirect not detected: {cmd!r}"
+
+
+def test_windows_read_and_search_commands_are_classified_precisely():
+    expected = {
+        "Select-String -Path *.py -Pattern TODO": ("search", False),
+        "Get-ChildItem -Recurse": ("search", False),
+        "Get-ChildItem -Filter *.py": ("search", False),
+        "Get-ChildItem | Where-Object Name -like '*.py'": ("search", False),
+        "dir /s *.py": ("search", False),
+        "Get-Content README.md": ("read", False),
+        "Get-ChildItem": ("read", False),
+        "dir": ("read", False),
+        "Get-Content README.md > copy.txt": ("edit", True),
+    }
+
+    for command, classification in expected.items():
+        assert classify_shell_command(command) == classification
+
+
 def test_find_replace_mutation_is_not_misclassified_as_search():
     transcript = Transcript(
         messages=[
