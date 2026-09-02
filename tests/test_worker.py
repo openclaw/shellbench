@@ -1,5 +1,9 @@
 import asyncio
 import json
+import os
+import signal
+import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -452,3 +456,56 @@ async def test_run_job_heartbeat_flushes_latest_progress_snapshot(monkeypatch):
             },
         )
     ]
+
+
+def test_run_lane_prepare_hook_kills_hung_hook(tmp_path: Path, monkeypatch):
+    hook = tmp_path / "hung-hook"
+    hook.write_text(
+        '#!/bin/sh\necho $$ > "$HOME/hook.pid"\nexec sleep 1000\n',
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    state_dir = tmp_path / "lane" / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir.parent / "home").mkdir(parents=True)
+    pid_path = state_dir.parent / "home" / "hook.pid"
+
+    monkeypatch.setenv("CLAWBENCH_LANE_PREPARE_CMD", str(hook))
+    monkeypatch.setenv("CLAWBENCH_LANE_PREPARE_TIMEOUT_SECONDS", "1")
+
+    worker = EvalWorker(JobQueue())
+    lane = ParallelLane(index=0, tasks=[DummyTask("t1", "tier1", "coding")])
+    lane.state_dir = state_dir
+    lane.port = GATEWAY_PORT
+
+    outcome: list[BaseException | None] = []
+
+    def run() -> None:
+        try:
+            worker._run_lane_prepare_hook(lane)
+            outcome.append(None)
+        except BaseException as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    try:
+        thread.start()
+        thread.join(5)
+        assert not thread.is_alive(), "prepare hook hung without timeout"
+        assert outcome
+        exc = outcome[0]
+        assert exc is not None
+        assert isinstance(exc, (subprocess.TimeoutExpired, RuntimeError))
+        if isinstance(exc, RuntimeError):
+            assert "timed out" in str(exc).lower()
+        assert pid_path.is_file()
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        if pid_path.is_file():
+            try:
+                os.kill(int(pid_path.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except (ValueError, ProcessLookupError, OSError):
+                pass
