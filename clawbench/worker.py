@@ -629,7 +629,13 @@ class EvalWorker:
             "CLAWBENCH_LANE_PORT": str(lane.port),
         }
         logger.info("Running lane %d prepare hook", lane.index + 1)
-        subprocess.run([hook], env=hook_env, check=True)
+        timeout_seconds = int(os.environ.get("CLAWBENCH_LANE_PREPARE_TIMEOUT_SECONDS", "180"))
+        try:
+            subprocess.run([hook], env=hook_env, check=True, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Lane {lane.index + 1} prepare hook timed out after {timeout_seconds}s"
+            ) from exc
 
     def _seed_lane_state_dir(self, target_state_dir: Path) -> None:
         source_state_dir = Path(os.environ.get("OPENCLAW_STATE_DIR", os.path.expanduser("~/.openclaw")))
