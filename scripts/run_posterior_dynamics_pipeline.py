@@ -88,6 +88,15 @@ def main() -> None:
     _run([py, str(scripts_dir / "variance_decomp.py"), "--archive-dir", str(archive_dir), "--reports-dir", str(reports_dir), *tier_args])
     _run([py, str(scripts_dir / "survival_analysis.py"), "--archive-dir", str(archive_dir), "--reports-dir", str(reports_dir), *tier_args])
     _run([py, str(scripts_dir / "snr_weighted_ranking.py"), "--archive-dir", str(archive_dir), "--reports-dir", str(reports_dir), *tier_args])
+    _run([
+        py,
+        str(scripts_dir / "violation_time_decomposition.py"),
+        "--archive-dir",
+        str(archive_dir),
+        "--reports-dir",
+        str(reports_dir / "violation_time_decomposition"),
+        *tier_args,
+    ])
     _run([py, str(scripts_dir / "generate_dynamical_report.py"), "--reports-dir", str(reports_dir)])
     if args.include_dynamics_report:
         _write_dynamics_reports(archive_dir, output_dir, args.tier)

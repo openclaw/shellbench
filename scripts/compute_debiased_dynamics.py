@@ -34,9 +34,9 @@ def compute_debiased_dynamics(regimes_path, constraint_path, weights_path, topic
     model_regimes_weight_sum = defaultdict(float)
 
     for key, data in regimes.items():
-        parts = key.split("/")
-        model = parts[0]
-        task_id = parts[1] if len(parts) > 1 else parts[0]
+        key_parts = key.rsplit("/", 2)
+        model = data.get("model") or (key_parts[0] if len(key_parts) == 3 else key)
+        task_id = data.get("task_id") or (key_parts[1] if len(key_parts) == 3 else key)
 
         # Match task to topic
         matched_topic = "unknown"

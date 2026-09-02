@@ -63,6 +63,7 @@ allow-direct-references = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 addopts = ["-p", "no:opik"]
+pythonpath = ["."]
 testpaths = ["tests"]
 
 [tool.ruff]

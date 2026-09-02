@@ -79,7 +79,7 @@ def main() -> None:
     L("")
     by_model = defaultdict(Counter)
     for key, row in regimes.items():
-        model = key.split("/")[0]
+        model = row.get("model") or key.rsplit("/", 2)[0]
         regime = row.get("regime", "unknown")
         by_model[model][regime] += 1
 

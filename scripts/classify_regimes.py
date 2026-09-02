@@ -145,6 +145,7 @@ def main() -> None:
 
     all_turn_texts: list[str] = []
     run_turns: dict[str, list[str]] = {}
+    run_metadata: dict[str, dict[str, str | int]] = {}
 
     for model_name, task_runs in grouped.items():
         for task_id, runs in task_runs.items():
@@ -152,6 +153,11 @@ def main() -> None:
                 ts = turn_texts(run, fallback_any_message=False)
                 key = f"{model_name}/{task_id}/run{run.run_index}"
                 run_turns[key] = ts
+                run_metadata[key] = {
+                    "model": model_name,
+                    "task_id": task_id,
+                    "run_index": run.run_index,
+                }
                 all_turn_texts.extend(ts)
 
     used_fallback_messages = False
@@ -159,12 +165,18 @@ def main() -> None:
         used_fallback_messages = True
         all_turn_texts = []
         run_turns = {}
+        run_metadata = {}
         for model_name, task_runs in grouped.items():
             for task_id, runs in task_runs.items():
                 for run in runs:
                     ts = turn_texts(run, fallback_any_message=True)
                     key = f"{model_name}/{task_id}/run{run.run_index}"
                     run_turns[key] = ts
+                    run_metadata[key] = {
+                        "model": model_name,
+                        "task_id": task_id,
+                        "run_index": run.run_index,
+                    }
                     all_turn_texts.extend(ts)
 
     if not all_turn_texts:
@@ -205,6 +217,7 @@ def main() -> None:
     for key, metrics in per_run.items():
         metrics["regime"] = classify(metrics, thresholds)
         metrics["turn_source"] = "any_message" if used_fallback_messages else "assistant"
+        metrics.update(run_metadata.get(key, {}))
 
     args.reports_dir.mkdir(parents=True, exist_ok=True)
     out = args.reports_dir / "regimes.json"
