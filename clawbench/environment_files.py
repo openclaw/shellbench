@@ -19,6 +19,8 @@ import json
 import logging
 import os
 import re
+import signal
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -92,6 +94,54 @@ def verify_file_state(
 # ---------------------------------------------------------------------------
 
 
+def _execution_subprocess_kwargs() -> dict[str, Any]:
+    if sys.platform == "win32":
+        return {}
+    return {"start_new_session": True}
+
+
+def _kill_execution_pgroup(process: asyncio.subprocess.Process) -> None:
+    """Signal the process group so shell-spawned children do not keep pipes open."""
+    if process.pid is None:
+        return
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            check=False,
+            capture_output=True,
+        )
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        return
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        return
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+
+
+async def _reap_timed_out_process(
+    process: asyncio.subprocess.Process, timeout_seconds: float
+) -> None:
+    _kill_execution_pgroup(process)
+    try:
+        await asyncio.wait_for(
+            process.communicate(),
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+    except (asyncio.TimeoutError, ProcessLookupError, OSError):
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+
 async def run_execution_check(
     spec: ExecutionCheck,
     *,
@@ -135,6 +185,7 @@ async def run_execution_check(
     full_env["PYTHONPATH"] = ":".join(python_path_parts)
 
     try:
+        spawn_kwargs = _execution_subprocess_kwargs()
         if spec.shell:
             process = await asyncio.create_subprocess_shell(
                 rendered_command,
@@ -142,6 +193,7 @@ async def run_execution_check(
                 env=full_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **spawn_kwargs,
             )
         else:
             process = await asyncio.create_subprocess_exec(
@@ -150,14 +202,14 @@ async def run_execution_check(
                 env=full_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **spawn_kwargs,
             )
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             process.communicate(),
             timeout=spec.timeout_seconds,
         )
     except asyncio.TimeoutError:
-        process.kill()
-        await process.communicate()
+        await _reap_timed_out_process(process, spec.timeout_seconds)
         return ExecutionCheckResult(
             name=spec.name,
             command=rendered_command,
