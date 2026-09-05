@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
 from clawbench.client import GatewayClient
+from clawbench.environment_files import _execution_subprocess_kwargs, _reap_timed_out_process
 from clawbench.paths import resolve_workspace_path
 from clawbench.render import render_argv_template, render_shell_template, render_template, render_value
 from clawbench.schemas import (
@@ -128,8 +131,6 @@ async def run_execution_check(
             reason=str(exc),
         )
     rendered_env = render_value(spec.env, runtime_values)
-    import os
-    import sys
 
     full_env = {
         **os.environ,
@@ -145,6 +146,7 @@ async def run_execution_check(
     full_env["PYTHONPATH"] = ":".join(python_path_parts)
 
     try:
+        spawn_kwargs = _execution_subprocess_kwargs()
         if spec.shell:
             process = await asyncio.create_subprocess_shell(
                 rendered_command,
@@ -152,6 +154,7 @@ async def run_execution_check(
                 env=full_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **spawn_kwargs,
             )
         else:
             process = await asyncio.create_subprocess_exec(
@@ -160,14 +163,14 @@ async def run_execution_check(
                 env=full_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **spawn_kwargs,
             )
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             process.communicate(),
             timeout=spec.timeout_seconds,
         )
     except asyncio.TimeoutError:
-        process.kill()
-        await process.communicate()
+        await _reap_timed_out_process(process, spec.timeout_seconds)
         return ExecutionCheckResult(
             name=spec.name,
             command=rendered_command,
