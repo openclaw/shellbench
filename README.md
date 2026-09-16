@@ -328,6 +328,11 @@ Being honest about what reproduces and what doesn't:
 
 ### What drifts
 
+Native Docker cleanup commands (`docker kill`, `docker rm`, and Compose teardown)
+have a 30-second deadline. A timed-out Docker CLI is terminated, then killed if
+needed, with at most two additional two-second waits to reap it. Cleanup reports
+the timeout instead of waiting indefinitely for an unresponsive Docker daemon.
+
 - **Absolute scores** — seed noise is ~0.02 stddev per task per model. Expect run_score to drift within that envelope.
 - **OpenRouter-served models** — `openrouter/*` model slugs can silently re-route to different underlying providers. We observed GLM 5.1 at 0.79 then 0.33 within hours as OpenRouter flipped its backing provider. Pin to canonical versions (e.g., `z-ai/glm-5.1-20260406`) for stable measurement.
 - **OpenClaw platform drift** — 4.9 → 4.15-beta.1 shifted scores by +0.13 to +0.29 across all models. 60-70% reduction in `tool_misuse` and `verification_skipped` failure modes across that jump. Pin the base to reproduce published numbers.

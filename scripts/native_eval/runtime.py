@@ -64,6 +64,7 @@ CODEX_DIAGNOSTIC_LINE = re.compile(
 )
 CODEX_STREAM_READ_ATTEMPTS = 20
 CODEX_STREAM_READ_DELAY_SECONDS = 0.1
+DOCKER_CLEANUP_TIMEOUT_SEC = 30
 
 
 def build_judge_env(proxy_url: str, proxy_key: str) -> dict[str, str]:
@@ -424,27 +425,30 @@ class DockerTaskEnvironment:
                     stderr_path=stderr_path,
                 )
         except TimeoutError:
-            await run_process(
-                ["docker", "kill", self.container_id],
-                stdout_path=self.trial_dir / "trial.log",
-                stderr_path=self.trial_dir / "trial.log",
-            )
+            async with asyncio.timeout(DOCKER_CLEANUP_TIMEOUT_SEC):
+                await run_process(
+                    ["docker", "kill", self.container_id],
+                    stdout_path=self.trial_dir / "trial.log",
+                    stderr_path=self.trial_dir / "trial.log",
+                )
             raise
 
     async def stop(self) -> None:
         if self.task.compose_file:
-            await run_process(
-                self._compose_prefix()
-                + ["down", "--volumes", "--remove-orphans", "--timeout", "10"],
-                stdout_path=self.trial_dir / "environment-stop.log",
-                stderr_path=self.trial_dir / "environment-stop.log",
-            )
+            async with asyncio.timeout(DOCKER_CLEANUP_TIMEOUT_SEC):
+                await run_process(
+                    self._compose_prefix()
+                    + ["down", "--volumes", "--remove-orphans", "--timeout", "10"],
+                    stdout_path=self.trial_dir / "environment-stop.log",
+                    stderr_path=self.trial_dir / "environment-stop.log",
+                )
         else:
-            await run_process(
-                ["docker", "rm", "-f", self.container_name],
-                stdout_path=self.trial_dir / "environment-stop.log",
-                stderr_path=self.trial_dir / "environment-stop.log",
-            )
+            async with asyncio.timeout(DOCKER_CLEANUP_TIMEOUT_SEC):
+                await run_process(
+                    ["docker", "rm", "-f", self.container_name],
+                    stdout_path=self.trial_dir / "environment-stop.log",
+                    stderr_path=self.trial_dir / "environment-stop.log",
+                )
 
 
 async def run_trial(
@@ -1354,6 +1358,31 @@ def _timing(result: CommandResult) -> dict[str, str]:
     }
 
 
+REAP_WAIT_SEC = 2
+
+
+async def _reap_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        async with asyncio.timeout(REAP_WAIT_SEC):
+            await process.wait()
+    except TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        try:
+            async with asyncio.timeout(REAP_WAIT_SEC):
+                await process.wait()
+        except TimeoutError:
+            return
+
+
 async def run_process(
     args: list[str],
     *,
@@ -1366,12 +1395,16 @@ async def run_process(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    await asyncio.gather(
-        _drain(process.stdout, stdout_path),
-        _drain(process.stderr, stderr_path),
-    )
-    returncode = await process.wait()
-    return CommandResult(returncode, started_at, utc_now())
+    try:
+        await asyncio.gather(
+            _drain(process.stdout, stdout_path),
+            _drain(process.stderr, stderr_path),
+        )
+        returncode = await process.wait()
+        return CommandResult(returncode, started_at, utc_now())
+    except (TimeoutError, asyncio.CancelledError):
+        await _reap_process(process)
+        raise
 
 
 async def capture_process(args: list[str]) -> str:
