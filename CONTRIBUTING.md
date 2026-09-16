@@ -85,6 +85,11 @@ partner tasks live under `tasks-domain/`. Each task needs:
 Before submitting a new task, run it against at least one agent to verify the
 completion checks fire correctly.
 
+Execution-check deadlines include process cleanup: POSIX checks run in an
+isolated process group, while Windows uses bounded `taskkill /T` cleanup. Output
+draining after termination is limited to two seconds so descendants holding
+pipes cannot indefinitely stall scoring.
+
 ---
 
 ## Commit style
