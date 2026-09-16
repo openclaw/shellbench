@@ -28,19 +28,15 @@ class DummyTask:
         return [object()] * self._phases
 
 
-def test_configure_browser_runtime_sets_benchmark_safe_openclaw_config(monkeypatch):
+def test_configure_browser_runtime_sets_benchmark_safe_openclaw_config(monkeypatch, tmp_path: Path):
     worker = EvalWorker(JobQueue())
-    state_dir = Path("/tmp/test-openclaw-config-basic")
-    if state_dir.exists():
-        import shutil
-
-        shutil.rmtree(state_dir)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
     config_path = state_dir / "openclaw.json"
     config_path.write_text("{}", encoding="utf-8")
     monkeypatch.setenv("OPENCLAW_STATE_DIR", str(state_dir))
 
-    worker._configure_browser_runtime(["node", "/openclaw/dist/cli.js"], {"HOME": "/tmp/home"})
+    worker._configure_browser_runtime(["node", "/openclaw/dist/cli.js"], {"HOME": str(tmp_path / "home")})
 
     assert json.loads(config_path.read_text(encoding="utf-8")) == {
         "agents": {"defaults": {"skipBootstrap": True}},
@@ -68,20 +64,16 @@ def test_write_eval_exec_approvals_replaces_gateway_defaults(tmp_path: Path):
     assert approvals["defaults"] == {"security": "full", "ask": "off", "askFallback": "full"}
 
 
-def test_configure_browser_runtime_pins_subagents_to_active_model(monkeypatch):
+def test_configure_browser_runtime_pins_subagents_to_active_model(monkeypatch, tmp_path: Path):
     worker = EvalWorker(JobQueue())
     worker.set_active_model("openai-codex/gpt-5.4")
-    state_dir = Path("/tmp/test-openclaw-config-model")
-    if state_dir.exists():
-        import shutil
-
-        shutil.rmtree(state_dir)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
     config_path = state_dir / "openclaw.json"
     config_path.write_text("{}", encoding="utf-8")
     monkeypatch.setenv("OPENCLAW_STATE_DIR", str(state_dir))
 
-    worker._configure_browser_runtime(["node", "/openclaw/dist/cli.js"], {"HOME": "/tmp/home"})
+    worker._configure_browser_runtime(["node", "/openclaw/dist/cli.js"], {"HOME": str(tmp_path / "home")})
 
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert data["agents"]["defaults"] == {
@@ -95,15 +87,11 @@ def test_configure_browser_runtime_pins_subagents_to_active_model(monkeypatch):
     assert data["models"]["providers"]["openai-codex"]["auth"] == "api-key"
 
 
-def test_configure_browser_runtime_sets_requested_agent_runtime(monkeypatch):
+def test_configure_browser_runtime_sets_requested_agent_runtime(monkeypatch, tmp_path: Path):
     worker = EvalWorker(JobQueue())
     worker.set_active_model("openai/gpt-5.5")
-    state_dir = Path("/tmp/test-openclaw-config-runtime")
-    if state_dir.exists():
-        import shutil
-
-        shutil.rmtree(state_dir)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
     config_path = state_dir / "openclaw.json"
     config_path.write_text(
         json.dumps(
@@ -123,7 +111,7 @@ def test_configure_browser_runtime_sets_requested_agent_runtime(monkeypatch):
     monkeypatch.setenv("CLAWBENCH_OPENCLAW_AGENT_RUNTIME", "codex")
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
 
-    worker._configure_browser_runtime(["node", "/openclaw/dist/cli.js"], {"HOME": "/tmp/home"})
+    worker._configure_browser_runtime(["node", "/openclaw/dist/cli.js"], {"HOME": str(tmp_path / "home")})
 
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert data["agents"]["defaults"]["agentRuntime"]["id"] == "codex"
@@ -157,15 +145,11 @@ def test_configure_browser_runtime_sets_requested_agent_runtime(monkeypatch):
         }
 
 
-def test_configure_browser_runtime_strips_source_agent_runtime_when_unset(monkeypatch):
+def test_configure_browser_runtime_strips_source_agent_runtime_when_unset(monkeypatch, tmp_path: Path):
     worker = EvalWorker(JobQueue())
     worker.set_active_model("anthropic/claude-sonnet-4-6")
-    state_dir = Path("/tmp/test-openclaw-config-runtime-strip")
-    if state_dir.exists():
-        import shutil
-
-        shutil.rmtree(state_dir)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
     config_path = state_dir / "openclaw.json"
     config_path.write_text(
         json.dumps(
@@ -189,7 +173,7 @@ def test_configure_browser_runtime_strips_source_agent_runtime_when_unset(monkey
     monkeypatch.delenv("CLAWBENCH_OPENCLAW_AGENT_RUNTIME", raising=False)
     monkeypatch.delenv("OPENCLAW_AGENT_RUNTIME", raising=False)
 
-    worker._configure_browser_runtime(["node", "/openclaw/dist/cli.js"], {"HOME": "/tmp/home"})
+    worker._configure_browser_runtime(["node", "/openclaw/dist/cli.js"], {"HOME": str(tmp_path / "home")})
 
     data = json.loads(config_path.read_text(encoding="utf-8"))
     defaults = data["agents"]["defaults"]

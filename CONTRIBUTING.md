@@ -82,6 +82,11 @@ partner tasks live under `tasks-domain/`. Each task needs:
   the task
 - A `judge` rubric for semantic tasks
 
+Background services start in declaration order. If setup or readiness fails,
+or startup is cancelled, the harness stops every service it has started before
+propagating the error. A successful startup transfers cleanup responsibility to
+the caller.
+
 Before submitting a new task, run it against at least one agent to verify the
 completion checks fire correctly.
 
