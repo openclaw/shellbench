@@ -85,6 +85,10 @@ partner tasks live under `tasks-domain/`. Each task needs:
 Before submitting a new task, run it against at least one agent to verify the
 completion checks fire correctly.
 
+Native Docker tasks may run as a non-root user. Their log mounts remain writable
+by that user; the host trial directory is restricted to its owner (`0700`) so
+unrelated host users cannot traverse to or modify the logs.
+
 ---
 
 ## Commit style

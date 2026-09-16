@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import stat
 import subprocess
 import sys
 import tarfile
@@ -1459,6 +1460,32 @@ def test_workdir_falls_back_to_existing_container_directory(
         "if [ -d /app ]; then printf /app; "
         "elif [ -d /workspace ]; then printf /workspace; else pwd; fi"
     )
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_prepare_trial_dirs_keep_mounts_writable_under_private_parent(tmp_path: Path, existing: bool) -> None:
+    trial_dir = tmp_path / "trial"
+    if existing:
+        trial_dir.mkdir()
+        trial_dir.chmod(0o777)
+    environment = DockerTaskEnvironment(
+        task=object(),  # type: ignore[arg-type]
+        trial_dir=trial_dir,
+        container_name="trial",
+        project_name="trial",
+        toolchain_root=tmp_path,
+    )
+
+    environment.prepare_trial_dirs()
+
+    assert stat.S_IMODE(trial_dir.stat().st_mode) == 0o700
+    for path in (
+        environment.agent_dir,
+        environment.verifier_dir,
+        environment.artifacts_dir / "logs" / "artifacts",
+    ):
+        assert path.is_dir()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o777
 
 
 def test_claude_code_selects_canonical_model_explicitly() -> None:

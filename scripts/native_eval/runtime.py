@@ -109,14 +109,20 @@ class DockerTaskEnvironment:
     def artifacts_dir(self) -> Path:
         return self.trial_dir / "artifacts"
 
-    async def start(self) -> CommandResult:
+    def prepare_trial_dirs(self) -> None:
+        self.trial_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.trial_dir.chmod(0o700)
         for path in (
             self.agent_dir,
             self.verifier_dir,
             self.artifacts_dir / "logs" / "artifacts",
         ):
             path.mkdir(parents=True, exist_ok=True)
+            # Docker mounts these below the private parent for arbitrary task UIDs.
             path.chmod(0o777)
+
+    async def start(self) -> CommandResult:
+        self.prepare_trial_dirs()
 
         started_at = utc_now()
         try:
