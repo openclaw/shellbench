@@ -14,6 +14,10 @@ from uuid import uuid4
 import pytest
 
 from scripts.native_eval.fleet import (
+    CRABBOX_INSPECT_TIMEOUT_SECONDS,
+    CRABBOX_STOP_TIMEOUT_SECONDS,
+    CRABBOX_WARMUP_CLEANUP_SECONDS,
+    CRABBOX_WARMUP_TIMEOUT_SECONDS,
     FleetConfig,
     FleetController,
     FleetError,
@@ -260,6 +264,118 @@ def test_subprocess_timeout_output_is_normalized_to_text(
     assert result.returncode == 124
     assert result.stdout == "partial stdout"
     assert result.stderr == "partial stderr"
+
+
+def _broker_controller(executor: object) -> FleetController:
+    controller = object.__new__(FleetController)
+    controller.config = FleetConfig(
+        run_index=Path("/tmp/unused-index"),
+        local_root=Path("/tmp/unused-root"),
+        runner_root=Path("/tmp/unused-runner"),
+        task_archive=Path("/tmp/unused-tasks"),
+        env_file=Path("/tmp/unused.env"),
+        warmup_capacity_attempts=1,
+        warmup_capacity_backoff_seconds=0,
+    )
+    controller.executor = executor
+    return controller
+
+
+@pytest.mark.parametrize("action", ["inspect", "warmup"])
+def test_inspect_and_warmup_honor_subprocess_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    seen_timeouts: list[float] = []
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            raise AssertionError(f"{action} invoked subprocess.run without a timeout")
+        seen_timeouts.append(float(timeout))
+        raise subprocess.TimeoutExpired(
+            args[0] if args else [action],
+            timeout,
+            output=b"",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    controller = _broker_controller(SubprocessExecutor())
+
+    with pytest.raises(FleetError, match="timed out"):
+        if action == "inspect":
+            controller._inspect_lease("cbx_hung", required=True)
+        else:
+            controller._warmup_lease(
+                ["crabbox", "warmup", "--slug", "hung"],
+                "hung",
+            )
+
+    if action == "inspect":
+        assert seen_timeouts == [CRABBOX_INSPECT_TIMEOUT_SECONDS]
+        assert seen_timeouts == [45]
+    else:
+        expected = 30 * 60 + CRABBOX_WARMUP_CLEANUP_SECONDS
+        assert seen_timeouts == [CRABBOX_WARMUP_TIMEOUT_SECONDS]
+        assert seen_timeouts == [expected]
+
+
+def test_warmup_succeeds_when_child_uses_full_creation_window() -> None:
+    class RecordingExecutor(SubprocessExecutor):
+        def __init__(self) -> None:
+            self.timeouts: list[float] = []
+
+        def run_with_timeout(
+            self,
+            command: Sequence[str],
+            *,
+            capture_output: bool,
+            timeout: float,
+        ) -> subprocess.CompletedProcess[str]:
+            del capture_output
+            self.timeouts.append(timeout)
+            return subprocess.CompletedProcess(list(command), 0, stdout="", stderr="")
+
+    executor = RecordingExecutor()
+    _broker_controller(executor)._warmup_lease(
+        ["crabbox", "warmup", "--slug", "slow-ok"],
+        "slow-ok",
+    )
+
+    expected = 30 * 60 + CRABBOX_WARMUP_CLEANUP_SECONDS
+    assert executor.timeouts == [CRABBOX_WARMUP_TIMEOUT_SECONDS]
+    assert executor.timeouts == [expected]
+
+
+def test_warmup_timeout_leaves_cleanup_slack_after_creation_budget() -> None:
+    assert CRABBOX_WARMUP_TIMEOUT_SECONDS > 30 * 60
+    assert CRABBOX_WARMUP_CLEANUP_SECONDS == CRABBOX_STOP_TIMEOUT_SECONDS
+    assert CRABBOX_WARMUP_TIMEOUT_SECONDS == 30 * 60 + CRABBOX_WARMUP_CLEANUP_SECONDS
+
+
+@pytest.mark.parametrize("action", ["inspect", "warmup"])
+def test_inspect_and_warmup_accept_run_only_executor(tmp_path: Path, action: str) -> None:
+    class RunOnlyExecutor:
+        def run(self, command, *, capture_output=False):
+            assert capture_output
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="synthetic failure")
+
+    controller = object.__new__(FleetController)
+    controller.config = FleetConfig(
+        run_index=tmp_path / "index.json",
+        local_root=tmp_path,
+        runner_root=tmp_path,
+        task_archive=tmp_path / "tasks.tar",
+        env_file=tmp_path / "test.env",
+    )
+    controller.executor = RunOnlyExecutor()
+
+    with pytest.raises(FleetError, match="synthetic failure"):
+        if action == "inspect":
+            controller._inspect_lease("synthetic", required=True)
+        else:
+            controller._warmup_lease(["crabbox", "warmup"], "synthetic")
 
 
 def test_optional_inspect_treats_stopped_lease_as_absent(tmp_path: Path) -> None:

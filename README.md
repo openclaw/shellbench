@@ -328,6 +328,12 @@ Being honest about what reproduces and what doesn't:
 
 ### What drifts
 
+The native fleet controller bounds Crabbox CLI inspection to 45 seconds and
+warmup to the 30-minute creation budget plus cleanup slack per invocation so
+Crabbox can finish provider create, readiness, and post-timeout cancellation.
+Custom injected command executors retain their `run` interface and own their
+execution deadlines.
+
 - **Absolute scores** — seed noise is ~0.02 stddev per task per model. Expect run_score to drift within that envelope.
 - **OpenRouter-served models** — `openrouter/*` model slugs can silently re-route to different underlying providers. We observed GLM 5.1 at 0.79 then 0.33 within hours as OpenRouter flipped its backing provider. Pin to canonical versions (e.g., `z-ai/glm-5.1-20260406`) for stable measurement.
 - **OpenClaw platform drift** — 4.9 → 4.15-beta.1 shifted scores by +0.13 to +0.29 across all models. 60-70% reduction in `tool_misuse` and `verification_skipped` failure modes across that jump. Pin the base to reproduce published numbers.

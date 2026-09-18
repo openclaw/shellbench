@@ -55,6 +55,17 @@ CRABBOX_STOP_TIMEOUT_SECONDS = 6 * 60
 CRABBOX_READY_ATTEMPTS = 30
 CRABBOX_READY_BACKOFF_SECONDS = 10
 CRABBOX_INSPECT_ATTEMPTS = 4
+# Coordinator inspect is a single GET. Bound it so a hung broker cannot
+# pin the fleet controller.
+CRABBOX_INSPECT_TIMEOUT_SECONDS = 45
+# Crabbox warmup waits for provider create plus readiness (AWS coordinator
+# polls activation inside a 30-minute creation budget). Do not treat it as
+# a single create POST. After that inner deadline Crabbox still needs time
+# to abandon the unrecovered create (10s cancel plus extra). Match the
+# existing stop/release path (five 60-second release retries) so a create
+# that hits coordinatorHTTPTimeout can still record cancellation.
+CRABBOX_WARMUP_CLEANUP_SECONDS = CRABBOX_STOP_TIMEOUT_SECONDS
+CRABBOX_WARMUP_TIMEOUT_SECONDS = 30 * 60 + CRABBOX_WARMUP_CLEANUP_SECONDS
 
 
 class CommandExecutor(Protocol):
@@ -693,9 +704,19 @@ class FleetController:
             return lease
         raise AssertionError("unreachable")
 
+    def _run_broker_command(
+        self, command: Sequence[str], *, timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        if isinstance(self.executor, SubprocessExecutor):
+            return self.executor.run_with_timeout(command, capture_output=True, timeout=timeout)
+        return self.executor.run(command, capture_output=True)
+
     def _warmup_lease(self, command: Sequence[str], slug: str) -> None:
         for attempt in range(1, self.config.warmup_capacity_attempts + 1):
-            result = self.executor.run(command, capture_output=True)
+            result = self._run_broker_command(
+                command,
+                timeout=CRABBOX_WARMUP_TIMEOUT_SECONDS,
+            )
             if result.returncode == 0:
                 return
             detail = (result.stderr or result.stdout or "").strip()
@@ -728,7 +749,10 @@ class FleetController:
             "--json",
         ]
         for attempt in range(1, CRABBOX_INSPECT_ATTEMPTS + 1):
-            result = self.executor.run(command, capture_output=True)
+            result = self._run_broker_command(
+                command,
+                timeout=CRABBOX_INSPECT_TIMEOUT_SECONDS,
+            )
             if result.returncode == 0:
                 break
             detail = (result.stderr or result.stdout or "").strip()
@@ -1297,14 +1321,9 @@ printf '%s\n' "$pid"
             lease_still_exists = True
         if lease_still_exists:
             with self._cleanup_lock:
-                if isinstance(self.executor, SubprocessExecutor):
-                    stop = self.executor.run_with_timeout(
-                        stop_command,
-                        capture_output=True,
-                        timeout=CRABBOX_STOP_TIMEOUT_SECONDS,
-                    )
-                else:
-                    stop = self.executor.run(stop_command, capture_output=True)
+                stop = self._run_broker_command(
+                    stop_command, timeout=CRABBOX_STOP_TIMEOUT_SECONDS
+                )
         else:
             stop = subprocess.CompletedProcess(stop_command, 0, stdout="", stderr="")
         if stop.returncode:
