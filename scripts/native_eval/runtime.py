@@ -21,6 +21,7 @@ from scripts.native_eval.harness_trajectories import (
 from scripts.native_eval.harnesses import TOOLCHAIN_ROOT, build_harness_command
 from scripts.native_eval.models import RunSpec
 from scripts.native_eval.proxy import JUDGE_PROXY_MODEL_NAME
+from scripts.native_eval.run_review import review_native_trial
 from scripts.native_eval.tasks import TaskSpec
 
 
@@ -433,18 +434,20 @@ class DockerTaskEnvironment:
 
     async def stop(self) -> None:
         if self.task.compose_file:
-            await run_process(
+            result = await run_process(
                 self._compose_prefix()
                 + ["down", "--volumes", "--remove-orphans", "--timeout", "10"],
                 stdout_path=self.trial_dir / "environment-stop.log",
                 stderr_path=self.trial_dir / "environment-stop.log",
             )
         else:
-            await run_process(
+            result = await run_process(
                 ["docker", "rm", "-f", self.container_name],
                 stdout_path=self.trial_dir / "environment-stop.log",
                 stderr_path=self.trial_dir / "environment-stop.log",
             )
+        if result.returncode:
+            raise DockerStartupError(f"Environment shutdown exited {result.returncode}")
 
 
 async def run_trial(
@@ -460,6 +463,9 @@ async def run_trial(
     trial_name = f"{task.name[:32].rstrip('_-')}__{trial_suffix}"
     trial_dir = job_dir / trial_name
     trial_dir.mkdir(parents=True, exist_ok=False)
+    # Resolve this runner-owned root before starting the actor. Evidence paths
+    # below it remain unresolved and are later opened without following links.
+    trial_dir = trial_dir.resolve()
     (trial_dir / "agent").mkdir()
     (trial_dir / "verifier").mkdir()
     (trial_dir / "artifacts").mkdir()
@@ -481,14 +487,13 @@ async def run_trial(
     recorded_exception: BaseException | None = None
     execution_exception: BaseException | None = None
     agent_exit_code: int | None = None
-    agent_command = build_harness_command(
-        run,
-        proxy_url=proxy_url,
-        proxy_key=proxy_key,
-        mcp_servers=task.mcp_servers,
-    )
-
     try:
+        agent_command = build_harness_command(
+            run,
+            proxy_url=proxy_url,
+            proxy_key=proxy_key,
+            mcp_servers=task.mcp_servers,
+        )
         env_start = await environment.start()
         result["environment_setup"] = _timing(env_start)
         atomic_write_json(trial_dir / "result.json", result)
@@ -588,8 +593,10 @@ async def run_trial(
         if recorded_exception is None:
             recorded_exception = exc
     finally:
+        actor_stopped = False
         try:
             await environment.stop()
+            actor_stopped = True
         except Exception as exc:
             if execution_exception is None:
                 execution_exception = exc
@@ -615,6 +622,25 @@ async def run_trial(
                 ),
                 encoding="utf-8",
             )
+        # Freeze evidence only after shutdown: an actor may otherwise rewrite
+        # logs, artifacts, or shared-environment verifier output mid-review.
+        # Review failures are separate from task execution and verifier reward.
+        try:
+            result["run_review"] = await review_native_trial(
+                trial_dir=trial_dir,
+                task=task,
+                run=run,
+                result=result,
+                proxy_url=proxy_url,
+                proxy_key=proxy_key,
+                actor_stopped=actor_stopped,
+            )
+        except Exception as exc:
+            result["run_review"] = {
+                "status": "error",
+                "error": f"Review persistence failed: {type(exc).__name__}: {exc}",
+                "paths": {},
+            }
         atomic_write_json(trial_dir / "result.json", result)
     return result
 

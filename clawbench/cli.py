@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 
 import click
@@ -25,6 +26,90 @@ def cli(verbose: bool) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+
+@cli.command("review-log")
+@click.argument("evidence_path", type=click.Path(exists=True, path_type=Path))
+@click.option("--output", "-o", required=True, type=click.Path(path_type=Path),
+              help="New directory for evidence, review JSON, and the reviewed-log page.")
+@click.option("--review-result", type=click.Path(exists=True, path_type=Path),
+              help="Render an existing review against its original evidence without a model call.")
+@click.option("--judge-model", default="", help="Explicit judge model for a new review.")
+@click.option("--judge-api-url", envvar="AGENT_JUDGE_API_URL", default="",
+              help="OpenAI-compatible chat/completions endpoint.")
+@click.option("--reason", default="", help="Reason for a new review of previously reviewed evidence.")
+def review_log(
+    evidence_path: Path,
+    output: Path,
+    review_result: Path | None,
+    judge_model: str,
+    judge_api_url: str,
+    reason: str,
+) -> None:
+    """Review frozen Core evidence, or render its existing evidence-linked review.
+
+    The API credential is read from AGENT_JUDGE_API_KEY or OPENAI_API_KEY.
+    Without a model or --review-result, render an explicitly unreviewed log.
+    """
+    from datetime import datetime, timezone
+
+    from clawbench.review_report import persist_run_review, validate_review_evidence
+    from clawbench.run_review import (
+        ReviewEvidence,
+        RunReview,
+        evidence_sha256,
+        read_evidence_text,
+        review_with_http,
+        unreviewed_result,
+    )
+
+    if output.exists() or output.is_symlink():
+        raise click.ClickException("Output already exists; use a new directory to preserve history.")
+    if review_result and judge_model:
+        raise click.UsageError("Choose --review-result or --judge-model, not both.")
+    if judge_model and not judge_api_url:
+        raise click.UsageError("--judge-api-url is required with --judge-model.")
+    if judge_model and (evidence_path.parent / "review.json").exists() and not reason.strip():
+        raise click.UsageError("Provide --reason when re-reviewing an existing bundle.")
+    try:
+        evidence_text = read_evidence_text(
+            evidence_path.absolute().parent, evidence_path.name, max_bytes=8_000_000
+        )
+        if getattr(evidence_text, "truncated", False):
+            raise ValueError("Evidence file exceeds the replay size limit")
+        evidence = ReviewEvidence.model_validate_json(evidence_text)
+        if review_result:
+            review_text = read_evidence_text(
+                review_result.absolute().parent, review_result.name, max_bytes=2_000_000
+            )
+            if getattr(review_text, "truncated", False):
+                raise ValueError("Review file exceeds the replay size limit")
+            review = RunReview.model_validate_json(review_text)
+            validate_review_evidence(evidence, review)
+        elif judge_model:
+            api_key = os.environ.get("AGENT_JUDGE_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+            if not api_key:
+                raise click.ClickException("Set AGENT_JUDGE_API_KEY or OPENAI_API_KEY for judging.")
+            review = asyncio.run(review_with_http(
+                evidence, api_url=judge_api_url, api_key=api_key, model=judge_model
+            ))
+        else:
+            review = unreviewed_result(evidence)
+        page = persist_run_review(output, evidence, review)
+        if judge_model:
+            provenance = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "source_evidence": str(evidence_path.absolute()),
+                "evidence_sha256": evidence_sha256(evidence),
+                "reason": reason.strip() or "Initial behavioral review of saved evidence",
+            }
+            with (output / "revision.json").open("x", encoding="utf-8") as handle:
+                json.dump(provenance, handle, indent=2)
+        click.echo(f"Review: {review.status}\nReviewed log: {page.absolute()}")
+        if review.error:
+            raise click.ClickException(f"Review failed; evidence and error retained at {page.absolute()}")
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @cli.command()

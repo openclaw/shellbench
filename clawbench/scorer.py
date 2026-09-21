@@ -8,7 +8,7 @@ from typing import Any
 
 from clawbench.client import GatewayClient
 from clawbench.environment import verify_completion
-from clawbench.judge import judge_task_run
+from clawbench.judge import build_task_review_evidence, judge_task_run, review_task_run
 from clawbench.schemas import (
     BehaviorExpectations,
     BehaviorResult,
@@ -94,6 +94,10 @@ async def score_task_run(
     runtime_values: dict[str, Any],
     judge_model: str = "",
     judge_affects_score: bool = False,
+    run_id: str = "",
+    user_turns: list[dict[str, Any]] | None = None,
+    execution_status: str | None = None,
+    coverage_notes: list[str] | None = None,
 ) -> TaskRunResult:
     annotate_transcript_tool_calls(transcript)
     completion_result = await verify_completion(
@@ -114,6 +118,19 @@ async def score_task_run(
         client=client,
         judge_model=judge_model,
         completion_result=completion_result,
+    )
+    review_evidence = build_task_review_evidence(
+        task=task,
+        transcript=transcript,
+        workspace=workspace,
+        completion_result=completion_result,
+        run_id=run_id,
+        user_turns=user_turns,
+        execution_status=execution_status,
+        coverage_notes=coverage_notes,
+    )
+    run_review = await review_task_run(
+        evidence=review_evidence, client=client, judge_model=judge_model,
     )
     token_usage = transcript.total_usage
     efficiency_result = EfficiencyResult.from_usage(duration_ms=duration_ms, usage=token_usage)
@@ -172,6 +189,8 @@ async def score_task_run(
         trajectory_result=trajectory_result,
         behavior_result=behavior_result,
         judge_result=judge_result,
+        run_review=run_review,
+        review_evidence=review_evidence,
         run_score=round(run_score, 4),
         transcript=transcript,
         duration_ms=duration_ms,

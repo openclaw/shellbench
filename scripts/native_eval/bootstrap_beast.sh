@@ -122,7 +122,8 @@ install_litellm() {
   "$TOOLCHAIN_ROOT/bin/uv" venv --clear --python 3.12 "$venv"
   "$TOOLCHAIN_ROOT/bin/uv" pip install \
     --python "$venv/bin/python" \
-    "litellm[proxy]==$LITELLM_VERSION"
+    "litellm[proxy]==$LITELLM_VERSION" \
+    "pydantic==2.13.5" "httpx==0.28.1"
 }
 
 install_harness() {

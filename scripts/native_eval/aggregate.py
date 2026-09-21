@@ -121,6 +121,11 @@ PER_TASK_FIELDS = (
     "trajectory_status",
     "runtime_model_name",
     "canonical_model_identity",
+    "run_review_status",
+    "run_review_violation_count",
+    "run_review_evidence_path",
+    "run_review_path",
+    "run_review_html_path",
 )
 
 RUN_FIELDS = (
@@ -158,6 +163,9 @@ RUN_FIELDS = (
     "n_cache_tokens",
     "n_output_tokens",
     "cost_usd",
+    "review_completed",
+    "review_errors",
+    "review_violation_count",
 )
 
 REPAIR_SENSITIVITY_FIELDS = (
@@ -591,6 +599,10 @@ def _normalize_result(
         execution_reason = exception_message
     agent_result = result.get("agent_result")
     agent_result = agent_result if isinstance(agent_result, dict) else {}
+    run_review = result.get("run_review")
+    run_review = run_review if isinstance(run_review, dict) else {}
+    review_paths = run_review.get("paths")
+    review_paths = review_paths if isinstance(review_paths, dict) else {}
     row: dict[str, Any] = {
         "run_label": run_label,
         "pair_label": pair_label,
@@ -627,11 +639,20 @@ def _normalize_result(
         "trajectory_status": str(agent_result.get("trajectory_status") or ""),
         "runtime_model_name": str(agent_result.get("runtime_model_name") or ""),
         "canonical_model_identity": agent_result.get("canonical_model_identity"),
+        "run_review_status": str(run_review.get("status") or "not_recorded"),
+        "run_review_violation_count": _integer(run_review.get("violation_count")),
         "_has_result_file": True,
         "_valid_result": True,
         "_completed_result": bool(result.get("finished_at")),
         "_scorable": True,
     }
+    for field, key in (
+        ("run_review_evidence_path", "evidence"),
+        ("run_review_path", "review"),
+        ("run_review_html_path", "html"),
+    ):
+        relative = review_paths.get(key)
+        row[field] = str(result_path.parent / relative) if isinstance(relative, str) and relative else ""
     for field in TIMING_FIELDS:
         timing = result.get(field)
         timing = timing if isinstance(timing, dict) else {}
@@ -1065,6 +1086,9 @@ def _summarize_run(
         "n_cache_tokens": _sum_present(scored_rows, "n_cache_tokens"),
         "n_output_tokens": _sum_present(scored_rows, "n_output_tokens"),
         "cost_usd": _sum_present(scored_rows, "cost_usd"),
+        "review_completed": sum(row.get("run_review_status") == "completed" for row in rows),
+        "review_errors": sum(row.get("run_review_status") == "error" for row in rows),
+        "review_violation_count": _sum_present(rows, "run_review_violation_count"),
     }
 
 

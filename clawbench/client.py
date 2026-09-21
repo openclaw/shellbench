@@ -518,11 +518,13 @@ class GatewayClient:
 
         collected_messages: list[TranscriptMessage] = []
         done = False
+        stop_reason = "unknown"
         deadline = asyncio.get_running_loop().time() + timeout
         try:
             while not done:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
+                    stop_reason = "timeout"
                     logger.warning(
                         "Timeout waiting for final state on session %s run %s",
                         session_key,
@@ -533,6 +535,7 @@ class GatewayClient:
                     wait_payload = _task_result_or_empty(wait_task)
                     status = str(wait_payload.get("status", ""))
                     if status and status != "timeout":
+                        stop_reason = status
                         logger.info(
                             "agent.wait observed terminal status for session %s run %s: %s",
                             session_key,
@@ -542,6 +545,7 @@ class GatewayClient:
                         done = True
                         break
                     if status == "timeout":
+                        stop_reason = "timeout"
                         logger.warning(
                             "agent.wait timed out for session %s run %s",
                             session_key,
@@ -552,6 +556,7 @@ class GatewayClient:
                     event = await asyncio.wait_for(chat_queue.get(), timeout=min(0.5, remaining))
                     state = event.get("payload", {}).get("state", "")
                     if state in {"final", "aborted", "error"}:
+                        stop_reason = "completed" if state == "final" else state
                         done = True
                 except asyncio.TimeoutError:
                     pass
@@ -592,7 +597,9 @@ class GatewayClient:
             self._event_queues.pop(chat_queue_key, None)
             self._event_queues.pop(msg_queue_key, None)
 
-        return _correlate_transcript(Transcript(messages=collected_messages))
+        return _correlate_transcript(
+            Transcript(messages=collected_messages, stop_reason=stop_reason)
+        )
 
     async def _wait_for_agent_run(self, run_id: str, *, timeout_ms: int) -> dict[str, Any]:
         try:

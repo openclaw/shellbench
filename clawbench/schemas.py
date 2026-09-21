@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from clawbench.run_review import ReviewEvidence, RunReview
+
 
 class Tier(str, enum.Enum):
     TIER1 = "tier1"
@@ -224,6 +226,8 @@ class TranscriptMessage(BaseModel):
 
 class Transcript(BaseModel):
     messages: list[TranscriptMessage] = Field(default_factory=list)
+    # An empty/default transcript has no demonstrated terminal event.
+    stop_reason: str = "unknown"
 
     @property
     def tool_call_sequence(self) -> list[ToolCall]:
@@ -587,6 +591,9 @@ class TaskRunResult(BaseModel):
     trajectory_result: TrajectoryResult = Field(default_factory=TrajectoryResult)
     behavior_result: BehaviorResult = Field(default_factory=BehaviorResult)
     judge_result: JudgeResult = Field(default_factory=JudgeResult)
+    run_review: RunReview = Field(default_factory=RunReview)
+    review_evidence: ReviewEvidence | None = None
+    review_artifact_dir: str = ""
     run_score: float = 0.0
     transcript: Transcript = Field(default_factory=Transcript)
     duration_ms: int = 0

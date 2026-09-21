@@ -77,6 +77,12 @@ Every agent run produces a full execution trace: every tool call, every file rea
 
 **The key invariant**: the LLM judge can never rescue a failed deterministic check. Official scoring keeps judge results as a sidecar signal. Experimental judge-weighted scoring must be explicitly enabled and still gates judge contribution behind deterministic completion.
 
+Core also retains an [evidence-linked behavioral review](docs/RUN_REVIEW.md) of each
+run: authorization, data protection, instruction authority, verification, and
+reporting. Findings link to exact log events, with explicit incomplete-evidence and
+unreviewed states. Gateway runs enable it with `--judge-model`; native runs use the
+configured judge proxy. These reviews do not change existing task scores.
+
 ### 2. We measure reliability AND quantify noise
 
 A model that scores 90% on one run and 20% on the next is not a 55% model. It's an unreliable model. Users experience the worst run, not the average.

@@ -21,7 +21,10 @@ from rich.table import Table
 from clawbench import __version__
 from clawbench.ablation import build_ablation_profile
 from clawbench.client import GatewayClient, GatewayConfig
+from clawbench.judge import build_task_review_evidence
 from clawbench.releases import compute_task_snapshot_fingerprint, load_active_release
+from clawbench.review_report import persist_run_review
+from clawbench.run_review import RUBRIC_VERSION, unreviewed_result
 from clawbench.schemas import (
     BenchmarkResult,
     DeliveryOutcome,
@@ -44,7 +47,7 @@ console = Console()
 
 KNOWN_ADAPTERS = ("openclaw", "hermes", "codex", "claude-code")
 EXECUTABLE_ADAPTERS = {"openclaw"}
-RUN_CACHE_SCHEMA_VERSION = 2
+RUN_CACHE_SCHEMA_VERSION = 3
 
 
 class _NullCtx:
@@ -312,6 +315,10 @@ class BenchmarkHarness:
         services = []
         session_keys: list[str] = []
         agent_id: str | None = None
+        transcript = Transcript()
+        user_turns: list[dict[str, Any]] = []
+        review_notes: list[str] = []
+        execution_status = "unknown"
 
         # Per-phase timings so we can see where slow runs are spending their wall time.
         timings: dict[str, float] = {}
@@ -340,7 +347,6 @@ class BenchmarkHarness:
             )
             t_phase = _tick("bg_services_start", t_phase)
 
-            transcript = Transcript()
             start_ms = _now_ms()
 
             async with GatewayClient(self.gateway_config) as client:
@@ -353,6 +359,7 @@ class BenchmarkHarness:
                 )
                 t_phase = _tick("agent_create", t_phase)
                 for phase_index, phase in enumerate(task.normalized_phases()):
+                    phase_message_start = len(transcript.messages)
                     session_key = await client.create_session(
                         model=self.model,
                         agent_id=agent_id,
@@ -379,6 +386,9 @@ class BenchmarkHarness:
                         # on previous turns of this run, bail out and score whatever we have.
                         elapsed = time.monotonic() - t_run_start
                         if elapsed >= per_run_budget:
+                            execution_status = "incomplete"
+                            transcript.stop_reason = "timeout"
+                            review_notes.append("The run budget ended before the user simulator completed.")
                             logger.warning(
                                 "Run %s/%s hit per-run budget (%.0fs); stopping user simulator",
                                 task.id,
@@ -392,16 +402,53 @@ class BenchmarkHarness:
                         user_message = await simulator.next_message(transcript)
                         if user_message is None:
                             break
+                        user_turns.append({
+                            "before_message_index": len(transcript.messages),
+                            "phase_index": phase_index,
+                            "turn_index": turn_index,
+                            "text": user_message,
+                        })
                         t_turn_start = time.monotonic()
-                        phase_transcript = await client.send_and_wait(
-                            session_key,
-                            user_message,
-                            timeout=effective_timeout,
-                        )
+                        try:
+                            phase_transcript = await client.send_and_wait(
+                                session_key,
+                                user_message,
+                                timeout=effective_timeout,
+                            )
+                        except (Exception, asyncio.CancelledError):
+                            # Capture live session evidence before the connection/session
+                            # is closed. Prior phases and turns remain in the transcript.
+                            try:
+                                partial = await asyncio.wait_for(
+                                    client.get_session_messages(session_key), timeout=10,
+                                )
+                                previous = transcript.messages[phase_message_start:]
+                                if partial[:len(previous)] == previous:
+                                    transcript.messages.extend(partial[len(previous):])
+                                else:
+                                    transcript.messages.extend(partial)
+                                    if previous and partial:
+                                        review_notes.append(
+                                            "Recovered session history may overlap earlier captured turns."
+                                        )
+                            except Exception as capture_error:
+                                review_notes.append(f"Partial session history unavailable: {capture_error}")
+                            raise
                         timings[f"phase{phase_index}_turn{turn_index}"] = round(
                             time.monotonic() - t_turn_start, 2
                         )
                         transcript.messages.extend(phase_transcript.messages)
+                        if phase_transcript.stop_reason == "completed":
+                            if execution_status != "incomplete":
+                                execution_status = "completed"
+                                transcript.stop_reason = "completed"
+                        else:
+                            execution_status = "incomplete"
+                            transcript.stop_reason = phase_transcript.stop_reason
+                            review_notes.append(
+                                f"Phase {phase_index} turn {turn_index} stop reason: "
+                                f"{phase_transcript.stop_reason}."
+                            )
                         turn_index += 1
                     t_phase = _tick(f"phase{phase_index}_total", t_phase)
 
@@ -419,10 +466,15 @@ class BenchmarkHarness:
                     runtime_values=runtime_values,
                     judge_model=self.judge_model,
                     judge_affects_score=self.judge_affects_score,
+                    run_id=f"{task.id}/{workspace.name}",
+                    user_turns=user_turns,
+                    execution_status=execution_status,
+                    coverage_notes=review_notes,
                 )
                 timings["score"] = round(time.monotonic() - t_score_start, 2)
                 timings["total"] = round(time.monotonic() - t_run_start, 2)
                 result.run_index = run_index
+                self._persist_review(result, workspace)
 
                 # Write per-run cache so a future resume of this job can skip this run.
                 if cache_path is not None:
@@ -449,9 +501,21 @@ class BenchmarkHarness:
                     " ".join(f"{k}={v}s" for k, v in timings.items() if k != "total"),
                 )
                 return result
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             logger.exception("Run %s/%s failed", task.id, run_index)
-            return TaskRunResult(
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            error_message = str(exc) or ("Run cancelled" if cancelled else type(exc).__name__)
+            transcript.stop_reason = "cancelled" if cancelled else "error"
+            evidence = build_task_review_evidence(
+                task=task,
+                transcript=transcript,
+                workspace=workspace,
+                run_id=f"{task.id}/{workspace.name}",
+                user_turns=user_turns,
+                execution_status="incomplete",
+                coverage_notes=[*review_notes, f"Run execution failed: {error_message}"],
+            )
+            result = TaskRunResult(
                 task_id=task.id,
                 tier=task.tier.value,
                 family=task.family.value,
@@ -476,12 +540,21 @@ class BenchmarkHarness:
                 official=task.official,
                 run_index=run_index,
                 run_score=0.0,
-                transcript=Transcript(),
-                duration_ms=0,
+                transcript=transcript,
+                duration_ms=int((time.monotonic() - t_run_start) * 1000),
+                token_usage=transcript.total_usage,
+                review_evidence=evidence,
+                run_review=unreviewed_result(
+                    evidence, model=self.judge_model, error=f"Run execution failed: {error_message}",
+                ),
                 delivery_outcome=DeliveryOutcome.FAIL,
-                failure_mode=classify_error_failure_mode(task, str(exc)),
-                error=str(exc),
+                failure_mode=classify_error_failure_mode(task, error_message),
+                error=error_message,
             )
+            self._persist_review(result, workspace)
+            if cancelled:
+                raise
+            return result
         finally:
             await stop_background_services(services)
             if session_keys or agent_id:
@@ -495,6 +568,20 @@ class BenchmarkHarness:
                     logger.warning("Session cleanup failed: %s", exc)
             if os.environ.get("CLAWBENCH_KEEP_WORKSPACES") != "1":
                 shutil.rmtree(workspace, ignore_errors=True)
+
+    def _persist_review(self, result: TaskRunResult, workspace: Path) -> None:
+        """Write outside the disposable actor workspace before it is removed."""
+        if result.review_evidence is None:
+            return
+        configured_root = os.environ.get("CLAWBENCH_REVIEW_DIR")
+        review_root = Path(configured_root) if configured_root else workspace.parent / "_reviews"
+        directory = review_root / workspace.name
+        try:
+            persist_run_review(directory, result.review_evidence, result.run_review)
+            result.review_artifact_dir = str(directory.resolve())
+        except Exception as exc:
+            # The result still embeds the exact evidence and review for recovery.
+            logger.warning("Review persistence failed for %s: %s", result.task_id, exc)
 
     async def _create_run_agent(
         self,
@@ -554,6 +641,8 @@ class BenchmarkHarness:
             "adapter": self.adapter,
             "prompt_variant": self.prompt_variant,
             "judge_model": self.judge_model,
+            "review_api_url": os.environ.get("AGENT_JUDGE_API_URL", "").strip(),
+            "review_rubric_version": RUBRIC_VERSION,
             "judge_affects_score": self.judge_affects_score,
             "tool_profile_name": self.tool_profile_name,
             "enabled_toolsets": self.enabled_toolsets,
