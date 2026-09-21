@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import re
 import time
 from collections import Counter
@@ -12,6 +14,16 @@ from typing import Any
 
 from clawbench.client import GatewayClient
 from clawbench.paths import resolve_workspace_path
+from clawbench.run_review import (
+    ReviewEvidence,
+    RunReview,
+    build_review_evidence,
+    build_review_prompt,
+    parse_review_response,
+    read_evidence_text,
+    review_with_http,
+    unreviewed_result,
+)
 from clawbench.session_labels import unique_session_label
 from clawbench.schemas import (
     CompletionResult,
@@ -22,6 +34,182 @@ from clawbench.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def build_task_review_evidence(
+    *,
+    task: TaskDefinition,
+    transcript: Transcript,
+    workspace: Path,
+    completion_result: CompletionResult | None = None,
+    run_id: str = "",
+    user_turns: list[dict[str, Any]] | None = None,
+    execution_status: str | None = None,
+    coverage_notes: list[str] | None = None,
+) -> ReviewEvidence:
+    """Capture the complete available record, independent of task judge excerpts."""
+    notes = list(coverage_notes or [])
+    capture_incomplete = False
+    execution_status = execution_status or (
+        "completed" if transcript.stop_reason == "completed" else "unknown"
+    )
+    if transcript.stop_reason != "completed":
+        notes.append(f"Transcript stop reason: {transcript.stop_reason}.")
+    events = []
+    turns_by_index: dict[int, list[dict[str, Any]]] = {}
+    for turn in user_turns or []:
+        turns_by_index.setdefault(int(turn["before_message_index"]), []).append(turn)
+    for index in range(len(transcript.messages) + 1):
+        for turn in turns_by_index.get(index, []):
+            events.append({"kind": "user_turn", **turn})
+        if index < len(transcript.messages):
+            events.append({"kind": "transcript_message", **transcript.messages[index].model_dump(mode="json")})
+
+    artifact_paths = [item.path for item in task.completion.files]
+    if task.judge is not None:
+        artifact_paths.extend(task.judge.artifact_paths)
+    output_root = workspace / "output"
+    if output_root.is_symlink():
+        capture_incomplete = True
+        notes.append("Artifact discovery skipped a symlinked output directory.")
+    elif output_root.is_dir():
+        try:
+            for path in output_root.rglob("*"):
+                if path.is_file():
+                    artifact_paths.append(path.relative_to(workspace).as_posix())
+                    if len(artifact_paths) >= 64:
+                        capture_incomplete = True
+                        notes.append("Artifact discovery stopped at 64 paths; other files may exist.")
+                        break
+        except OSError as exc:
+            capture_incomplete = True
+            notes.append(f"Artifact discovery was incomplete: {exc}")
+    artifacts: dict[str, str] = {}
+    for index, path in enumerate(dict.fromkeys(artifact_paths)):
+        if index >= 64:
+            capture_incomplete = True
+            notes.append("Only the first 64 declared/discovered artifacts were captured.")
+            break
+        try:
+            content = read_evidence_text(workspace, path, max_bytes=16_000)
+            artifacts[path] = content
+            if getattr(content, "truncated", False):
+                capture_incomplete = True
+        except (OSError, ValueError) as exc:
+            capture_incomplete = True
+            notes.append(f"Artifact {path!r} unavailable: {exc}")
+    if artifacts:
+        notes.append("Artifact capture is limited to 16,000 bytes per file and declared paths/output/.")
+    if user_turns is not None:
+        instruction = str(user_turns[0].get("text", "")) if user_turns else ""
+        if not user_turns:
+            notes.append("No scripted user instruction was delivered before execution stopped.")
+    else:
+        phases = task.normalized_phases()
+        first_turns = phases[0].user.turns if phases else []
+        instruction = first_turns[0].message if first_turns else ""
+        notes.append(
+            "Initial instruction reconstructed from the first scripted turn. "
+            "Later planned turns are not evidence of delivered authorization."
+        )
+    return build_review_evidence(
+        run_id=run_id or f"{task.id}/{workspace.name}",
+        task_id=task.id,
+        instruction=instruction,
+        events=events,
+        artifacts=artifacts,
+        verifier=completion_result.model_dump(mode="json") if completion_result else None,
+        execution_status=execution_status,
+        coverage_notes=notes,
+        trace_complete=execution_status == "completed",
+        capture_incomplete=capture_incomplete,
+    )
+
+
+async def review_task_run(
+    *, evidence: ReviewEvidence, client: GatewayClient, judge_model: str,
+) -> RunReview:
+    """Review behavior as a diagnostic sidecar; never return a task score."""
+    if not judge_model:
+        return unreviewed_result(evidence)
+    api_url = os.environ.get("AGENT_JUDGE_API_URL", "").strip()
+    if api_url:
+        evidence.coverage.notes.append("Behavioral review uses a direct HTTP request with no tools.")
+        try:
+            return await asyncio.wait_for(
+                review_with_http(
+                    evidence, api_url=api_url,
+                    api_key=os.environ.get("AGENT_JUDGE_API_KEY") or os.environ.get("OPENAI_API_KEY", ""),
+                    model=judge_model, timeout=120,
+                ),
+                timeout=120,
+            )
+        except Exception as exc:
+            return unreviewed_result(
+                evidence, model=judge_model, error=str(exc) or type(exc).__name__,
+            )
+    session_key = ""
+
+    async def request_review() -> Transcript:
+        nonlocal session_key
+        session_key = await client.create_session(
+            model=judge_model,
+            label=unique_session_label("clawbench-run-review"),
+        )
+        inventory = await client.get_effective_tools(session_key)
+        groups = inventory.get("groups") if isinstance(inventory, dict) else None
+        if not isinstance(groups, list) or any(
+            not isinstance(group, dict)
+            or not isinstance(group.get("tools"), list)
+            or group["tools"]
+            for group in groups
+        ):
+            evidence.coverage.notes.append(
+                "Gateway reviewer was not proven tool-free; no run evidence was submitted."
+            )
+            raise RuntimeError(
+                "Behavioral review requires a tool-free judge. Configure AGENT_JUDGE_API_URL "
+                "and AGENT_JUDGE_API_KEY (or OPENAI_API_KEY), or a gateway with an explicitly "
+                "empty effective tool inventory."
+            )
+        evidence.coverage.notes.append(
+            "Gateway reviewer effective tool inventory was explicitly empty before evidence submission."
+        )
+        await client.subscribe(session_key)
+        return await client.send_and_wait(
+            session_key, build_review_prompt(evidence), timeout=120,
+        )
+
+    try:
+        response = await asyncio.wait_for(request_review(), timeout=120)
+        if response.tool_call_sequence or any(
+            message.tool_results or message.tool_result_for or message.role in {"tool", "toolResult"}
+            for message in response.messages
+        ):
+            result = unreviewed_result(
+                evidence, model=judge_model, error="Behavioral reviewer attempted tool use; judgment rejected.",
+            )
+            result.raw_response = response.assistant_text[:65_536]
+            return result
+        if response.stop_reason != "completed":
+            result = unreviewed_result(
+                evidence, model=judge_model,
+                error=f"Review response did not complete (stop reason: {response.stop_reason}).",
+            )
+            result.raw_response = response.assistant_text[:65_536]
+            return result
+        return parse_review_response(response.assistant_text, evidence=evidence, model=judge_model)
+    except Exception as exc:
+        logger.warning("Behavioral review failed: %s", exc)
+        return unreviewed_result(
+            evidence, model=judge_model, error=str(exc) or type(exc).__name__,
+        )
+    finally:
+        if session_key:
+            try:
+                await asyncio.wait_for(client.delete_session(session_key), timeout=10)
+            except Exception as exc:
+                logger.warning("Failed to delete review session %s: %s", session_key, exc)
 
 
 async def judge_task_run(

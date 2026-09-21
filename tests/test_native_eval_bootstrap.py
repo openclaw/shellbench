@@ -85,6 +85,8 @@ def test_bootstrap_installs_and_probes_only_selected_harness(
     assert sum(line.startswith("hermes-install ") for line in calls) == (harness == "hermes")
     assert [line for line in calls if line.startswith("probe ")] == [f"probe {harness}"]
     assert sum(line.startswith("uv ") for line in calls) == 2
+    assert any("venv --clear --python 3.12" in line for line in calls)
+    assert any("pydantic==2.13.5 httpx==0.28.1" in line for line in calls)
     manifest = json.loads(result.stdout[result.stdout.index("{"):])
     key = harness.replace("-", "_")
     assert manifest[key] == f"{harness}-test"

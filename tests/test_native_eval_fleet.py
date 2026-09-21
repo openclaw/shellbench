@@ -108,11 +108,15 @@ def test_remote_run_archives_terminal_status(tmp_path: Path, exit_code: int) -> 
     proxy.parent.mkdir(parents=True)
     proxy.write_text("#!/bin/sh\nexec sleep 60\n", encoding="utf-8")
     proxy.chmod(0o755)
+    runner_python = proxy.parent / "python"
+    runner_python.write_text(f'#!{bash}\npython3 "$@"\n', encoding="utf-8")
+    runner_python.chmod(0o755)
     env_file = tmp_path / "remote.env"
     env_file.write_text("", encoding="utf-8")
     shell_env = tmp_path / "bash_env"
     shell_env.write_text(
         '''python3() {
+  [[ "$SHELLBENCH_RUN_REVIEW_API_URL" == http://127.0.0.1:4000/v1/chat/completions ]] || return 99
   if [[ "$*" == *--prepare-proxy-config* ]]; then printf 'high\\n'; return 0; fi
   mkdir -p "$TEST_ROOT/results/jobs/$TEST_LABEL/task__trial"
   printf '{}\\n' > "$TEST_ROOT/results/jobs/$TEST_LABEL/task__trial/result.json"

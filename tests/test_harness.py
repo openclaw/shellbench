@@ -288,7 +288,7 @@ def test_run_cache_path_includes_scoring_inputs(tmp_path: Path):
 
     base_path = base._run_cache_path(tmp_path, task, 0)
 
-    assert "v2-" in str(base_path)
+    assert "v3-" in str(base_path)
     assert base_path == same._run_cache_path(tmp_path, task, 0)
     assert base_path != different_judge._run_cache_path(tmp_path, task, 0)
     assert base_path != different_judge_gate._run_cache_path(tmp_path, task, 0)

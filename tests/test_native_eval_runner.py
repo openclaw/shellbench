@@ -110,6 +110,7 @@ def test_all_harness_errors_reject_run_but_agent_errors_do_not() -> None:
 def test_trial_does_not_hide_execution_failure_after_agent_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str | None
 ) -> None:
+    monkeypatch.setenv("SHELLBENCH_RUN_REVIEW", "off")
     class Environment:
         def __init__(self, *, trial_dir: Path, **_kwargs: object) -> None:
             self.trial_dir = trial_dir

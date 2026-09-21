@@ -77,10 +77,13 @@ printf '%s\n' "$$" > "$RUN_STATE_DIR/pid"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$RUN_STATE_DIR/started_at_utc"
 printf '%s\n' "running" > "$RUN_STATE_DIR/state"
 export SHELLBENCH_PROXY_KEY="${SHELLBENCH_PROXY_KEY:-$(openssl rand -hex 32)}"
+# Behavioral review runs on the host; host.docker.internal is the address
+# supplied to task containers, not a resolvable name on every Linux host.
+export SHELLBENCH_RUN_REVIEW_API_URL="${SHELLBENCH_RUN_REVIEW_API_URL:-http://127.0.0.1:4000/v1/chat/completions}"
 
 cd "$ROOT/runner"
 RUN_COMMAND=(
-  python3 -m scripts.native_eval.run_job
+  "$TOOLCHAIN_ROOT/litellm-venv/bin/python" -m scripts.native_eval.run_job
   --tasks-root "$TASKS_ROOT"
   --jobs-dir "$ROOT/results/jobs"
   --run-label "$RUN_LABEL"
