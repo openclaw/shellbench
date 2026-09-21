@@ -64,56 +64,55 @@ async def start_background_services(
     services: list[ManagedService] = []
     values = dict(runtime_values)
 
-    for spec in specs:
-        port = spec.port or _pick_free_port()
-        base_url = render_template(spec.url_template, {"port": port}) if spec.url_template else None
-        values[f"{spec.name}_port"] = port
-        if base_url:
-            values[f"{spec.name}_url"] = base_url
+    try:
+        for spec in specs:
+            port = spec.port or _pick_free_port()
+            base_url = render_template(spec.url_template, {"port": port}) if spec.url_template else None
+            values[f"{spec.name}_port"] = port
+            if base_url:
+                values[f"{spec.name}_url"] = base_url
 
-        rendered_env = render_value(spec.env, values)
-        service_env = {
-            **os.environ,
-            **{key: str(value) for key, value in rendered_env.items()},
-        }
-        if spec.port_env:
-            service_env[spec.port_env] = str(port)
-        service_env.setdefault("PYTHONUNBUFFERED", "1")
+            rendered_env = render_value(spec.env, values)
+            service_env = {
+                **os.environ,
+                **{key: str(value) for key, value in rendered_env.items()},
+            }
+            if spec.port_env:
+                service_env[spec.port_env] = str(port)
+            service_env.setdefault("PYTHONUNBUFFERED", "1")
 
-        command = render_shell_template(spec.command, values)
-        cwd = resolve_workspace_path(
-            workspace,
-            render_template(spec.cwd, values),
-            field=f"background service cwd for {spec.name}",
-        )
-        log_dir = workspace / ".clawbench-services"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"{spec.name}.log"
-        log_file = log_path.open("w", encoding="utf-8")
-
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=service_env,
-            shell=True,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,  # put shell + child in own process group so we can kill the whole tree
-        )
-        managed = ManagedService(
-            spec=spec,
-            process=process,
-            log_path=log_path,
-            port=port,
-            base_url=base_url,
-        )
-        try:
+            command = render_shell_template(spec.command, values)
+            cwd = resolve_workspace_path(
+                workspace,
+                render_template(spec.cwd, values),
+                field=f"background service cwd for {spec.name}",
+            )
+            log_dir = workspace / ".clawbench-services"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"{spec.name}.log"
+            with log_path.open("w", encoding="utf-8") as log_file:
+                process = subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    env=service_env,
+                    shell=True,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    start_new_session=True,  # put shell + child in own process group so we can kill the whole tree
+                )
+            managed = ManagedService(
+                spec=spec,
+                process=process,
+                log_path=log_path,
+                port=port,
+                base_url=base_url,
+            )
+            services.append(managed)
             await _wait_for_service_ready(managed, workspace, values)
-        except Exception:
-            await stop_background_services([managed])
-            raise
-        services.append(managed)
+    except BaseException:
+        await stop_background_services(services)
+        raise
 
     return services, values
 
