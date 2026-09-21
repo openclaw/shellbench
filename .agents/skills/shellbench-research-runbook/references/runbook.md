@@ -427,6 +427,8 @@ The command writes:
 - `model_identity_audit.csv`: one strict identity summary per run
 - `turn_usage.csv`: one row per normalized trace step
 - `tool_calls.csv`: one row per tool call
+- `trajectory_nodes.csv` and `trajectory_links.csv`: unique embedded nodes and lineage
+- `model_usage_coverage.csv`: per-model observed-step usage and missingness
 - `research_audit.json`: counts and audit status
 
 The tables retain r0 rows with `phase=r0` and
@@ -446,15 +448,21 @@ Also audit proxy/provider logs:
 
 ## Tokens, Tools, And Cost
 
-Task-level token totals can be recovered when the harness emits them in
-`agent_result` or ATIF `final_metrics`. Tool calls can be recovered per turn
-from `steps[].tool_calls`.
+Task-level token values prefer `agent_result`, then root ATIF `final_metrics`
+only for missing fields. Explicit zero is preserved. Nested-family metrics
+remain separate from root metrics; never add both scopes. Turn/tool rows cover
+unique embedded nodes and retain their session and trajectory identities.
 
-Per-turn token and cost analysis has three evidence levels:
+See [native research evidence](../../../../docs/native_research_evidence.md)
+for table joins, receipt integrity, metric scopes, and independent capture,
+execution, identity, token, cost, resource, and reward statuses.
+
+Per-turn token and cost analysis distinguishes these evidence levels:
 
 | Level | Requirement | Report as |
 |---|---|---|
-| Exact | per-request usage/spend in trace or proxy/provider log | `exact_*` |
+| Reported | runtime-reported usage or cost without billing reconciliation | `reported_*` |
+| Reconciled | joined request-level provider billing evidence | separate billing evidence; not certified by this exporter |
 | Estimated | tokens plus pinned provider ID and dated pricing snapshot | `estimated` |
 | Missing | neither exact spend nor sufficient pricing evidence | `unavailable_*` |
 

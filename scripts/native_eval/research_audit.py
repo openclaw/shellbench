@@ -10,6 +10,21 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
+from scripts.native_eval.research_evidence import (
+    COVERAGE_FIELDS,
+    EVIDENCE_FIELDS,
+    LINEAGE_FIELDS,
+    LINK_FIELDS,
+    NODE_FIELDS,
+    acceptance_evidence,
+    openclaw,
+    receipt_evidence,
+    record,
+    records,
+    step_model,
+    trajectory_family,
+)
+
 
 TRACE_FIELDS = (
     "run_label",
@@ -43,6 +58,8 @@ TRACE_FIELDS = (
     "n_output_tokens",
     "cost_usd",
     "cost_provenance",
+    "usage_sources_json",
+    *EVIDENCE_FIELDS,
 )
 
 TURN_FIELDS = (
@@ -54,6 +71,10 @@ TURN_FIELDS = (
     "repetition",
     "task_name",
     "turn_index",
+    *LINEAGE_FIELDS,
+    "step_id",
+    "observed_model_name",
+    "model_evidence_source",
     "source",
     "timestamp",
     "message_chars",
@@ -76,6 +97,10 @@ TOOL_FIELDS = (
     "repetition",
     "task_name",
     "turn_index",
+    *LINEAGE_FIELDS,
+    "step_id",
+    "observed_model_name",
+    "model_evidence_source",
     "tool_index",
     "tool_call_id",
     "function_name",
@@ -112,6 +137,7 @@ RUN_AUDIT_FIELDS = (
     "toolchain_manifest_path",
     "proxy_log_path",
     "task_cost_exact_count",
+    "task_cost_reported_count",
     "task_cost_unavailable_count",
 )
 
@@ -148,7 +174,7 @@ def _nested(mapping: dict[str, Any], *keys: str) -> Any:
 def _first_number(mapping: dict[str, Any], keys: Iterable[str]) -> int | float | None:
     for key in keys:
         value = _number(mapping.get(key))
-        if value is not None:
+        if value is not None and value >= 0:
             return value
     return None
 
@@ -160,23 +186,25 @@ def _usage(
     metrics = trajectory.get("final_metrics")
     if not isinstance(metrics, dict):
         metrics = {}
-    return (
-        _first_number(
-            agent_result,
+    fields = (
+        (
             ("n_input_tokens", "input_tokens", "prompt_tokens"),
-        )
-        or _first_number(metrics, ("total_prompt_tokens", "prompt_tokens")),
-        _first_number(
-            agent_result,
+            ("total_prompt_tokens", "prompt_tokens"),
+        ),
+        (
             ("n_cache_tokens", "cache_tokens", "cached_tokens"),
-        )
-        or _first_number(metrics, ("total_cached_tokens", "cached_tokens")),
-        _first_number(
-            agent_result,
+            ("total_cached_tokens", "cached_tokens"),
+        ),
+        (
             ("n_output_tokens", "output_tokens", "completion_tokens"),
-        )
-        or _first_number(metrics, ("total_completion_tokens", "completion_tokens")),
+            ("total_completion_tokens", "completion_tokens"),
+        ),
     )
+    values = []
+    for result_keys, metric_keys in fields:
+        value = _first_number(agent_result, result_keys)
+        values.append(value if value is not None else _first_number(metrics, metric_keys))
+    return tuple(values)
 
 
 def _cost(
@@ -188,12 +216,12 @@ def _cost(
         ("cost_usd", "total_cost_usd", "total_cost"),
     )
     if cost is not None:
-        return cost, "exact_harness"
+        return cost, "reported_harness"
     metrics = trajectory.get("final_metrics")
     if isinstance(metrics, dict):
         cost = _first_number(metrics, ("total_cost_usd", "cost_usd", "total_cost"))
     if cost is not None:
-        return cost, "exact_trace"
+        return cost, "reported_trace"
     return None, "unavailable_without_provider_spend_or_pricing_snapshot"
 
 
@@ -217,9 +245,7 @@ def _step_usage(step: dict[str, Any]) -> tuple[Any, Any, Any, Any, str]:
     )
     cost = _first_number(metrics, ("cost_usd", "total_cost_usd", "total_cost"))
     provenance = (
-        "exact_trace_turn"
-        if cost is not None
-        else "unavailable_without_per_request_spend"
+        "reported_trace_turn" if cost is not None else "unavailable_without_per_request_spend"
     )
     return input_tokens, cache_tokens, output_tokens, cost, provenance
 
@@ -262,12 +288,18 @@ def _observed_models(
     runtime_model = agent_result.get("runtime_model_name")
     if isinstance(runtime_model, str) and runtime_model:
         observed.add(runtime_model)
-    values = _nested(trajectory, "extra", "observed_models")
-    if isinstance(values, list):
-        observed.update(str(value) for value in values if value)
-    model_name = _nested(trajectory, "agent", "model_name")
-    if isinstance(model_name, str) and model_name:
-        observed.add(model_name.rsplit("/", 1)[-1])
+    for node in trajectory_family(trajectory).nodes:
+        values = _nested(node.data, "extra", "observed_models")
+        if isinstance(values, list):
+            observed.update(str(value).rsplit("/", 1)[-1] for value in values if value)
+        model_name = _nested(node.data, "agent", "model_name")
+        if isinstance(model_name, str) and model_name:
+            observed.add(model_name.rsplit("/", 1)[-1])
+        for step in records(node.data.get("steps")):
+            model = step_model(node.data, step)
+            if model:
+                observed.add(model.rsplit("/", 1)[-1])
+
     return observed
 
 
@@ -299,7 +331,7 @@ def _observation(step: dict[str, Any], call_id: str) -> str:
         if isinstance(item, dict)
         and (not call_id or str(item.get("source_call_id") or "") == call_id)
     ]
-    selected = matching or [item for item in results if isinstance(item, dict)]
+    selected = matching if call_id else [item for item in results if isinstance(item, dict)]
     return "\n".join(str(item.get("content") or "") for item in selected)
 
 
@@ -383,6 +415,9 @@ def export_research_tables(
     turn_rows: list[dict[str, Any]] = []
     tool_rows: list[dict[str, Any]] = []
     run_rows: list[dict[str, Any]] = []
+    node_rows: list[dict[str, Any]] = []
+    link_rows: list[dict[str, Any]] = []
+    coverage_rows: list[dict[str, Any]] = []
 
     for entry_value in run_index["runs"]:
         if not isinstance(entry_value, dict):
@@ -428,30 +463,98 @@ def export_research_tables(
                 agent_result=agent_result,
                 trajectory_exists=trajectory_exists,
             )
+            family = trajectory_family(trajectory)
+            evidence = receipt_evidence(trajectory_path, family)
+            if identity_status == "match" and (
+                not family.identity_observed
+                or evidence["receipt_node_coverage_status"] == "partial"
+                or evidence["capture_status"] == "invalid"
+            ):
+                identity_status = "not_observed"
             counters[identity_status] += 1
             if trajectory_exists:
                 counters["real_trace"] += 1
-            steps = trajectory.get("steps")
-            if not isinstance(steps, list):
-                steps = []
+            steps = [
+                (node, index, step)
+                for node in family.nodes
+                for index, step in enumerate(records(node.data.get("steps")))
+            ]
             input_tokens, cache_tokens, output_tokens = _usage(agent_result, trajectory)
             cost, cost_provenance = _cost(agent_result, trajectory)
-            counters[
-                "task_cost_exact"
-                if cost is not None
-                else "task_cost_unavailable"
-            ] += 1
+            counters["task_cost_reported" if cost is not None else "task_cost_unavailable"] += 1
             task_tool_count = 0
 
-            for turn_index, step_value in enumerate(steps):
-                if not isinstance(step_value, dict):
-                    continue
-                step = step_value
+            table_base = {
+                "run_label": run_label,
+                "task_name": task_name,
+                "result_path": str(result_path),
+                "trajectory_path": str(trajectory_path),
+            }
+            model_coverage: dict[str, dict[str, Any]] = {}
+            for node in family.nodes:
+                metrics = record(node.data.get("final_metrics"))
+                node_rows.append(
+                    {
+                        **table_base,
+                        **node.lineage(),
+                        "node_metrics_json": json.dumps(metrics),
+                        "metrics_scope": record(metrics.get("extra")).get("scope", "unspecified"),
+                        "wrapper_only": openclaw(node.data).get("wrapper_only"),
+                    }
+                )
+            link_rows.extend({**table_base, **link} for link in family.links)
+
+            for node, turn_index, step in steps:
+                observed_model = step_model(node.data, step)
+                lineage = {
+                    **node.lineage(),
+                    "step_id": step.get("step_id"),
+                    "observed_model_name": observed_model,
+                    "model_evidence_source": (
+                        "step"
+                        if step.get("model_name")
+                        else "trajectory_default"
+                        if observed_model
+                        else "not_observed"
+                    ),
+                }
                 tool_calls = step.get("tool_calls")
                 if not isinstance(tool_calls, list):
                     tool_calls = []
                 task_tool_count += len(tool_calls)
                 turn_usage = _step_usage(step)
+                if step.get("source") == "agent":
+                    coverage = model_coverage.setdefault(
+                        observed_model,
+                        {
+                            **table_base,
+                            "observed_model_name": observed_model,
+                            "metric_scope": "observed_agent_steps",
+                            "agent_step_count": 0,
+                            **{
+                                f"{name}_observed_step_count": 0
+                                for name in ("input", "cache", "output", "cost")
+                            },
+                            **{
+                                name: None
+                                for name in (
+                                    "n_input_tokens",
+                                    "n_cache_tokens",
+                                    "n_output_tokens",
+                                    "cost_usd",
+                                )
+                            },
+                        },
+                    )
+                    coverage["agent_step_count"] += 1
+                    for name, key, value in zip(
+                        ("input", "cache", "output", "cost"),
+                        ("n_input_tokens", "n_cache_tokens", "n_output_tokens", "cost_usd"),
+                        turn_usage[:4],
+                    ):
+                        if value is not None:
+                            coverage[f"{name}_observed_step_count"] += 1
+                            coverage[key] = (coverage[key] or 0) + value
                 turn_rows.append(
                     {
                         "run_label": run_label,
@@ -462,6 +565,7 @@ def export_research_tables(
                         "repetition": entry.get("repetition"),
                         "task_name": task_name,
                         "turn_index": turn_index,
+                        **lineage,
                         "source": step.get("source"),
                         "timestamp": step.get("timestamp"),
                         "message_chars": len(str(step.get("message") or "")),
@@ -491,6 +595,7 @@ def export_research_tables(
                             "repetition": entry.get("repetition"),
                             "task_name": task_name,
                             "turn_index": turn_index,
+                            **lineage,
                             "tool_index": tool_index,
                             "tool_call_id": call_id,
                             "function_name": call_value.get("function_name"),
@@ -505,6 +610,12 @@ def export_research_tables(
                         }
                     )
 
+            coverage_rows.extend(model_coverage.values())
+            evidence.update(
+                acceptance_evidence(
+                    result, list(model_coverage.values()), cost=cost, reward=_reward(result)
+                )
+            )
             trace_rows.append(
                 {
                     "run_label": run_label,
@@ -517,9 +628,7 @@ def export_research_tables(
                     "reasoning_effort": entry.get("reasoning_effort"),
                     "judge_model_id": entry.get("judge_model_id"),
                     "judge_reasoning_effort": entry.get("judge_reasoning_effort"),
-                    "judge_identity_status": (
-                        "unverified_requires_proxy_request_evidence"
-                    ),
+                    "judge_identity_status": ("unverified_requires_proxy_request_evidence"),
                     "repetition": entry.get("repetition"),
                     "phase": entry.get("phase") or "full",
                     "qualification_family": entry.get("qualification_family"),
@@ -528,15 +637,45 @@ def export_research_tables(
                     "reward": _reward(result),
                     "result_path": str(result_path),
                     "trajectory_path": str(trajectory_path),
-                    "toolchain_manifest_path": (
-                        str(toolchain_path) if toolchain_path else ""
-                    ),
+                    "toolchain_manifest_path": (str(toolchain_path) if toolchain_path else ""),
                     "proxy_log_path": str(proxy_log_path) if proxy_log_path else "",
                     "trajectory_status": agent_result.get("trajectory_status"),
                     "observed_model_ids": json.dumps(sorted(observed)),
                     "model_identity_status": identity_status,
                     "turn_count": len(steps),
+                    "node_count": len(family.nodes),
+                    "family_issues_json": json.dumps(sorted(family.issues)),
+                    "root_metrics_json": json.dumps(record(trajectory.get("final_metrics"))),
+                    **evidence,
                     "tool_call_count": task_tool_count,
+                    "usage_sources_json": json.dumps(
+                        {
+                            key: (
+                                "harness_reported"
+                                if _first_number(agent_result, aliases) is not None
+                                else "root_final_metrics"
+                                if value is not None
+                                else "unavailable"
+                            )
+                            for key, aliases, value in (
+                                (
+                                    "input",
+                                    ("n_input_tokens", "input_tokens", "prompt_tokens"),
+                                    input_tokens,
+                                ),
+                                (
+                                    "cache",
+                                    ("n_cache_tokens", "cache_tokens", "cached_tokens"),
+                                    cache_tokens,
+                                ),
+                                (
+                                    "output",
+                                    ("n_output_tokens", "output_tokens", "completion_tokens"),
+                                    output_tokens,
+                                ),
+                            )
+                        }
+                    ),
                     "n_input_tokens": input_tokens,
                     "n_cache_tokens": cache_tokens,
                     "n_output_tokens": output_tokens,
@@ -547,8 +686,7 @@ def export_research_tables(
 
         result_count = len(result_paths)
         passed = result_count > 0 and (
-            counters["match"] == result_count
-            and counters["real_trace"] == result_count
+            counters["match"] == result_count and counters["real_trace"] == result_count
         )
         run_rows.append(
             {
@@ -562,9 +700,7 @@ def export_research_tables(
                 "reasoning_effort": entry.get("reasoning_effort"),
                 "judge_model_id": entry.get("judge_model_id"),
                 "judge_reasoning_effort": entry.get("judge_reasoning_effort"),
-                "judge_identity_status": (
-                    "unverified_requires_proxy_request_evidence"
-                ),
+                "judge_identity_status": ("unverified_requires_proxy_request_evidence"),
                 "repetition": entry.get("repetition"),
                 "phase": entry.get("phase") or "full",
                 "qualification_family": entry.get("qualification_family"),
@@ -577,11 +713,10 @@ def export_research_tables(
                 "identity_not_observed_count": counters["not_observed"],
                 "trace_missing_count": counters["trace_missing"],
                 "model_identity_audit_passed": passed,
-                "toolchain_manifest_path": (
-                    str(toolchain_path) if toolchain_path else ""
-                ),
+                "toolchain_manifest_path": (str(toolchain_path) if toolchain_path else ""),
                 "proxy_log_path": str(proxy_log_path) if proxy_log_path else "",
-                "task_cost_exact_count": counters["task_cost_exact"],
+                "task_cost_exact_count": 0,
+                "task_cost_reported_count": counters["task_cost_reported"],
                 "task_cost_unavailable_count": counters["task_cost_unavailable"],
             }
         )
@@ -590,7 +725,15 @@ def export_research_tables(
     _write_csv(output_dir / "turn_usage.csv", TURN_FIELDS, turn_rows)
     _write_csv(output_dir / "tool_calls.csv", TOOL_FIELDS, tool_rows)
     _write_csv(output_dir / "model_identity_audit.csv", RUN_AUDIT_FIELDS, run_rows)
+    base_fields = ("run_label", "task_name", "result_path", "trajectory_path")
+    _write_csv(output_dir / "trajectory_nodes.csv", base_fields + NODE_FIELDS, node_rows)
+    _write_csv(output_dir / "trajectory_links.csv", base_fields + LINK_FIELDS, link_rows)
+    _write_csv(
+        output_dir / "model_usage_coverage.csv", base_fields + COVERAGE_FIELDS, coverage_rows
+    )
     summary = {
+        "schema_version": 2,
+        "node_count": len(node_rows),
         "run_count": len(run_rows),
         "task_result_count": len(trace_rows),
         "turn_count": len(turn_rows),
@@ -602,18 +745,17 @@ def export_research_tables(
             row["model_identity_audit_passed"] is not True for row in run_rows
         ),
         "r0_run_count": sum(row["phase"] == "r0" for row in run_rows),
-        "scoring_run_count": sum(
-            row["leaderboard_eligible"] is not False for row in run_rows
+        "scoring_run_count": sum(row["leaderboard_eligible"] is not False for row in run_rows),
+        "exact_task_cost_count": 0,
+        "reported_task_cost_count": sum(
+            row["cost_provenance"] in {"reported_harness", "reported_trace"} for row in trace_rows
         ),
-        "exact_task_cost_count": sum(
-            row["cost_provenance"] in {"exact_harness", "exact_trace"}
-            for row in trace_rows
-        ),
-        "unavailable_task_cost_count": sum(
-            row["cost_usd"] is None for row in trace_rows
-        ),
+        "unavailable_task_cost_count": sum(row["cost_usd"] is None for row in trace_rows),
         "outputs": {
             "trace_inventory": "trace_inventory.csv",
+            "trajectory_nodes": "trajectory_nodes.csv",
+            "trajectory_links": "trajectory_links.csv",
+            "model_usage_coverage": "model_usage_coverage.csv",
             "turn_usage": "turn_usage.csv",
             "tool_calls": "tool_calls.csv",
             "model_identity_audit": "model_identity_audit.csv",
