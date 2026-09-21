@@ -10,7 +10,12 @@ from websockets.datastructures import Headers
 from websockets.exceptions import InvalidMessage, InvalidStatus
 from websockets.http11 import Response
 
-from clawbench.client import GatewayClient, GatewayConfig, _correlate_transcript, _parse_single_message
+from clawbench.client import (
+    GatewayClient,
+    GatewayConfig,
+    _correlate_transcript,
+    _parse_single_message,
+)
 from clawbench.schemas import EfficiencyResult, TokenUsage, Transcript
 
 
@@ -62,6 +67,9 @@ async def test_gateway_client_connects_and_creates_session_over_websocket(monkey
     assert [request["method"] for request in requests] == ["connect", "sessions.create"]
     assert requests[0]["params"]["minProtocol"] == 3
     assert requests[0]["params"]["maxProtocol"] == 4
+    # Machine clients must not claim the version-coupled browser Control UI.
+    assert requests[0]["params"]["client"]["id"] == "gateway-client"
+    assert requests[0]["params"]["client"]["mode"] == "backend"
     assert requests[1]["params"] == {"model": "test/model", "label": "dependency-smoke"}
 
 
@@ -151,7 +159,12 @@ def test_tool_results_are_correlated_back_to_tool_calls():
         {
             "role": "assistant",
             "content": [
-                {"type": "toolCall", "id": "call-1", "name": "exec", "arguments": {"command": "pytest -q"}},
+                {
+                    "type": "toolCall",
+                    "id": "call-1",
+                    "name": "exec",
+                    "arguments": {"command": "pytest -q"},
+                },
             ],
         }
     )
@@ -170,6 +183,57 @@ def test_tool_results_are_correlated_back_to_tool_calls():
     assert call.output == "ERROR failed test"
     assert call.success is False
     assert call.error == "ERROR failed test"
+
+
+@pytest.mark.parametrize(
+    ("metadata", "output", "expected"),
+    [
+        ({"isError": False}, "Other errors use an error JSON field.", True),
+        ({"isError": True}, "Request completed", False),
+        ({"isError": False, "details": {"exitCode": 1}}, "", False),
+        ({"isError": False, "details": {"exitCode": 0}}, "0 failed; no error", True),
+        ({"isError": True, "details": {"exitCode": 0}}, "Tool wrapper failed", False),
+        ({"details": {"exitCode": 2}}, "command ended", False),
+        ({"is_error": False}, "Invalid examples belong in this document", True),
+    ],
+)
+def test_native_tool_status_precedes_output_vocabulary(metadata, output, expected):
+    message = _parse_single_message(
+        {"role": "assistant", "content": [{"type": "toolCall", "id": "call-1", "name": "exec"}]}
+    )
+    result = _parse_single_message(
+        {"role": "toolResult", "toolCallId": "call-1", "content": output, **metadata}
+    )
+    assert message is not None and result is not None
+    transcript = _correlate_transcript(Transcript(messages=[message, result]))
+    call = transcript.tool_call_sequence[0]
+    assert result.tool_results[0].success is expected
+    assert call.success is expected
+    assert call.error == ("" if expected else output)
+
+
+def test_block_tool_result_preserves_explicit_failure():
+    message = _parse_single_message(
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "one", "name": "read"}]}
+    )
+    result = _parse_single_message(
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "one",
+                    "content": "no data",
+                    "is_error": True,
+                }
+            ],
+        }
+    )
+    assert message is not None and result is not None
+    assert (
+        _correlate_transcript(Transcript(messages=[message, result])).tool_call_sequence[0].success
+        is False
+    )
 
 
 def test_parser_accepts_codex_tool_search_output_shape():
@@ -459,6 +523,7 @@ async def test_send_and_wait_passes_gateway_timeout_and_waits_for_run():
     transcript = await client.send_and_wait(session_key, "hello", timeout=1.5)
 
     send_call = next(call for call in calls if call[0] == "sessions.send")
+    assert send_call[1] is not None
     assert send_call[1] == {
         "key": session_key,
         "message": "hello",
@@ -469,6 +534,7 @@ async def test_send_and_wait_passes_gateway_timeout_and_waits_for_run():
     assert wait_call[1] == {"runId": "run-1", "timeoutMs": 1500}
     assert wait_call[2]["timeout"] == 11.5
     assert [message.text for message in transcript.assistant_messages] == ["Done."]
+    assert transcript.stop_reason == "complete"
 
 
 @pytest.mark.asyncio
@@ -491,6 +557,55 @@ async def test_send_and_wait_aborts_run_when_no_terminal_state_arrives():
 
     client._rpc = fake_rpc  # type: ignore[method-assign]
 
-    await client.send_and_wait(session_key, "hello", timeout=0.01)
+    transcript = await client.send_and_wait(session_key, "hello", timeout=0.01)
 
     assert ("sessions.abort", {"key": session_key, "runId": "run-timeout"}, {"timeout": 1}) in calls
+    assert transcript.stop_reason == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_send_failure_keeps_messages_collected_before_history_error():
+    from clawbench.client import GatewayRunError
+
+    client = GatewayClient(GatewayConfig(request_timeout=1))
+
+    async def rpc(method, params=None, **kwargs):
+        if method == "sessions.send":
+            await client._event_queues["session.message:s"].put(
+                {
+                    "payload": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Partial work"}],
+                        }
+                    }
+                }
+            )
+            await client._event_queues["chat:s"].put({"payload": {"state": "final"}})
+        return {"ok": True, "payload": {}}
+
+    async def broken_history(session_key):
+        raise OSError("history unavailable")
+
+    client._rpc = rpc  # type: ignore[method-assign]
+    client.get_session_messages = broken_history  # type: ignore[method-assign]
+    with pytest.raises(GatewayRunError) as failure:
+        await client.send_and_wait("s", "hello", timeout=1)
+    assert failure.value.transcript.assistant_text == "Partial work"
+    assert client._event_queues == {}
+
+
+@pytest.mark.asyncio
+async def test_send_failure_releases_queues_and_preserves_partial_evidence():
+    from clawbench.client import GatewayRunError
+
+    client = GatewayClient(GatewayConfig())
+
+    async def fail_send(method, params=None, **kwargs):
+        raise RuntimeError("transport disconnected during send")
+
+    client._rpc = fail_send
+    with pytest.raises(GatewayRunError) as failure:
+        await client.send_and_wait("s", "hello", timeout=1)
+    assert failure.value.transcript.stop_reason == "error"
+    assert not client._event_queues

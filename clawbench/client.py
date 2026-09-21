@@ -204,6 +204,14 @@ class GatewayConfig:
     )
 
 
+class GatewayRunError(RuntimeError):
+    """An interrupted call with the execution evidence collected before failure."""
+
+    def __init__(self, message: str, transcript: Transcript):
+        super().__init__(message)
+        self.transcript = transcript
+
+
 class GatewayClient:
     """Persistent WebSocket client for the OpenClaw gateway."""
 
@@ -245,9 +253,7 @@ class GatewayClient:
                     ping_timeout=None,
                 )
                 self._listen_task = asyncio.create_task(self._listener())
-                challenge = await self._wait_event(
-                    "connect.challenge", timeout=attempt_timeout
-                )
+                challenge = await self._wait_event("connect.challenge", timeout=attempt_timeout)
                 challenge_payload = challenge.get("payload", {})
                 nonce = ""
                 if isinstance(challenge_payload, dict):
@@ -264,10 +270,10 @@ class GatewayClient:
                     "operator.pairing",
                 ]
                 client_info = {
-                    "id": "openclaw-control-ui",
+                    "id": "gateway-client",
                     "version": __version__,
                     "platform": "linux",
-                    "mode": "ui",
+                    "mode": "backend",
                 }
                 connect_params: dict[str, Any] = {
                     "minProtocol": MIN_PROTOCOL_VERSION,
@@ -373,7 +379,9 @@ class GatewayClient:
         state_dir = Path(os.environ.get("OPENCLAW_STATE_DIR") or os.path.expanduser("~/.openclaw"))
         store_path = state_dir / "agents" / agent_id / "sessions" / "sessions.json"
         if not store_path.exists():
-            logger.warning("session store not found at %s; cannot set auth profile override", store_path)
+            logger.warning(
+                "session store not found at %s; cannot set auth profile override", store_path
+            )
             return False
         try:
             store = json.loads(store_path.read_text(encoding="utf-8"))
@@ -382,12 +390,24 @@ class GatewayClient:
             return False
         if not isinstance(store, dict):
             return False
-        entry_key = session_key if session_key in store else next(
-            (key for key in store if isinstance(key, str) and key.lower() == session_key.lower()),
-            "",
+        entry_key = (
+            session_key
+            if session_key in store
+            else next(
+                (
+                    key
+                    for key in store
+                    if isinstance(key, str) and key.lower() == session_key.lower()
+                ),
+                "",
+            )
         )
         if not entry_key or not isinstance(store.get(entry_key), dict):
-            logger.warning("session %s not found in %s; cannot set auth profile override", session_key, store_path)
+            logger.warning(
+                "session %s not found in %s; cannot set auth profile override",
+                session_key,
+                store_path,
+            )
             return False
         entry = store[entry_key]
         if (
@@ -471,7 +491,9 @@ class GatewayClient:
         if run_id:
             params["runId"] = run_id
         try:
-            await self._rpc("sessions.abort", params, timeout=min(self.config.request_timeout, 10.0))
+            await self._rpc(
+                "sessions.abort", params, timeout=min(self.config.request_timeout, 10.0)
+            )
         except Exception as exc:
             logger.warning("Failed to abort session %s run %s: %s", session_key, run_id or "-", exc)
 
@@ -496,15 +518,28 @@ class GatewayClient:
         self._event_queues[msg_queue_key] = msg_queue
         timeout_ms = max(1, min(int(timeout * 1000), 2_147_483_647))
 
-        send_response = await self._rpc(
-            "sessions.send",
-            {
-                "key": session_key,
-                "message": message,
-                "idempotencyKey": idempotency_key,
-                "timeoutMs": timeout_ms,
-            },
-        )
+        try:
+            send_response = await self._rpc(
+                "sessions.send",
+                {
+                    "key": session_key,
+                    "message": message,
+                    "idempotencyKey": idempotency_key,
+                    "timeoutMs": timeout_ms,
+                },
+            )
+        except Exception as exc:
+            partial = _correlate_transcript(
+                Transcript(
+                    messages=await _drain_message_queue(
+                        msg_queue, quiet_seconds=0.01, max_wait_seconds=0.05
+                    )
+                )
+            )
+            partial.stop_reason = "error"
+            self._event_queues.pop(chat_queue_key, None)
+            self._event_queues.pop(msg_queue_key, None)
+            raise GatewayRunError(str(exc), partial) from exc
         send_payload = send_response.get("payload", {})
         run_id = idempotency_key
         if isinstance(send_payload, dict):
@@ -512,12 +547,11 @@ class GatewayClient:
             if isinstance(raw_run_id, str) and raw_run_id.strip():
                 run_id = raw_run_id.strip()
 
-        wait_task = asyncio.create_task(
-            self._wait_for_agent_run(run_id, timeout_ms=timeout_ms)
-        )
+        wait_task = asyncio.create_task(self._wait_for_agent_run(run_id, timeout_ms=timeout_ms))
 
         collected_messages: list[TranscriptMessage] = []
         done = False
+        stop_reason = "timeout"
         deadline = asyncio.get_running_loop().time() + timeout
         try:
             while not done:
@@ -540,6 +574,9 @@ class GatewayClient:
                             status,
                         )
                         done = True
+                        stop_reason = (
+                            "complete" if status in {"ok", "completed", "success"} else status
+                        )
                         break
                     if status == "timeout":
                         logger.warning(
@@ -553,6 +590,7 @@ class GatewayClient:
                     state = event.get("payload", {}).get("state", "")
                     if state in {"final", "aborted", "error"}:
                         done = True
+                        stop_reason = "complete" if state == "final" else state
                 except asyncio.TimeoutError:
                     pass
 
@@ -571,17 +609,22 @@ class GatewayClient:
             # history without emitting complete streaming events. Backfill from
             # sessions.get if stream capture appears incomplete.
             history_messages = await self.get_session_messages(session_key)
-            collected_assistant = sum(
-                1 for msg in collected_messages if msg.role == "assistant"
-            )
-            history_assistant = sum(
-                1 for msg in history_messages if msg.role == "assistant"
-            )
+            collected_assistant = sum(1 for msg in collected_messages if msg.role == "assistant")
+            history_assistant = sum(1 for msg in history_messages if msg.role == "assistant")
             if history_messages and (
                 len(history_messages) > len(collected_messages)
                 or history_assistant > collected_assistant
             ):
                 collected_messages = history_messages
+        except Exception as exc:
+            # Do not discard messages already emitted when history retrieval or
+            # another later operation fails. The harness persists this evidence.
+            collected_messages.extend(
+                await _drain_message_queue(msg_queue, quiet_seconds=0.01, max_wait_seconds=0.05)
+            )
+            partial = _correlate_transcript(Transcript(messages=collected_messages))
+            partial.stop_reason = "error"
+            raise GatewayRunError(str(exc), partial) from exc
         finally:
             if not wait_task.done():
                 wait_task.cancel()
@@ -592,7 +635,9 @@ class GatewayClient:
             self._event_queues.pop(chat_queue_key, None)
             self._event_queues.pop(msg_queue_key, None)
 
-        return _correlate_transcript(Transcript(messages=collected_messages))
+        transcript = _correlate_transcript(Transcript(messages=collected_messages))
+        transcript.stop_reason = stop_reason
+        return transcript
 
     async def _wait_for_agent_run(self, run_id: str, *, timeout_ms: int) -> dict[str, Any]:
         try:
@@ -638,7 +683,7 @@ class GatewayClient:
             raise RuntimeError("Gateway client is not connected")
 
         request_id = str(uuid.uuid4())
-        frame = {"type": "req", "id": request_id, "method": method}
+        frame: dict[str, Any] = {"type": "req", "id": request_id, "method": method}
         if params is not None:
             frame["params"] = params
 
@@ -650,9 +695,7 @@ class GatewayClient:
             response = await asyncio.wait_for(future, timeout=effective_timeout)
         except asyncio.TimeoutError:
             self._pending.pop(request_id, None)
-            raise TimeoutError(
-                f"RPC {method} timed out after {effective_timeout:.1f}s"
-            )
+            raise TimeoutError(f"RPC {method} timed out after {effective_timeout:.1f}s")
 
         if not response.get("ok", False):
             error = response.get("error", {})
@@ -737,9 +780,7 @@ def _build_connect_device(
 
     node_executable = _resolve_node_executable()
     if not node_executable:
-        logger.warning(
-            "Failed to build device identity payload: no Node executable found"
-        )
+        logger.warning("Failed to build device identity payload: no Node executable found")
         return None
 
     try:
@@ -910,7 +951,11 @@ def _parse_single_message(message_data: dict[str, Any]) -> TranscriptMessage | N
                 )
                 if tool_result_for:
                     tool_results.append(
-                        ToolResult(id=str(tool_result_for), content=tool_result_content)
+                        ToolResult(
+                            id=str(tool_result_for),
+                            content=tool_result_content,
+                            success=_tool_result_success(block),
+                        )
                     )
                 if tool_result_content:
                     text_parts.append(tool_result_content)
@@ -929,7 +974,11 @@ def _parse_single_message(message_data: dict[str, Any]) -> TranscriptMessage | N
             tool_result_content = "\n".join(part for part in text_parts if part)
         if tool_result_for and not tool_results:
             tool_results.append(
-                ToolResult(id=str(tool_result_for), content=tool_result_content)
+                ToolResult(
+                    id=str(tool_result_for),
+                    content=tool_result_content,
+                    success=_tool_result_success(message_data),
+                )
             )
 
     # Some providers surface assistant failures in a dedicated error field
@@ -1053,6 +1102,23 @@ def _parse_usage_payload(payload: Any) -> TokenUsage:
     )
 
 
+def _tool_result_success(payload: dict[str, Any]) -> bool | None:
+    """Native tool failure and process exit status precede text heuristics.
+
+    OpenClaw can return isError=False for a successfully launched process that
+    exits nonzero. A successful file read can contain arbitrary error vocabulary.
+    """
+    flags = [payload.get("isError"), payload.get("is_error")]
+    if any(flag is True for flag in flags):
+        return False
+    details = payload.get("details")
+    if isinstance(details, dict) and type(details.get("exitCode")) is int:
+        return details["exitCode"] == 0
+    if any(flag is False for flag in flags):
+        return True
+    return None
+
+
 def _looks_like_error(text: str) -> bool:
     normalized = text.lower()
     error_patterns = [
@@ -1076,8 +1142,7 @@ def _correlate_transcript(transcript: Transcript) -> Transcript:
                 by_id[tool_call.id] = tool_call
         result_pairs = list(message.tool_results)
         if message.tool_result_for and not any(
-            result.id == message.tool_result_for
-            and result.content == message.tool_result_content
+            result.id == message.tool_result_for and result.content == message.tool_result_content
             for result in result_pairs
         ):
             result_pairs.append(
@@ -1095,7 +1160,10 @@ def _correlate_transcript(transcript: Transcript) -> Transcript:
                     tool_call.output = f"{tool_call.output}\n{result.content}".strip()
                 else:
                     tool_call.output = result.content
-            if tool_call.success is None:
+            if result.success is not None:
+                tool_call.success = result.success
+                tool_call.error = "" if result.success else tool_call.output
+            elif tool_call.success is None:
                 tool_call.success = not _looks_like_error(tool_call.output)
             if tool_call.success is False and not tool_call.error:
                 tool_call.error = tool_call.output

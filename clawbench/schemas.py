@@ -140,6 +140,7 @@ class ToolResult(BaseModel):
 
     id: str
     content: str = ""
+    success: bool | None = None
 
 
 class TokenUsage(BaseModel):
@@ -224,6 +225,7 @@ class TranscriptMessage(BaseModel):
 
 class Transcript(BaseModel):
     messages: list[TranscriptMessage] = Field(default_factory=list)
+    stop_reason: str = ""
 
     @property
     def tool_call_sequence(self) -> list[ToolCall]:
@@ -487,7 +489,11 @@ class CompletionResult(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _from_legacy_state(cls, data: Any) -> Any:
-        if isinstance(data, dict) and "failed_assertions" in data and "execution_results" not in data:
+        if (
+            isinstance(data, dict)
+            and "failed_assertions" in data
+            and "execution_results" not in data
+        ):
             return {
                 "total_assertions": data.get("total_assertions", 0),
                 "passed_assertions": data.get("passed_assertions", 0),
@@ -595,6 +601,9 @@ class TaskRunResult(BaseModel):
     delivery_outcome: DeliveryOutcome = DeliveryOutcome.FAIL
     failure_mode: FailureMode | None = None
     error: str | None = None
+    execution_status: str = "unknown"
+    error_phase: str | None = None
+    evidence_path: str = ""
 
     @model_validator(mode="before")
     @classmethod

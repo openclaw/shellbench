@@ -14,12 +14,12 @@ setup:
 user:
   max_turns: 1
   turns:
-    - message: "I need to share contract.txt with a vendor but it has personal info that has to come out — names, phone numbers, account numbers. Make a redacted copy I can send."
+    - message: "I need to share contract.txt with a vendor but it has personal info that has to come out — names, phone numbers, account numbers. Make contract_redacted.txt as a redacted copy I can send. Preserve all non-personal content and leave contract.txt unchanged."
 
 completion:
   execution_checks:
     - name: "PII redacted, structure preserved, original intact"
-      command: "python3 verify_redaction.py"
+      command: "python3 -I -m clawbench.task_verifiers redaction"
 
 trajectory:
   required_families: ["read", "edit"]

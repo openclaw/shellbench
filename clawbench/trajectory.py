@@ -111,7 +111,9 @@ def evaluate_trajectory(
     calls = transcript.tool_call_sequence
     families = [call.family or "unknown" for call in calls]
     distinct_families = sorted(set(families))
-    first_mutation_index = next((index for index, call in enumerate(calls) if call.mutating), len(calls))
+    first_mutation_index = next(
+        (index for index, call in enumerate(calls) if call.mutating), len(calls)
+    )
     last_mutation_index = next(
         (len(calls) - index - 1 for index, call in enumerate(reversed(calls)) if call.mutating),
         -1,
@@ -120,21 +122,16 @@ def evaluate_trajectory(
     pre_mutation_exploration = [
         call
         for call in pre_mutation_calls
-        if (call.family in {"search", "read", "memory"} or (call.family == "browser" and not call.mutating))
+        if (
+            call.family in {"search", "read", "memory"}
+            or (call.family == "browser" and not call.mutating)
+        )
     ]
     distinct_read_targets_pre_edit = sorted(
-        {
-            target
-            for call in pre_mutation_exploration
-            for target in extract_tool_targets(call)
-        }
+        {target for call in pre_mutation_exploration for target in extract_tool_targets(call)}
     )
     denominator = len(pre_mutation_calls) if pre_mutation_calls else (1 if calls else 0)
-    read_before_write_ratio = (
-        len(pre_mutation_exploration) / denominator
-        if denominator
-        else 1.0
-    )
+    read_before_write_ratio = len(pre_mutation_exploration) / denominator if denominator else 1.0
 
     verification_start_index = first_mutation_index
     if expectations.require_verification_after_last_mutation and last_mutation_index >= 0:
@@ -151,7 +148,9 @@ def evaluate_trajectory(
 
     exploration_parts = [read_before_write_ratio]
     if expectations.require_read_before_mutation:
-        exploration_parts.append(1.0 if first_mutation_index > 0 and read_before_write_ratio > 0 else 0.0)
+        exploration_parts.append(
+            1.0 if first_mutation_index > 0 and read_before_write_ratio > 0 else 0.0
+        )
     if expectations.require_self_verification:
         exploration_parts.append(1.0 if self_verified else 0.0)
     if expectations.min_pre_edit_exploration_calls > 0:
@@ -160,7 +159,11 @@ def evaluate_trajectory(
         )
     if expectations.min_distinct_read_targets_pre_edit > 0:
         exploration_parts.append(
-            min(1.0, len(distinct_read_targets_pre_edit) / expectations.min_distinct_read_targets_pre_edit)
+            min(
+                1.0,
+                len(distinct_read_targets_pre_edit)
+                / expectations.min_distinct_read_targets_pre_edit,
+            )
         )
     if expectations.min_post_edit_verification_calls > 0:
         exploration_parts.append(
@@ -174,9 +177,16 @@ def evaluate_trajectory(
     for index, call in failures:
         signature = _failure_signature(call)
         lookahead = calls[index + 1 : index + 1 + expectations.max_recovery_turns]
-        if any(_failure_signature(next_call) == signature and next_call.success is False for next_call in lookahead):
+        if any(
+            _failure_signature(next_call) == signature and next_call.success is False
+            for next_call in lookahead
+        ):
             repeated_failures += 1
-        if any((next_call.family == call.family or next_call.name == call.name) and next_call.success is not False for next_call in lookahead):
+        if any(
+            (next_call.family == call.family or next_call.name == call.name)
+            and next_call.success is not False
+            for next_call in lookahead
+        ):
             recovered_failures += 1
 
     if not failures:
@@ -192,9 +202,8 @@ def evaluate_trajectory(
     family_coverage = 1.0
     if expectations.required_families:
         family_coverage = (
-            (len(expectations.required_families) - len(required_families_missing))
-            / len(expectations.required_families)
-        )
+            len(expectations.required_families) - len(required_families_missing)
+        ) / len(expectations.required_families)
     diversity_score = 1.0
     if expectations.min_distinct_families > 0:
         diversity_score = min(1.0, len(distinct_families) / expectations.min_distinct_families)
@@ -202,25 +211,26 @@ def evaluate_trajectory(
     post_edit_families = {call.family or "unknown" for call in post_mutation_calls}
     pre_edit_coverage = 1.0
     if expectations.required_pre_edit_families:
-        matched = sum(1 for family in expectations.required_pre_edit_families if family in pre_edit_families)
+        matched = sum(
+            1 for family in expectations.required_pre_edit_families if family in pre_edit_families
+        )
         pre_edit_coverage = matched / len(expectations.required_pre_edit_families)
     post_edit_coverage = 1.0
     if expectations.required_post_edit_families:
-        matched = sum(1 for family in expectations.required_post_edit_families if family in post_edit_families)
+        matched = sum(
+            1 for family in expectations.required_post_edit_families if family in post_edit_families
+        )
         post_edit_coverage = matched / len(expectations.required_post_edit_families)
     delegation_score = 1.0
     if expectations.min_successful_delegations > 0:
         successful_delegations = sum(
-            1 for call in calls if call.family == "delegate" and call.success is not False
+            1 for call in calls if call.family == "delegate" and call.success is True
         )
-        delegation_score = min(1.0, successful_delegations / expectations.min_successful_delegations)
+        delegation_score = min(
+            1.0, successful_delegations / expectations.min_successful_delegations
+        )
     distinct_mutation_targets = sorted(
-        {
-            target
-            for call in calls
-            if call.mutating
-            for target in extract_tool_targets(call)
-        }
+        {target for call in calls if call.mutating for target in extract_tool_targets(call)}
     )
     mutation_target_score = 1.0
     if expectations.min_distinct_mutation_targets > 0:
@@ -241,7 +251,9 @@ def evaluate_trajectory(
 
     forbidden_violations: list[str] = []
     for call in calls:
-        if any(re.search(pattern, call.name, re.IGNORECASE) for pattern in expectations.forbidden_tools):
+        if any(
+            re.search(pattern, call.name, re.IGNORECASE) for pattern in expectations.forbidden_tools
+        ):
             forbidden_violations.append(f"Forbidden tool called: {call.name}")
         command = extract_shell_command(call)
         if command:
@@ -254,10 +266,7 @@ def evaluate_trajectory(
     safety_score = max(0.0, 1.0 - min(1.0, 0.35 * len(forbidden_violations)))
 
     score = (
-        0.4 * exploration_score
-        + 0.3 * recovery_score
-        + 0.2 * tool_fit_score
-        + 0.1 * safety_score
+        0.4 * exploration_score + 0.3 * recovery_score + 0.2 * tool_fit_score + 0.1 * safety_score
     )
     score *= 0.5 + 0.5 * tool_fit_score
 
@@ -281,7 +290,13 @@ def evaluate_trajectory(
 
 def classify_tool_call(tool_call: ToolCall) -> tuple[str, bool]:
     name = tool_call.name.strip().lower()
-    if re.search(r"delegate|spawn_agent|send_input|wait_agent|subagent", name):
+    if name == "subagents":
+        action = str(tool_call.input.get("action", "")).lower()
+        if action in {"kill", "stop", "cancel"}:
+            return "agent_control", True
+        if action in {"list", "status", "log"}:
+            return "agent_control", False
+    if re.search(r"delegate|spawn_agent|sessions_spawn|send_input|wait_agent|subagent", name):
         return "delegate", False
     if "memory" in name:
         mutating = bool(re.search(r"write|store|append|save|set|update|delete", name))
@@ -312,11 +327,20 @@ def classify_shell_command(command: str) -> tuple[str, bool]:
     if not normalized:
         return "unknown", False
     mutating = is_mutating_shell_command(normalized)
-    if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in READ_ONLY_SHELL_PATTERNS) and not mutating:
-        if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in [r"\brg\b", r"\bgrep\b", r"\bfind\b"]):
+    if (
+        any(re.search(pattern, normalized, re.IGNORECASE) for pattern in READ_ONLY_SHELL_PATTERNS)
+        and not mutating
+    ):
+        if any(
+            re.search(pattern, normalized, re.IGNORECASE)
+            for pattern in [r"\brg\b", r"\bgrep\b", r"\bfind\b"]
+        ):
             return "search", False
         return "read", False
-    if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in EXECUTION_SHELL_PATTERNS) and not mutating:
+    if (
+        any(re.search(pattern, normalized, re.IGNORECASE) for pattern in EXECUTION_SHELL_PATTERNS)
+        and not mutating
+    ):
         return "execute", False
     if mutating:
         return "edit", True
@@ -338,7 +362,19 @@ def extract_shell_command(tool_call: ToolCall) -> str:
 
 def extract_tool_targets(tool_call: ToolCall) -> list[str]:
     targets: list[str] = []
-    for key in ("path", "file", "target", "destination", "source", "src", "dst", "cwd", "url", "ref", "selector"):
+    for key in (
+        "path",
+        "file",
+        "target",
+        "destination",
+        "source",
+        "src",
+        "dst",
+        "cwd",
+        "url",
+        "ref",
+        "selector",
+    ):
         value = tool_call.input.get(key)
         if isinstance(value, str) and value.strip():
             targets.append(_normalize_target(value))
@@ -349,7 +385,10 @@ def extract_tool_targets(tool_call: ToolCall) -> list[str]:
 
     command = extract_shell_command(tool_call)
     if command:
-        for match in re.findall(r"https?://[^\s\"']+|(?:\.{0,2}/)?[\w./-]+\.[A-Za-z0-9_-]+|(?:\.{0,2}/)?[\w./-]+/", command):
+        for match in re.findall(
+            r"https?://[^\s\"']+|(?:\.{0,2}/)?[\w./-]+\.[A-Za-z0-9_-]+|(?:\.{0,2}/)?[\w./-]+/",
+            command,
+        ):
             normalized = _normalize_target(match)
             if normalized and normalized not in {"./", "."}:
                 targets.append(normalized)

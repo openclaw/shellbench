@@ -11,7 +11,7 @@ import os
 import shutil
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,8 @@ from rich.table import Table
 
 from clawbench import __version__
 from clawbench.ablation import build_ablation_profile
-from clawbench.client import GatewayClient, GatewayConfig
+from clawbench.client import GatewayClient, GatewayConfig, GatewayRunError
+from clawbench.evidence import persist_run_evidence
 from clawbench.releases import compute_task_snapshot_fingerprint, load_active_release
 from clawbench.schemas import (
     BenchmarkResult,
@@ -34,7 +35,11 @@ from clawbench.schemas import (
 )
 from clawbench.scorer import classify_error_failure_mode, score_task_run
 from clawbench.session_labels import unique_session_label
-from clawbench.services import build_runtime_values, start_background_services, stop_background_services
+from clawbench.services import (
+    build_runtime_values,
+    start_background_services,
+    stop_background_services,
+)
 from clawbench.simulated_user import UserSimulator
 from clawbench.stats import bootstrap_ci, summarize_task_runs
 from clawbench.tasks import get_assets_dir, load_all_tasks
@@ -44,7 +49,7 @@ console = Console()
 
 KNOWN_ADAPTERS = ("openclaw", "hermes", "codex", "claude-code")
 EXECUTABLE_ADAPTERS = {"openclaw"}
-RUN_CACHE_SCHEMA_VERSION = 2
+RUN_CACHE_SCHEMA_VERSION = 4
 
 
 class _NullCtx:
@@ -153,12 +158,18 @@ class BenchmarkHarness:
             random.shuffle(tasks)
 
         if not self.quiet:
-            console.print(f"\n[bold]ClawBench v{__version__}[/bold] — {len(tasks)} tasks x {self.runs_per_task} runs")
+            console.print(
+                f"\n[bold]ClawBench v{__version__}[/bold] — {len(tasks)} tasks x {self.runs_per_task} runs"
+            )
             console.print(f"Model: [cyan]{self.model}[/cyan]")
             console.print(f"Adapter: [cyan]{self.adapter}[/cyan]")
             if self.judge_model:
                 console.print(f"Advisory judge: [magenta]{self.judge_model}[/magenta]")
-            mode = "serial" if self.concurrency == 1 else f"parallel(concurrency={self.concurrency}, browser={self.browser_concurrency})"
+            mode = (
+                "serial"
+                if self.concurrency == 1
+                else f"parallel(concurrency={self.concurrency}, browser={self.browser_concurrency})"
+            )
             console.print(f"Execution: [bright_blue]{mode}[/]")
             console.print(
                 "Axes: [green]Completion[/] + [blue]Trajectory[/] + [yellow]Behavior[/] + [magenta]Reliability[/]\n"
@@ -238,10 +249,7 @@ class BenchmarkHarness:
         await asyncio.gather(*(run_one(task, idx) for task, idx in work_items))
 
         # Convert from list-with-Nones to plain list, preserving run order
-        return {
-            task.id: [r for r in results_by_task[task.id] if r is not None]
-            for task in tasks
-        }
+        return {task.id: [r for r in results_by_task[task.id] if r is not None] for task in tasks}
 
     def _print_run_result(
         self,
@@ -292,11 +300,14 @@ class BenchmarkHarness:
             cache_path = self._run_cache_path(Path(cache_dir_env), task, run_index)
             if cache_path.exists():
                 try:
-                    cached = TaskRunResult.model_validate_json(cache_path.read_text(encoding="utf-8"))
+                    cached = TaskRunResult.model_validate_json(
+                        cache_path.read_text(encoding="utf-8")
+                    )
                     cached.run_index = run_index
                     logger.info(
                         "TIMING %s/run%s total=cached score=%.2f C=%.2f T=%.2f B=%.2f J=%.2f  (resumed from %s)",
-                        task.id, run_index,
+                        task.id,
+                        run_index,
                         cached.run_score,
                         cached.completion_result.score,
                         cached.trajectory_result.score,
@@ -306,12 +317,18 @@ class BenchmarkHarness:
                     )
                     return cached
                 except Exception as exc:
-                    logger.warning("Cache load failed for %s/run%s: %s (will re-run)", task.id, run_index, exc)
+                    logger.warning(
+                        "Cache load failed for %s/run%s: %s (will re-run)", task.id, run_index, exc
+                    )
 
         workspace = self._create_run_workspace(task, run_index)
         services = []
         session_keys: list[str] = []
         agent_id: str | None = None
+        transcript = Transcript()
+        result: TaskRunResult | None = None
+        error_phase = "setup"
+        evidence_saved = False
 
         # Per-phase timings so we can see where slow runs are spending their wall time.
         timings: dict[str, float] = {}
@@ -330,7 +347,11 @@ class BenchmarkHarness:
             runtime_values = build_runtime_values(
                 workspace=workspace,
                 repo_root=self.repo_root,
-                extra={"task_id": task.id, "model": self.model, "prompt_variant": self.prompt_variant},
+                extra={
+                    "task_id": task.id,
+                    "model": self.model,
+                    "prompt_variant": self.prompt_variant,
+                },
             )
             services, runtime_values = await start_background_services(
                 task.setup.background_services,
@@ -340,7 +361,6 @@ class BenchmarkHarness:
             )
             t_phase = _tick("bg_services_start", t_phase)
 
-            transcript = Transcript()
             start_ms = _now_ms()
 
             async with GatewayClient(self.gateway_config) as client:
@@ -393,6 +413,7 @@ class BenchmarkHarness:
                         if user_message is None:
                             break
                         t_turn_start = time.monotonic()
+                        error_phase = "execution"
                         phase_transcript = await client.send_and_wait(
                             session_key,
                             user_message,
@@ -402,12 +423,15 @@ class BenchmarkHarness:
                             time.monotonic() - t_turn_start, 2
                         )
                         transcript.messages.extend(phase_transcript.messages)
+                        if transcript.stop_reason in {"", "complete"}:
+                            transcript.stop_reason = phase_transcript.stop_reason
                         turn_index += 1
                     t_phase = _tick(f"phase{phase_index}_total", t_phase)
 
                 duration_ms = _now_ms() - start_ms
                 last_session_key = session_keys[-1] if session_keys else ""
                 t_score_start = time.monotonic()
+                error_phase = "grading"
                 result = await score_task_run(
                     task=task,
                     transcript=transcript,
@@ -423,18 +447,11 @@ class BenchmarkHarness:
                 timings["score"] = round(time.monotonic() - t_score_start, 2)
                 timings["total"] = round(time.monotonic() - t_run_start, 2)
                 result.run_index = run_index
-
-                # Write per-run cache so a future resume of this job can skip this run.
-                if cache_path is not None:
-                    try:
-                        cache_path.parent.mkdir(parents=True, exist_ok=True)
-                        tmp_path = cache_path.with_suffix(".json.tmp")
-                        tmp_path.write_text(
-                            result.model_dump_json(indent=2), encoding="utf-8"
-                        )
-                        tmp_path.replace(cache_path)
-                    except Exception as exc:
-                        logger.warning("Cache write failed for %s/run%s: %s", task.id, run_index, exc)
+                result.execution_status = (
+                    transcript.stop_reason or "complete"
+                    if transcript.assistant_messages
+                    else "no_assistant_response"
+                )
 
                 logger.info(
                     "TIMING %s/run%s total=%.1fs score=%.2f C=%.2f T=%.2f B=%.2f J=%.2f  %s",
@@ -445,13 +462,18 @@ class BenchmarkHarness:
                     result.completion_result.score,
                     result.trajectory_result.score,
                     result.behavior_result.score,
-                    result.judge_result.score if (result.judge_result.enabled and not result.judge_result.error) else 0.0,
+                    result.judge_result.score
+                    if (result.judge_result.enabled and not result.judge_result.error)
+                    else 0.0,
                     " ".join(f"{k}={v}s" for k, v in timings.items() if k != "total"),
                 )
                 return result
         except Exception as exc:
             logger.exception("Run %s/%s failed", task.id, run_index)
-            return TaskRunResult(
+            if isinstance(exc, GatewayRunError):
+                transcript.messages.extend(exc.transcript.messages)
+                transcript.stop_reason = exc.transcript.stop_reason
+            result = TaskRunResult(
                 task_id=task.id,
                 tier=task.tier.value,
                 family=task.family.value,
@@ -476,14 +498,39 @@ class BenchmarkHarness:
                 official=task.official,
                 run_index=run_index,
                 run_score=0.0,
-                transcript=Transcript(),
-                duration_ms=0,
+                transcript=transcript,
+                duration_ms=int((time.monotonic() - t_run_start) * 1000),
+                token_usage=transcript.total_usage,
                 delivery_outcome=DeliveryOutcome.FAIL,
                 failure_mode=classify_error_failure_mode(task, str(exc)),
                 error=str(exc),
+                execution_status=f"{error_phase}_error",
+                error_phase=error_phase,
             )
+            return result
         finally:
             await stop_background_services(services)
+            if result is not None:
+                try:
+                    persist_run_evidence(result, workspace)
+                    evidence_saved = True
+                except Exception as exc:
+                    logger.warning("Evidence retention failed; preserving %s: %s", workspace, exc)
+            # Cache only completed executions after evidence_path is populated.
+            if (
+                evidence_saved
+                and result is not None
+                and not result.error
+                and result.execution_status == "complete"
+                and cache_path is not None
+            ):
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_path = cache_path.with_suffix(".json.tmp")
+                    tmp_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+                    tmp_path.replace(cache_path)
+                except Exception as exc:
+                    logger.warning("Cache write failed for %s/run%s: %s", task.id, run_index, exc)
             if session_keys or agent_id:
                 try:
                     async with GatewayClient(self.gateway_config) as cleanup_client:
@@ -493,7 +540,7 @@ class BenchmarkHarness:
                             await cleanup_client.delete_agent(agent_id, delete_files=False)
                 except Exception as exc:
                     logger.warning("Session cleanup failed: %s", exc)
-            if os.environ.get("CLAWBENCH_KEEP_WORKSPACES") != "1":
+            if evidence_saved and os.environ.get("CLAWBENCH_KEEP_WORKSPACES") != "1":
                 shutil.rmtree(workspace, ignore_errors=True)
 
     async def _create_run_agent(
@@ -580,7 +627,9 @@ class BenchmarkHarness:
             for tool in group.get("tools", [])
         }
         if "browser" not in tool_ids:
-            raise RuntimeError("Browser tasks require the browser tool, but it is not available in this gateway.")
+            raise RuntimeError(
+                "Browser tasks require the browser tool, but it is not available in this gateway."
+            )
 
     def _aggregate(
         self,
@@ -608,12 +657,18 @@ class BenchmarkHarness:
             total_tokens = [result.efficiency_result.total_tokens for result in runs]
             cost_values = [result.efficiency_result.estimated_cost_usd for result in runs]
             pass_flags = [self._is_passing_run(task, result) for result in runs]
-            passing_runs = [result for result, passed in zip(runs, pass_flags, strict=False) if passed]
+            passing_runs = [
+                result for result, passed in zip(runs, pass_flags, strict=False) if passed
+            ]
             failure_mode_counts = _count_values(
                 result.failure_mode.value for result in runs if result.failure_mode is not None
             )
-            delivery_outcome_counts = _count_values(result.delivery_outcome.value for result in runs)
-            judge_error_count = sum(1 for result in runs if result.judge_result.enabled and result.judge_result.error)
+            delivery_outcome_counts = _count_values(
+                result.delivery_outcome.value for result in runs
+            )
+            judge_error_count = sum(
+                1 for result in runs if result.judge_result.enabled and result.judge_result.error
+            )
 
             summary = summarize_task_runs(
                 run_scores,
@@ -651,7 +706,8 @@ class BenchmarkHarness:
                     mean_judge_score=_mean(judge_scores),
                     mean_judge_confidence=_mean(judge_confidences),
                     judge_pass_rate=(
-                        sum(1 for result in judged_runs if result.judge_result.passed) / len(judged_runs)
+                        sum(1 for result in judged_runs if result.judge_result.passed)
+                        / len(judged_runs)
                         if judged_runs
                         else 0.0
                     ),
@@ -677,12 +733,14 @@ class BenchmarkHarness:
                     mean_total_tokens=_mean(total_tokens),
                     mean_cost_usd=_mean(cost_values),
                     tokens_per_pass=(
-                        sum(run.efficiency_result.total_tokens for run in passing_runs) / len(passing_runs)
+                        sum(run.efficiency_result.total_tokens for run in passing_runs)
+                        / len(passing_runs)
                         if passing_runs
                         else 0.0
                     ),
                     cost_per_pass=(
-                        sum(run.efficiency_result.estimated_cost_usd for run in passing_runs) / len(passing_runs)
+                        sum(run.efficiency_result.estimated_cost_usd for run in passing_runs)
+                        / len(passing_runs)
                         if passing_runs
                         else 0.0
                     ),
@@ -714,7 +772,9 @@ class BenchmarkHarness:
                     mean_completion=_mean([stat.mean_completion_score for stat in current]),
                     mean_trajectory=_mean([stat.mean_trajectory_score for stat in current]),
                     mean_behavior=_mean([stat.mean_behavior_score for stat in current]),
-                    mean_judge=_mean([stat.mean_judge_score for stat in current if stat.judged_runs > 0]),
+                    mean_judge=_mean(
+                        [stat.mean_judge_score for stat in current if stat.judged_runs > 0]
+                    ),
                     mean_reliability=_mean([stat.reliability_score for stat in current]),
                     ci_lower=ci.lower,
                     ci_upper=ci.upper,
@@ -740,7 +800,9 @@ class BenchmarkHarness:
                     mean_completion=_mean([stat.mean_completion_score for stat in current]),
                     mean_trajectory=_mean([stat.mean_trajectory_score for stat in current]),
                     mean_behavior=_mean([stat.mean_behavior_score for stat in current]),
-                    mean_judge=_mean([stat.mean_judge_score for stat in current if stat.judged_runs > 0]),
+                    mean_judge=_mean(
+                        [stat.mean_judge_score for stat in current if stat.judged_runs > 0]
+                    ),
                     mean_reliability=_mean([stat.reliability_score for stat in current]),
                     pass_hat_k_rate=_mean([1.0 if stat.pass_hat_k else 0.0 for stat in current]),
                     total_weight=total_weight,
@@ -802,11 +864,15 @@ class BenchmarkHarness:
             overall_trajectory=_mean([stat.mean_trajectory_score for stat in task_stats]),
             overall_behavior=_mean([stat.mean_behavior_score for stat in task_stats]),
             judge_model=self.judge_model,
-            overall_judge_score=_mean([stat.mean_judge_score for stat in task_stats if stat.judged_runs > 0]),
+            overall_judge_score=_mean(
+                [stat.mean_judge_score for stat in task_stats if stat.judged_runs > 0]
+            ),
             overall_judge_confidence=_mean(
                 [stat.mean_judge_confidence for stat in task_stats if stat.judged_runs > 0]
             ),
-            overall_judge_pass_rate=_mean([stat.judge_pass_rate for stat in task_stats if stat.judged_runs > 0]),
+            overall_judge_pass_rate=_mean(
+                [stat.judge_pass_rate for stat in task_stats if stat.judged_runs > 0]
+            ),
             judge_task_coverage=(
                 sum(1 for stat in task_stats if stat.judged_runs > 0) / len(task_stats)
                 if task_stats
@@ -829,7 +895,9 @@ class BenchmarkHarness:
             overall_tokens_per_pass=_mean([stat.tokens_per_pass for stat in task_stats]),
             overall_cost_per_pass=_mean([stat.cost_per_pass for stat in task_stats]),
             overall_worst_of_n=_mean([stat.worst_of_n for stat in task_stats]),
-            public_dev_score=_mean([stat.mean_task_score for stat in task_stats if stat.pool == "public_dev"]),
+            public_dev_score=_mean(
+                [stat.mean_task_score for stat in task_stats if stat.pool == "public_dev"]
+            ),
             official_hidden_score=_mean(
                 [stat.mean_task_score for stat in task_stats if stat.pool == "official_hidden"]
             ),
@@ -842,7 +910,9 @@ class BenchmarkHarness:
             consensus_subset_score=_mean(
                 [stat.mean_task_score for stat in task_stats if "consensus" in stat.subsets]
             ),
-            hard_subset_score=_mean([stat.mean_task_score for stat in task_stats if "hard" in stat.subsets]),
+            hard_subset_score=_mean(
+                [stat.mean_task_score for stat in task_stats if "hard" in stat.subsets]
+            ),
             overall_delivery_outcome_counts=overall_delivery_outcome_counts,
             overall_failure_mode_counts=overall_failure_mode_counts,
             overall_ci_lower=overall_ci.lower,
@@ -924,8 +994,18 @@ class BenchmarkHarness:
         table.add_column("Failure", justify="left")
 
         for stat in result.task_results:
-            color = "green" if stat.mean_task_score >= 0.7 else "yellow" if stat.mean_task_score >= 0.4 else "red"
-            top_failure = max(stat.failure_mode_counts.items(), key=lambda item: item[1])[0] if stat.failure_mode_counts else "-"
+            color = (
+                "green"
+                if stat.mean_task_score >= 0.7
+                else "yellow"
+                if stat.mean_task_score >= 0.4
+                else "red"
+            )
+            top_failure = (
+                max(stat.failure_mode_counts.items(), key=lambda item: item[1])[0]
+                if stat.failure_mode_counts
+                else "-"
+            )
             table.add_row(
                 stat.task_id,
                 stat.tier,
@@ -947,16 +1027,18 @@ class BenchmarkHarness:
 
     def _benchmark_checksum(self, tasks: list[TaskDefinition]) -> str:
         payload = "|".join(
-            sorted(f"{task.id}:{task.pool.value}:{task.variant_id}:{task.release_id}" for task in tasks)
+            sorted(
+                f"{task.id}:{task.pool.value}:{task.variant_id}:{task.release_id}" for task in tasks
+            )
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _mean(values: list[float]) -> float:
+def _mean(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-def _percentile(values: list[float], percentile: float) -> float:
+def _percentile(values: Sequence[float], percentile: float) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)

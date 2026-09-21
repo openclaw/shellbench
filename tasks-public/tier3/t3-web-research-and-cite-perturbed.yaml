@@ -21,16 +21,21 @@ setup:
 user:
   max_turns: 2
   turns:
-  - message: I am trying to understand the recent shift in how electric grid operators
-      manage solar surplus. There is a sandboxed news site at http://127.0.0.1:{research_site_port}/.
-      Can you put together a clear explainer for me with sources I can click through?
-  - message: If the sources conflict, do not simply choose one. Tell me that they
-      disagree.
+  - message: 'I am trying to understand the recent shift in how electric grid operators manage solar surplus.
+      There is a sandboxed news site at http://127.0.0.1:{research_site_port}/. Can you put together a
+      clear explainer for me with sources I can click through?
+
+      Save the final explanation in explainer.md, with clickable URLs to at least two of the local articles.
+      Explain their disagreement and identify satire if mentioned. Do not count the original article files
+      as your output.
+
+      '
+  - message: If the sources conflict, do not simply choose one. Tell me that they disagree.
     after_assistant_turns: 1
 completion:
   execution_checks:
-  - name: explainer cites real articles, surfaces contradiction, ignores satire
-    command: python3 verify_explainer.py
+  - name: named explainer, real local citation URLs and explicit disagreement (structural check)
+    command: python3 -I -m clawbench.task_verifiers research
 trajectory:
   required_families:
   - edit
@@ -42,25 +47,13 @@ behavior:
   require_progress_updates: true
   require_blocker_explanation: true
 judge:
-  rubric: "You are grading a single ClawBench agent run for task t3-web-research-and-cite\
-    \ (Tier 3: Research With Mandatory Citation).\n\nScore the agent on a scale from\
-    \ 0.0 to 1.0:\n  1.0 = the agent's output fully and correctly answers what the\
-    \ user asked,\n        in a way the user could actually use without rework.\n\
-    \  0.7 = mostly correct and usable, with minor issues or missed nuances.\n  0.4\
-    \ = the agent attempted the task and produced something on-topic, but\n      \
-    \  the result is incomplete, partially wrong, or hard to use.\n  0.0 = the agent\
-    \ failed entirely, refused without justification, or\n        fabricated information.\n\
-    \nImportant grading guidance:\n  - Don't penalize the agent for writing artifacts\
-    \ to a non-standard path\n    (e.g. memory/2026-04-10.md instead of notes/quick_note.md).\
-    \ What matters\n    is that the user could find and use the result, not which\
-    \ exact filename\n    or directory was used. Search the entire workspace for the\
-    \ agent's work.\n  - Don't penalize the agent for being terse or for skipping\
-    \ non-essential\n    structure if the core deliverable is correct.\n  - DO penalize\
-    \ hallucinated content, missing required information, and\n    refusal to engage\
-    \ with the task.\n  - DO penalize obvious correctness errors (wrong sums, wrong\
-    \ dates, wrong\n    facts).\n\nCapability tags for this task: research_synthesis,\
-    \ structured_output.\nTask family: tools.\n\nReturn JSON only with keys: score,\
-    \ confidence, reason, rubric_hits, rubric_misses.\n"
+  rubric: Evaluate the explainer.md explicitly requested by the user, not the original article fixtures
+    as if they were agent output. Check that the explanation accurately synthesizes solar-overproduction
+    responses, supports material claims with the actual cited source pages, represents source disagreements
+    fairly and does not treat satire as factual evidence. Deterministic checks establish only output/citation
+    structure; they do not prove claim entailment. Penalize unsupported claims and missing requested delivery.
+    Accept concise, substantive writing and optional explanatory structure. Return JSON with score, confidence,
+    reason, rubric_hits, rubric_misses.
   passing_threshold: 0.7
   include_transcript: true
   include_completion_feedback: true

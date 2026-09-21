@@ -20,7 +20,9 @@ class FakeGatewayClient:
 @pytest.mark.asyncio
 async def test_run_agent_uses_staged_run_workspace(tmp_path: Path):
     task = next(task for task in load_all_tasks() if task.id == "t1-bugfix-discount")
-    harness = BenchmarkHarness(gateway_config=GatewayConfig(), model="test-model", randomize_order=False)
+    harness = BenchmarkHarness(
+        gateway_config=GatewayConfig(), model="test-model", randomize_order=False
+    )
     workspace = tmp_path / "run-workspace"
     workspace.mkdir(parents=True, exist_ok=True)
     client = FakeGatewayClient()
@@ -99,10 +101,14 @@ async def test_run_workspace_is_sibling_of_openclaw_workspace_and_cleaned_up(
     monkeypatch.setattr(BenchmarkHarness, "_setup_workspace", fake_setup_workspace)
     monkeypatch.setattr("clawbench.harness.GatewayClient", RunGatewayClient)
     monkeypatch.setattr("clawbench.harness.UserSimulator", DoneSimulator)
-    monkeypatch.setattr("clawbench.harness.start_background_services", fake_start_background_services)
+    monkeypatch.setattr(
+        "clawbench.harness.start_background_services", fake_start_background_services
+    )
     monkeypatch.setattr("clawbench.harness.score_task_run", fake_score_task_run)
 
-    harness = BenchmarkHarness(gateway_config=GatewayConfig(), model="test-model", randomize_order=False)
+    harness = BenchmarkHarness(
+        gateway_config=GatewayConfig(), model="test-model", randomize_order=False
+    )
 
     result = await harness._run_single(task, run_index=0)
 
@@ -151,7 +157,9 @@ async def test_prepare_run_hook_executes_before_each_run(monkeypatch):
 
 
 def test_aggregate_reports_advisory_judge_metrics():
-    task = next(task for task in load_all_tasks() if task.id == "t5-hallucination-resistant-evidence")
+    task = next(
+        task for task in load_all_tasks() if task.id == "t5-hallucination-resistant-evidence"
+    )
     harness = BenchmarkHarness(
         gateway_config=GatewayConfig(),
         model="test-model",
@@ -167,7 +175,9 @@ def test_aggregate_reports_advisory_judge_metrics():
             run_index=0,
             run_score=0.9,
             completion_result=CompletionResult(total_assertions=1, passed_assertions=1, score=1.0),
-            judge_result=JudgeResult(enabled=True, model="judge-model", score=0.9, confidence=0.7, passed=True),
+            judge_result=JudgeResult(
+                enabled=True, model="judge-model", score=0.9, confidence=0.7, passed=True
+            ),
         ),
         TaskRunResult(
             task_id=task.id,
@@ -176,7 +186,9 @@ def test_aggregate_reports_advisory_judge_metrics():
             run_index=1,
             run_score=0.6,
             completion_result=CompletionResult(total_assertions=1, passed_assertions=1, score=1.0),
-            judge_result=JudgeResult(enabled=True, model="judge-model", score=0.5, confidence=0.9, passed=False),
+            judge_result=JudgeResult(
+                enabled=True, model="judge-model", score=0.5, confidence=0.9, passed=False
+            ),
         ),
     ]
 
@@ -288,7 +300,7 @@ def test_run_cache_path_includes_scoring_inputs(tmp_path: Path):
 
     base_path = base._run_cache_path(tmp_path, task, 0)
 
-    assert "v2-" in str(base_path)
+    assert "v4-" in str(base_path)
     assert base_path == same._run_cache_path(tmp_path, task, 0)
     assert base_path != different_judge._run_cache_path(tmp_path, task, 0)
     assert base_path != different_judge_gate._run_cache_path(tmp_path, task, 0)

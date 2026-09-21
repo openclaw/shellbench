@@ -24,7 +24,12 @@ from pathlib import Path
 from typing import Any
 
 from clawbench.paths import resolve_workspace_path
-from clawbench.render import render_argv_template, render_shell_template, render_template, render_value
+from clawbench.render import (
+    render_argv_template,
+    render_shell_template,
+    render_template,
+    render_value,
+)
 from clawbench.schemas import (
     ExecutionCheck,
     ExecutionCheckResult,
@@ -134,6 +139,7 @@ async def run_execution_check(
         python_path_parts.append(existing_pythonpath)
     full_env["PYTHONPATH"] = ":".join(python_path_parts)
 
+    process = None
     try:
         if spec.shell:
             process = await asyncio.create_subprocess_shell(
@@ -156,8 +162,9 @@ async def run_execution_check(
             timeout=spec.timeout_seconds,
         )
     except asyncio.TimeoutError:
-        process.kill()
-        await process.communicate()
+        if process is not None:
+            process.kill()
+            await process.communicate()
         return ExecutionCheckResult(
             name=spec.name,
             command=rendered_command,
@@ -174,6 +181,7 @@ async def run_execution_check(
             reason=str(exc),
         )
 
+    assert process is not None and process.returncode is not None
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")
     passed, reason = evaluate_execution_result(
@@ -319,29 +327,27 @@ def memory_visible_in_transcript(spec: MemoryState, transcript: Transcript) -> b
     `call.output`, `call.error`, all of which are canonical.
     """
 
-    needle = spec.key_pattern.lower()
+    pattern = re.compile(spec.key_pattern, re.IGNORECASE)
     for call in transcript.tool_call_sequence:
         family = (call.family or "").lower()
         name = call.name.lower()
         path = str(call.input.get("path", "")).lower()
-        if family != "memory" and "memory" not in path:
+        if call.success is not True or call.error:
             continue
-        if (
-            family == "memory"
-            and "search" in name
-            and "write" not in name
-            and "store" not in name
-            and "save" not in name
-        ):
+        native_write = (family == "memory" or "memory" in name) and bool(
+            re.search(r"write|store|append|save|set|update", name)
+        )
+        file_write = "memory" in path and bool(re.search(r"write|edit|append|save", name))
+        if not (native_write or file_write):
             continue
 
-        serialized_bits = [call.output, call.error]
+        serialized_bits = [call.output]
         try:
             serialized_bits.append(json.dumps(call.input, sort_keys=True))
         except TypeError:
             serialized_bits.append(str(call.input))
         haystack = " ".join(bit for bit in serialized_bits if bit).lower()
-        if needle not in haystack:
+        if not pattern.search(haystack):
             continue
         if all(token.lower() in haystack for token in spec.value_contains):
             return True
@@ -364,15 +370,14 @@ def verify_memory_fallback(
     1. Concatenate every known memory file in the workspace.
     2. Optionally add any adapter-supplied text (e.g. OpenClaw's
        `_read_agent_memory_text`) via `extra_memory_text`.
-    3. If the key_pattern appears (case-insensitive), check every
+    3. If the key_pattern regex matches (case-insensitive), check every
        `value_contains` token.
     4. If that fails, fall back to scanning the transcript for a memory
        write that matches.
     """
 
     memory_text = (read_workspace_memory_text(workspace) + "\n" + extra_memory_text).lower()
-    needle = spec.key_pattern.lower()
-    found = needle in memory_text
+    found = re.search(spec.key_pattern, memory_text, re.IGNORECASE) is not None
 
     if not spec.exists:
         return (not found, "Correctly absent" if not found else "Memory entry exists")

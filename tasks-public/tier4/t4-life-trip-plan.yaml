@@ -1,93 +1,77 @@
 id: t4-life-trip-plan
-name: "Tier 4: Trip Plan With Constraints"
+name: 'Tier 4: Trip Plan With Constraints'
 tier: tier4
 family: tools
 surface: tools
 pool: public_dev
-subsets: [hard]
-capabilities: [research_synthesis, structured_output, multifile_reasoning]
+subsets:
+- hard
+capabilities:
+- research_synthesis
+- structured_output
+- multifile_reasoning
 timeout_seconds: 960
-# Scenario: personal_life_assistant
-# Constraint-rich trip planning. Constraints come from a profile.yaml in
-# the workspace (dietary: vegetarian, mobility: limited stairs, budget cap,
-# preferred travel times, must include one specific landmark).
-#
-# A simulated places.json provides candidate venues. Some candidates have
-# accessibility metadata, others don't — the agent must mark unknowns,
-# not assume. Total trip cost must be under budget. The agent must
-# preserve at least one constraint that initially seems impossible by
-# proposing a relaxation explicitly.
-#
-# Frontier separator: no fabricating venues, prices, or accessibility info.
-# Verifier checks every named place exists in places.json.
-
 setup:
   asset_packs:
-    - t4_life_trip_plan
-
+  - t4_life_trip_plan
 user:
   max_turns: 3
   turns:
-    - message: |
-        I'm planning a long weekend in Kyoto next month and I need help
-        putting together an actual itinerary. My profile is in the usual
-        place. Try to keep it realistic — I don't bounce back from packed
-        days like I used to.
-    - message: "Make sure we hit Fushimi Inari at some point even if it's a stretch — I've wanted to see it forever."
-      after_assistant_turns: 1
-    - message: "If anything I'm asking for doesn't actually fit in the budget or my mobility, just tell me up front, don't try to fudge it."
-      after_assistant_turns: 2
+  - message: 'I''m planning a long weekend in Kyoto next month and I need help
 
+      putting together an actual itinerary. My profile is in the usual
+
+      place. Try to keep it realistic — I don''t bounce back from packed
+
+      days like I used to.
+
+
+      Save your final plan in itinerary.json. Use {"days":[{"day":1,"visits":[{"venue_id":"catalog_id"}]}],"other_costs":[{"label":"local
+      transport","estimate_usd":number}],"total_usd":number} with days 1, 2, and 3 exactly once and at
+      least one visit each day. Schedule only venues from places.json; if you include a name, use its
+      matching catalog name. Include vegetarian food. For any venue not marked mobility_friendly, add
+      a mobility_note describing the limitation and a restricted visit or explicit requested relaxation.
+      Each listed visit adds its catalog cost_usd once; the lodging catalog price covers the stated three-night
+      booking, so list that booking only once if used. Label additional cost estimates separately, sum
+      all visits and estimates accurately, and stay within the profile''s $800 cap. Preserve places.json.
+      Free-form final prose can explain tradeoffs; the structured itinerary is the checked deliverable.
+
+      '
+  - message: Make sure we hit Fushimi Inari at some point even if it's a stretch — I've wanted to see
+      it forever.
+    after_assistant_turns: 1
+  - message: If anything I'm asking for doesn't actually fit in the budget or my mobility, just tell me
+      up front, don't try to fudge it.
+    after_assistant_turns: 2
 completion:
   execution_checks:
-    - name: "no fabricated places (every named venue is in places.json)"
-      command: "python3 verify_no_fab_places.py"
-    - name: "Fushimi Inari included as required landmark"
-      command: "python3 verify_landmark_present.py"
-    - name: "dietary constraints honored"
-      command: "python3 verify_constraints_check.py"
-
+  - name: every scheduled venue exists in the original catalog
+    command: python3 -I -m clawbench.task_verifiers trip venues
+  - name: Fushimi Inari is an actual scheduled visit
+    command: python3 -I -m clawbench.task_verifiers trip landmark
+  - name: vegetarian food, explicit mobility limits and accurate budget
+    command: python3 -I -m clawbench.task_verifiers trip constraints
 trajectory:
-  required_families: ["read", "edit"]
+  required_families:
+  - read
+  - edit
   min_distinct_families: 2
   min_pre_edit_exploration_calls: 4
   require_read_before_mutation: true
   require_self_verification: true
-
 behavior:
   require_plan: true
   require_progress_updates: true
   require_blocker_explanation: true
-
 judge:
-  rubric: |
-    You are grading a single ClawBench agent run for task t4-life-trip-plan (Tier 4: Trip Plan With Constraints).
-
-    Score the agent on a scale from 0.0 to 1.0:
-      1.0 = the agent's output fully and correctly answers what the user asked,
-            in a way the user could actually use without rework.
-      0.7 = mostly correct and usable, with minor issues or missed nuances.
-      0.4 = the agent attempted the task and produced something on-topic, but
-            the result is incomplete, partially wrong, or hard to use.
-      0.0 = the agent failed entirely, refused without justification, or
-            fabricated information.
-
-    Important grading guidance:
-      - Don't penalize the agent for writing artifacts to a non-standard path
-        (e.g. memory/2026-04-10.md instead of notes/quick_note.md). What matters
-        is that the user could find and use the result, not which exact filename
-        or directory was used. Search the entire workspace for the agent's work.
-      - Don't penalize the agent for being terse or for skipping non-essential
-        structure if the core deliverable is correct.
-      - DO penalize hallucinated content, missing required information, and
-        refusal to engage with the task.
-      - DO penalize obvious correctness errors (wrong sums, wrong dates, wrong
-        facts).
-
-    Capability tags for this task: research_synthesis, structured_output, multifile_reasoning.
-    Task family: tools.
-
-    Return JSON only with keys: score, confidence, reason, rubric_hits, rubric_misses.
+  rubric: Evaluate the requested itinerary.json and the final explanation against the original profile
+    and venue catalog. Check a usable three-day plan, vegetarian food, feasible pacing, truthful costs
+    and realistic handling of limited mobility. The Fushimi Inari full hike is incompatible with the profile;
+    a clearly restricted lower-area visit can be appropriate. A mobility_note merely existing is not proof
+    that its adaptation is adequate. Deterministic checks establish catalog IDs, basic constraints and
+    sums, not complete real-world feasibility. Do not treat original profile/places files as agent output.
+    Accept extra explanatory fields and day ordering when the required schedule is equivalent. Return
+    JSON with score, confidence, reason, rubric_hits, rubric_misses.
   passing_threshold: 0.7
   include_transcript: true
   include_completion_feedback: true

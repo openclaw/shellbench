@@ -10,8 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from clawbench.client import GatewayClient
+from clawbench.environment_files import memory_visible_in_transcript
 from clawbench.paths import resolve_workspace_path
-from clawbench.render import render_argv_template, render_shell_template, render_template, render_value
+from clawbench.render import (
+    render_argv_template,
+    render_shell_template,
+    render_template,
+    render_value,
+)
 from clawbench.schemas import (
     CompletionResult,
     CompletionSpec,
@@ -52,7 +58,9 @@ async def verify_completion(
             failures.append(f"FILE {spec.path}: {reason}")
 
     for spec in completion.memory:
-        ok, reason = await _verify_memory(spec, client, session_key, agent_id=agent_id, transcript=transcript)
+        ok, reason = await _verify_memory(
+            spec, client, session_key, agent_id=agent_id, transcript=transcript
+        )
         total += 1
         if ok:
             passed += 1
@@ -144,6 +152,7 @@ async def run_execution_check(
         python_path_parts.append(existing_pythonpath)
     full_env["PYTHONPATH"] = ":".join(python_path_parts)
 
+    process = None
     try:
         if spec.shell:
             process = await asyncio.create_subprocess_shell(
@@ -166,8 +175,9 @@ async def run_execution_check(
             timeout=spec.timeout_seconds,
         )
     except asyncio.TimeoutError:
-        process.kill()
-        await process.communicate()
+        if process is not None:
+            process.kill()
+            await process.communicate()
         return ExecutionCheckResult(
             name=spec.name,
             command=rendered_command,
@@ -184,9 +194,12 @@ async def run_execution_check(
             reason=str(exc),
         )
 
+    assert process is not None and process.returncode is not None
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")
-    passed, reason = _evaluate_execution_result(spec, workspace, runtime_values, process.returncode, stdout, stderr)
+    passed, reason = _evaluate_execution_result(
+        spec, workspace, runtime_values, process.returncode, stdout, stderr
+    )
     return ExecutionCheckResult(
         name=spec.name,
         command=rendered_command,
@@ -224,10 +237,14 @@ def _evaluate_execution_result(
         if rendered not in stderr:
             return False, f"stderr missing '{rendered}'"
 
-    if spec.stdout_matches and not re.search(render_template(spec.stdout_matches, runtime_values), stdout, re.MULTILINE | re.DOTALL):
+    if spec.stdout_matches and not re.search(
+        render_template(spec.stdout_matches, runtime_values), stdout, re.MULTILINE | re.DOTALL
+    ):
         return False, f"stdout does not match {spec.stdout_matches}"
 
-    if spec.stderr_matches and not re.search(render_template(spec.stderr_matches, runtime_values), stderr, re.MULTILINE | re.DOTALL):
+    if spec.stderr_matches and not re.search(
+        render_template(spec.stderr_matches, runtime_values), stderr, re.MULTILINE | re.DOTALL
+    ):
         return False, f"stderr does not match {spec.stderr_matches}"
 
     if spec.expected_stdout is not None:
@@ -275,7 +292,9 @@ def _evaluate_execution_result(
     return True, "OK"
 
 
-def _verify_file(spec: FileState, workspace: Path, runtime_values: dict[str, Any]) -> tuple[bool, str]:
+def _verify_file(
+    spec: FileState, workspace: Path, runtime_values: dict[str, Any]
+) -> tuple[bool, str]:
     try:
         path = resolve_workspace_path(
             workspace,
@@ -343,15 +362,20 @@ async def _verify_memory(
                 return False, f"Memory value missing '{token}'"
         return True, "OK"
     except Exception as exc:
-        logger.info("memory.search unavailable for verification, falling back to agent memory files: %s", exc)
+        logger.info(
+            "memory.search unavailable for verification, falling back to agent memory files: %s",
+            exc,
+        )
 
     if not agent_id:
-        return False, "memory.search unavailable and no agent id was provided for fallback verification"
+        return (
+            False,
+            "memory.search unavailable and no agent id was provided for fallback verification",
+        )
 
     fallback_text = await _read_agent_memory_text(client, agent_id)
     normalized = fallback_text.lower()
-    needle = spec.key_pattern.lower()
-    found = needle in normalized
+    found = re.search(spec.key_pattern, normalized, re.IGNORECASE) is not None
 
     if not spec.exists:
         return (not found, "Correctly absent" if not found else "Memory entry exists")
@@ -363,7 +387,10 @@ async def _verify_memory(
 
     if transcript and _memory_visible_in_transcript(spec, transcript):
         return True, "Verified from transcript fallback"
-    return False, "No matching memory content found in persisted memory files or transcript fallback"
+    return (
+        False,
+        "No matching memory content found in persisted memory files or transcript fallback",
+    )
 
 
 async def _read_agent_memory_text(client: GatewayClient, agent_id: str) -> str:
@@ -389,27 +416,7 @@ async def _read_agent_memory_text(client: GatewayClient, agent_id: str) -> str:
 
 
 def _memory_visible_in_transcript(spec: MemoryState, transcript: Transcript) -> bool:
-    needle = spec.key_pattern.lower()
-    for call in transcript.tool_call_sequence:
-        family = (call.family or "").lower()
-        name = call.name.lower()
-        path = str(call.input.get("path", "")).lower()
-        if family != "memory" and "memory" not in path:
-            continue
-        if family == "memory" and "search" in name and "write" not in name and "store" not in name and "save" not in name:
-            continue
-
-        serialized_bits = [call.output, call.error]
-        try:
-            serialized_bits.append(json.dumps(call.input, sort_keys=True))
-        except TypeError:
-            serialized_bits.append(str(call.input))
-        haystack = " ".join(bit for bit in serialized_bits if bit).lower()
-        if needle not in haystack:
-            continue
-        if all(token.lower() in haystack for token in spec.value_contains):
-            return True
-    return False
+    return memory_visible_in_transcript(spec, transcript)
 
 
 async def _verify_session(
@@ -442,8 +449,7 @@ async def _verify_cron(spec: CronState, client: GatewayClient) -> tuple[bool, st
         if not jobs:
             return False, "No cron jobs found"
         if spec.description_contains and not any(
-            spec.description_contains.lower() in json.dumps(job).lower()
-            for job in jobs
+            spec.description_contains.lower() in json.dumps(job).lower() for job in jobs
         ):
             return False, f"No cron job matched '{spec.description_contains}'"
         return True, "OK"
@@ -465,7 +471,10 @@ async def _verify_gateway_assertion(
             return False, f"Path {spec.assert_path} not found"
         if spec.assert_equals is not None and value != spec.assert_equals:
             return False, f"Expected {spec.assert_equals}, got {value}"
-        if spec.assert_contains is not None and spec.assert_contains.lower() not in str(value).lower():
+        if (
+            spec.assert_contains is not None
+            and spec.assert_contains.lower() not in str(value).lower()
+        ):
             return False, f"Expected '{spec.assert_contains}' in {value}"
         return True, "OK"
     except Exception as exc:

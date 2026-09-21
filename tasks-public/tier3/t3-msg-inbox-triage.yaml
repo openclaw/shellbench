@@ -26,22 +26,29 @@ user:
   max_turns: 2
   turns:
     - message: |
+        For this scenario it is Wednesday, 2026-09-16 at 15:00 local time.
+        Interpret all email deadlines relative to that scenario time, not the host clock.
+        Apply the priorities in prefs.yaml.
         I haven't checked email all day and I'm dreading it. Can you go
         through what's in there and tell me what actually needs me, what
         can wait, and what's just noise? If anything looks urgent enough
         that I should reply tonight, draft something for me to look at —
         but don't send anything.
+        Save triage.json as {"messages": [...]} with one object per inbox filename.
+        Each object needs id, category, reason, and draft. Use categories urgent,
+        low_priority, phishing, needs_clarification. draft is null except for urgent
+        replies, where it is {"to": "original sender address", "body": "proposed reply"}.
     - message: "Anything that looks fishy, just flag it and don't touch it."
       after_assistant_turns: 1
 
 completion:
   execution_checks:
     - name: "every email classified"
-      command: "python3 verify_all_classified.py"
+      command: "python3 -I -m clawbench.task_verifiers inbox classified"
     - name: "phishing email flagged not drafted"
-      command: "python3 verify_phishing_flagged.py"
+      command: "python3 -I -m clawbench.task_verifiers inbox phishing"
     - name: "drafts cover the genuinely urgent emails"
-      command: "python3 verify_drafts_for_urgent.py"
+      command: "python3 -I -m clawbench.task_verifiers inbox drafts"
 
 trajectory:
   required_families: ["read", "edit"]
