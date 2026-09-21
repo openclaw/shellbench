@@ -1,0 +1,13 @@
+# Bridge and model relay dependencies; model credentials are supplied at runtime.
+annotated-types==0.8.0
+anyio==4.15.1
+certifi==2026.7.22
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.19
+pydantic==2.13.5
+pydantic-core==2.46.5
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+websockets==17.1

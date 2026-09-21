@@ -17,6 +17,8 @@ dependencies = [
     "numpy>=2.5.2,<3; python_version >= '3.12'",
     "rich>=15.0.0,<16",
     "click>=8.5.0,<9",
+    # Read retained native OpenClaw SQLite transcript archives on the host.
+    "zstandard>=0.25.0,<1",
     # Runtime deps for the task completion verifier. The harness shells out
     # to `pytest -q` / `pytest-asyncio` inside per-task workspaces as the
     # execution check; the container must have them in PATH.
@@ -55,7 +57,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["clawbench"]
-force-include = { "tasks-public" = "tasks-public", "tasks-domain" = "tasks-domain", "profiles" = "profiles", "baselines" = "baselines", "CLAWBENCH_V0_4_SPEC.md" = "CLAWBENCH_V0_4_SPEC.md", "PARTNER_TRACE_SPEC.md" = "PARTNER_TRACE_SPEC.md" }
+force-include = { "tasks-public" = "tasks-public", "tasks-domain" = "tasks-domain", "tasks-alignment" = "tasks-alignment", "profiles" = "profiles", "baselines" = "baselines", "CLAWBENCH_V0_4_SPEC.md" = "CLAWBENCH_V0_4_SPEC.md", "PARTNER_TRACE_SPEC.md" = "PARTNER_TRACE_SPEC.md" }
 
 [tool.hatch.metadata]
 allow-direct-references = true

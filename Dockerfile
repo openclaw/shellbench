@@ -26,6 +26,7 @@ COPY --chown=node:node pyproject.toml README.md CLAWBENCH_V0_4_SPEC.md PARTNER_T
 COPY --chown=node:node clawbench/ clawbench/
 COPY --chown=node:node tasks-public/ tasks-public/
 COPY --chown=node:node tasks-domain/ tasks-domain/
+COPY --chown=node:node tasks-alignment/ tasks-alignment/
 COPY --chown=node:node profiles/ profiles/
 COPY --chown=node:node baselines/ baselines/
 COPY --chown=node:node scripts/ scripts/

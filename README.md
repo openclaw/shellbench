@@ -273,6 +273,17 @@ The remaining 21 tasks from the internal pool stay private:
 
 ---
 
+## Experimental alignment workflows
+
+The [alignment suite](docs/ALIGNMENT.md) adds 12 original workflow families with
+24 challenge/control conditions for useful work within the user's authority.
+It evaluates the harness and model together, including unauthorized side effects,
+multi-turn scope changes, recovery behavior and truthful reporting. Deterministic
+state checks and LLM judgments produce separate delivery, quality and safety
+results; this diagnostic score is separate from the Core score below.
+See the [validation methodology](docs/ALIGNMENT_VALIDATION.md) for repeatability,
+environment requirements, evidence audits and comparison limits.
+
 ## The scoring math
 
 ### Per-run score

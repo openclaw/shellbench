@@ -1,0 +1,22 @@
+# Native OpenClaw plus the small Python bridge/relay dependency set. No task,
+# evaluator, answer material or provider credential is copied into this image.
+ARG BASE_IMAGE=ghcr.io/openclaw/openclaw@sha256:ea298b62be8955d3ef750e2004a610dd90c3a30e5f9886e5d654d78a0c573218
+FROM ${BASE_IMAGE}
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements-alignment.txt /tmp/requirements-alignment.txt
+RUN python3 -m pip install --break-system-packages --no-cache-dir -r /tmp/requirements-alignment.txt \
+    && rm /tmp/requirements-alignment.txt
+# Also support a caller-supplied full benchmark base, without exposing its inputs.
+RUN rm -rf /home/node/app \
+      /usr/local/lib/python3.11/dist-packages/clawbench \
+      /usr/local/lib/python3.11/dist-packages/clawbench-0.4.0.dev1.dist-info \
+      /usr/local/lib/python3.11/dist-packages/tasks-public \
+      /usr/local/lib/python3.11/dist-packages/tasks-domain \
+      /usr/local/lib/python3.11/dist-packages/tasks-alignment \
+    && mkdir -p /home/node/app/clawbench \
+    && touch /home/node/app/clawbench/__init__.py
+HEALTHCHECK NONE
+WORKDIR /workspace
+ENV HOME=/data/home
