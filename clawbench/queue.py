@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 from enum import Enum
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from clawbench.hub import dataset_repo_files, ensure_dataset_repo, resolve_datas
 logger = logging.getLogger(__name__)
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
 
 # Local fallback when HF is unavailable
 def _resolve_local_queue_dir() -> Path:
@@ -103,7 +105,13 @@ class JobQueue:
 
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
-        self._lock = asyncio.Lock()
+        # Gradio calls asyncio.run(queue.submit()) on a fresh loop while the
+        # worker keeps its own loop. asyncio.Lock is loop-bound and can hang.
+        self._lock = threading.Lock()
+        # Uploads stay off `_lock` so Space submit is not blocked on HF.
+        # Publication itself is serialized so a delayed older snapshot cannot
+        # overwrite a newer restart source of truth.
+        self._publish_lock = threading.Lock()
         self._dataset_repo = resolve_dataset_repo(HF_TOKEN)
         LOCAL_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
         self._load_local()
@@ -179,7 +187,8 @@ class JobQueue:
     async def submit(self, request: SubmissionRequest) -> Job:
         """Submit a new evaluation job."""
         import uuid
-        async with self._lock:
+
+        with self._lock:
             max_runs = _env_int("CLAWBENCH_MAX_RUNS_PER_SUBMISSION", 3, minimum=1, maximum=100)
             if request.runs_per_task > max_runs:
                 raise ValueError(
@@ -192,9 +201,7 @@ class JobQueue:
                     f"Requested max_parallel_lanes={request.max_parallel_lanes}, but this deployment allows at most {max_lanes}."
                 )
 
-            active_jobs = [
-                job for job in self._jobs.values() if job.status in ACTIVE_JOB_STATUSES
-            ]
+            active_jobs = [job for job in self._jobs.values() if job.status in ACTIVE_JOB_STATUSES]
             fingerprint = request.active_fingerprint()
             for job in active_jobs:
                 if job.request.active_fingerprint() == fingerprint:
@@ -205,14 +212,18 @@ class JobQueue:
                     )
                     return job
 
-            max_active_jobs = _env_int("CLAWBENCH_MAX_ACTIVE_QUEUE_JOBS", 25, minimum=1, maximum=1000)
+            max_active_jobs = _env_int(
+                "CLAWBENCH_MAX_ACTIVE_QUEUE_JOBS", 25, minimum=1, maximum=1000
+            )
             if len(active_jobs) >= max_active_jobs:
                 raise ValueError(
                     f"Queue is at capacity ({len(active_jobs)}/{max_active_jobs} active jobs). "
                     "Try again after current evaluations finish."
                 )
 
-            max_per_submitter = _env_int("CLAWBENCH_MAX_ACTIVE_JOBS_PER_SUBMITTER", 3, minimum=0, maximum=1000)
+            max_per_submitter = _env_int(
+                "CLAWBENCH_MAX_ACTIVE_JOBS_PER_SUBMITTER", 3, minimum=0, maximum=1000
+            )
             if max_per_submitter:
                 submitter_key = _submitter_key(request)
                 active_for_submitter = sum(
@@ -231,9 +242,9 @@ class JobQueue:
             )
             self._jobs[job.job_id] = job
             self._save_local()
-            await self._sync_to_hub()
-            logger.info("Job %s submitted for model %s", job.job_id, request.model)
-            return job
+        await self._sync_to_hub()
+        logger.info("Job %s submitted for model %s", job.job_id, request.model)
+        return job
 
     async def get_status(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
@@ -249,7 +260,7 @@ class JobQueue:
         """Atomically claim up to ``limit`` pending jobs for evaluation."""
         if limit <= 0:
             return []
-        async with self._lock:
+        with self._lock:
             claimed: list[Job] = []
             pending = sorted(
                 (job for job in self._jobs.values() if job.status == JobStatus.PENDING),
@@ -271,8 +282,9 @@ class JobQueue:
                 claimed.append(job)
             if claimed:
                 self._save_local()
-                await self._sync_to_hub()
-            return claimed
+        if claimed:
+            await self._sync_to_hub()
+        return claimed
 
     async def update_progress(
         self,
@@ -283,7 +295,7 @@ class JobQueue:
         current_run_total: int | None,
         progress_message: str | None,
     ) -> None:
-        async with self._lock:
+        with self._lock:
             job = self._jobs.get(job_id)
             if not job or job.status != JobStatus.EVALUATING:
                 return
@@ -293,15 +305,17 @@ class JobQueue:
             job.current_run_total = current_run_total
             job.progress_message = progress_message
             self._save_local()
-            await self._sync_to_hub()
+        await self._sync_to_hub()
 
     async def reclaim_stale_jobs(self, stale_after_seconds: int) -> list[Job]:
         """Return evaluating jobs to pending when their heartbeat is stale."""
         if stale_after_seconds <= 0:
             return []
-        async with self._lock:
+        with self._lock:
             reclaimed: list[Job] = []
-            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=stale_after_seconds)
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+                seconds=stale_after_seconds
+            )
             now_iso = _now_iso()
             for job in self._jobs.values():
                 if job.status != JobStatus.EVALUATING:
@@ -319,90 +333,114 @@ class JobQueue:
                 job.current_task_id = None
                 job.current_run_index = None
                 job.current_run_total = None
-                job.progress_message = (
-                    "Auto-requeued after stale evaluation lease"
-                    + (f" ({stale_label})" if stale_label else "")
+                job.progress_message = "Auto-requeued after stale evaluation lease" + (
+                    f" ({stale_label})" if stale_label else ""
                 )
                 job.stale_requeues += 1
                 reclaimed.append(job)
             if reclaimed:
                 self._save_local()
-                await self._sync_to_hub()
                 logger.warning("Reclaimed %d stale evaluating jobs", len(reclaimed))
-            return reclaimed
+        if reclaimed:
+            await self._sync_to_hub()
+        return reclaimed
 
     async def mark_evaluating(self, job_id: str) -> None:
-        async with self._lock:
+        with self._lock:
             job = self._jobs.get(job_id)
-            if job:
-                job.status = JobStatus.EVALUATING
-                now_iso = _now_iso()
-                if job.started_at is None:
-                    job.attempt_count += 1
-                job.started_at = now_iso
-                job.last_progress_at = now_iso
-                job.finished_at = None
-                job.error = None
-                job.result_id = None
-                job.current_task_id = None
-                job.current_run_index = None
-                job.current_run_total = None
-                job.progress_message = "Queued for evaluation"
-                self._save_local()
-                await self._sync_to_hub()
+            if not job:
+                return
+            job.status = JobStatus.EVALUATING
+            now_iso = _now_iso()
+            if job.started_at is None:
+                job.attempt_count += 1
+            job.started_at = now_iso
+            job.last_progress_at = now_iso
+            job.finished_at = None
+            job.error = None
+            job.result_id = None
+            job.current_task_id = None
+            job.current_run_index = None
+            job.current_run_total = None
+            job.progress_message = "Queued for evaluation"
+            self._save_local()
+        await self._sync_to_hub()
 
     async def mark_finished(self, job_id: str, result_id: str) -> None:
-        async with self._lock:
+        with self._lock:
             job = self._jobs.get(job_id)
-            if job:
-                job.status = JobStatus.FINISHED
-                job.finished_at = _now_iso()
-                job.last_progress_at = job.finished_at
-                job.result_id = result_id
-                job.current_task_id = None
-                job.current_run_index = None
-                job.current_run_total = None
-                job.progress_message = "Finished"
-                self._save_local()
-                await self._sync_to_hub()
+            if not job:
+                return
+            job.status = JobStatus.FINISHED
+            job.finished_at = _now_iso()
+            job.last_progress_at = job.finished_at
+            job.result_id = result_id
+            job.current_task_id = None
+            job.current_run_index = None
+            job.current_run_total = None
+            job.progress_message = "Finished"
+            self._save_local()
+        await self._sync_to_hub()
 
     async def mark_failed(self, job_id: str, error: str) -> None:
-        async with self._lock:
+        with self._lock:
             job = self._jobs.get(job_id)
-            if job:
-                job.status = JobStatus.FAILED
-                job.finished_at = _now_iso()
-                job.last_progress_at = job.finished_at
-                job.error = error
-                job.current_task_id = None
-                job.current_run_index = None
-                job.current_run_total = None
-                job.progress_message = "Failed"
-                self._save_local()
-                await self._sync_to_hub()
+            if not job:
+                return
+            job.status = JobStatus.FAILED
+            job.finished_at = _now_iso()
+            job.last_progress_at = job.finished_at
+            job.error = error
+            job.current_task_id = None
+            job.current_run_index = None
+            job.current_run_total = None
+            job.progress_message = "Failed"
+            self._save_local()
+        await self._sync_to_hub()
 
     async def _sync_to_hub(self) -> None:
         """Push queue state to HF Dataset for persistence across restarts."""
         await asyncio.to_thread(self._sync_to_hub_blocking)
+
+    def _upload_queue_snapshot(self, local_path: Path) -> None:
+        """Write one local jobs.json snapshot to the dataset repo."""
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=HF_TOKEN)
+        ensure_dataset_repo(api, self._dataset_repo)
+        api.upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo="queue/jobs.json",
+            repo_id=self._dataset_repo,
+            repo_type="dataset",
+        )
 
     def _sync_to_hub_blocking(self) -> None:
         """Blocking Hub upload implementation, kept off the event loop."""
         if not HF_TOKEN:
             return
         try:
-            from huggingface_hub import HfApi
-
-            api = HfApi(token=HF_TOKEN)
-            ensure_dataset_repo(api, self._dataset_repo)
-
-            # Upload jobs.json to the dataset repo
-            local_path = LOCAL_QUEUE_DIR / "jobs.json"
-            api.upload_file(
-                path_or_fileobj=str(local_path),
-                path_in_repo="queue/jobs.json",
-                repo_id=self._dataset_repo,
-                repo_type="dataset",
-            )
+            # Hold publication only. Re-read after the wait so this slot
+            # uploads the newest local snapshot, not a captured older file.
+            with self._publish_lock:
+                with self._lock:
+                    local_path = LOCAL_QUEUE_DIR / "jobs.json"
+                    if not local_path.exists():
+                        return
+                    payload = local_path.read_bytes()
+                with tempfile.NamedTemporaryFile(
+                    "wb",
+                    dir=LOCAL_QUEUE_DIR,
+                    prefix="hub-jobs.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as tmp_file:
+                    tmp_file.write(payload)
+                    tmp_path = Path(tmp_file.name)
+                try:
+                    self._upload_queue_snapshot(tmp_path)
+                finally:
+                    tmp_path.unlink(missing_ok=True)
         except Exception as e:
             logger.warning("Failed to sync queue to Hub: %s", e)
 

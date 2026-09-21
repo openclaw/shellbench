@@ -1,5 +1,8 @@
+import asyncio
 import datetime
 import json
+import threading
+from pathlib import Path
 
 import pytest
 
@@ -96,14 +99,18 @@ async def test_submit_dedupes_equivalent_active_jobs(monkeypatch):
             request=request,
         )
     }
-    monkeypatch.setattr(queue, "_save_local", lambda: (_ for _ in ()).throw(AssertionError("should not save")))
+    monkeypatch.setattr(
+        queue, "_save_local", lambda: (_ for _ in ()).throw(AssertionError("should not save"))
+    )
 
     async def fail_sync() -> None:
         raise AssertionError("should not sync")
 
     monkeypatch.setattr(queue, "_sync_to_hub", fail_sync)
 
-    job = await queue.submit(SubmissionRequest(model="anthropic/claude-sonnet-4-6", submitter="someone-else"))
+    job = await queue.submit(
+        SubmissionRequest(model="anthropic/claude-sonnet-4-6", submitter="someone-else")
+    )
 
     assert job.job_id == "job-1"
 
@@ -139,7 +146,9 @@ async def test_submit_enforces_submitter_limit(monkeypatch):
     }
 
     with pytest.raises(ValueError, match="already has 1 active"):
-        await queue.submit(SubmissionRequest(model="huggingface/Qwen/Qwen3-32B", submitter=" vincent "))
+        await queue.submit(
+            SubmissionRequest(model="huggingface/Qwen/Qwen3-32B", submitter=" vincent ")
+        )
 
 
 @pytest.mark.asyncio
@@ -256,7 +265,9 @@ def test_load_submission_rows_from_parquet_uses_direct_hub_download(tmp_path):
     parquet_path = tmp_path / "submissions.parquet"
     download_calls: list[tuple[str, str, str, str | None]] = []
 
-    def fake_downloader(*, repo_id: str, repo_type: str, filename: str, token: str | None = None) -> str:
+    def fake_downloader(
+        *, repo_id: str, repo_type: str, filename: str, token: str | None = None
+    ) -> str:
         download_calls.append((repo_id, repo_type, filename, token))
         return str(parquet_path)
 
@@ -280,7 +291,12 @@ def test_load_submission_rows_from_parquet_uses_direct_hub_download(tmp_path):
     )
 
     assert download_calls == [
-        ("ScoootScooob/clawbench-results", "dataset", "data/submissions-00000-of-00001.parquet", "hf_test")
+        (
+            "ScoootScooob/clawbench-results",
+            "dataset",
+            "data/submissions-00000-of-00001.parquet",
+            "hf_test",
+        )
     ]
     assert rows == [{"model": "anthropic/claude-sonnet-4-6", "overall_score": 0.7}]
 
@@ -406,8 +422,12 @@ async def test_update_progress_tracks_current_task_and_heartbeat(monkeypatch):
 @pytest.mark.asyncio
 async def test_reclaim_stale_jobs_requeues_only_expired_evaluations(monkeypatch):
     queue = JobQueue()
-    stale_started_at = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).isoformat()
-    fresh_started_at = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=2)).isoformat()
+    stale_started_at = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+    ).isoformat()
+    fresh_started_at = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=2)
+    ).isoformat()
     queue._jobs = {
         "job-1": Job(
             job_id="job-1",
@@ -462,3 +482,201 @@ async def test_reclaim_stale_jobs_requeues_only_expired_evaluations(monkeypatch)
     assert fresh_job.current_task_id == "t1-bugfix-discount"
     assert save_calls == ["saved"]
     assert sync_calls == ["synced"]
+
+
+async def _hold_queue_lock(
+    queue: JobQueue, held: threading.Event, release: threading.Event
+) -> None:
+    """Hold JobQueue._lock whether it is asyncio.Lock or threading.Lock."""
+    lock = queue._lock
+    if hasattr(lock, "__aenter__"):
+        async with lock:
+            held.set()
+            await asyncio.to_thread(release.wait, 5)
+        return
+    with lock:
+        held.set()
+        await asyncio.to_thread(release.wait, 5)
+
+
+def test_submit_from_second_event_loop_while_worker_holds_lock(tmp_path, monkeypatch):
+    """Space UI uses asyncio.run() on a new loop while EvalWorker holds the queue lock."""
+    monkeypatch.setattr(queue_module, "LOCAL_QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(queue_module, "HF_TOKEN", "")
+    queue = JobQueue()
+
+    held = threading.Event()
+    release = threading.Event()
+    worker_errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            asyncio.run(_hold_queue_lock(queue, held, release))
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+    assert held.wait(timeout=2), "worker never acquired the queue lock"
+
+    outcome: dict[str, Job | BaseException] = {}
+
+    def submit_from_other_loop() -> None:
+        try:
+            outcome["job"] = asyncio.run(
+                queue.submit(
+                    SubmissionRequest(model="anthropic/claude-sonnet-4-6", submitter="space-ui")
+                )
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    submit_thread = threading.Thread(target=submit_from_other_loop, daemon=True)
+    submit_thread.start()
+    # Worker still holds the lock. Release after submit is waiting so a
+    # thread lock can proceed; an asyncio.Lock bound to the worker loop
+    # deadlocks or raises instead.
+    release.set()
+    submit_thread.join(timeout=2)
+    worker_thread.join(timeout=2)
+
+    assert worker_errors == []
+    assert not submit_thread.is_alive(), "submit deadlocked across event loops"
+    assert "error" not in outcome, outcome.get("error")
+    job = outcome["job"]
+    assert isinstance(job, Job)
+    assert job.status == JobStatus.PENDING
+    assert job.job_id in queue._jobs
+
+
+def test_submit_does_not_block_on_hub_sync_from_second_loop(tmp_path, monkeypatch):
+    """Hub uploads must not keep the queue lock, or Space submit waits on HF."""
+    monkeypatch.setattr(queue_module, "LOCAL_QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(queue_module, "HF_TOKEN", "")
+    queue = JobQueue()
+
+    sync_started = threading.Event()
+    release_sync = threading.Event()
+
+    async def blocking_sync() -> None:
+        if sync_started.is_set():
+            return
+        sync_started.set()
+        await asyncio.to_thread(release_sync.wait, 5)
+
+    monkeypatch.setattr(queue, "_sync_to_hub", blocking_sync)
+
+    first_errors: list[BaseException] = []
+
+    def first_submit() -> None:
+        try:
+            asyncio.run(
+                queue.submit(
+                    SubmissionRequest(model="anthropic/claude-sonnet-4-6", submitter="worker")
+                )
+            )
+        except BaseException as exc:
+            first_errors.append(exc)
+
+    first_thread = threading.Thread(target=first_submit, daemon=True)
+    first_thread.start()
+    assert sync_started.wait(timeout=2), "first submit never reached hub sync"
+
+    outcome: dict[str, Job | BaseException] = {}
+
+    def second_submit() -> None:
+        try:
+            outcome["job"] = asyncio.run(
+                queue.submit(
+                    SubmissionRequest(model="huggingface/Qwen/Qwen3-32B", submitter="space-ui")
+                )
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    second_thread = threading.Thread(target=second_submit, daemon=True)
+    second_thread.start()
+    second_thread.join(timeout=2)
+    release_sync.set()
+    first_thread.join(timeout=2)
+
+    assert first_errors == []
+    assert not second_thread.is_alive(), "submit waited on hub upload lock"
+    assert "error" not in outcome, outcome.get("error")
+    job = outcome["job"]
+    assert isinstance(job, Job)
+    assert job.request.model == "huggingface/Qwen/Qwen3-32B"
+    assert job.status == JobStatus.PENDING
+
+
+def test_delayed_older_hub_upload_cannot_win_restart(tmp_path, monkeypatch):
+    """A late first snapshot must not become the restart source of truth."""
+    monkeypatch.setattr(queue_module, "LOCAL_QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(queue_module, "HF_TOKEN", "hf_test")
+    monkeypatch.setattr(queue_module, "ensure_dataset_repo", lambda *args, **kwargs: None)
+    monkeypatch.setattr(queue_module, "dataset_repo_files", lambda *args, **kwargs: [])
+    monkeypatch.setattr(queue_module, "resolve_dataset_repo", lambda token: "owner/queue")
+
+    queue = JobQueue()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    uploads: list[str] = []
+    remote: dict[str, str] = {}
+
+    def fake_upload(local_path) -> None:
+        payload = Path(local_path).read_text(encoding="utf-8")
+        status = json.loads(payload)[0]["status"]
+        if not first_started.is_set():
+            first_started.set()
+            assert release_first.wait(5), "first upload was not released"
+        remote["queue/jobs.json"] = payload
+        uploads.append(status)
+
+    monkeypatch.setattr(queue, "_upload_queue_snapshot", fake_upload)
+
+    submitted: dict[str, Job] = {}
+    submit_errors: list[BaseException] = []
+
+    def first_submit() -> None:
+        try:
+            submitted["job"] = asyncio.run(
+                queue.submit(
+                    SubmissionRequest(model="anthropic/claude-sonnet-4-6", submitter="worker")
+                )
+            )
+        except BaseException as exc:
+            submit_errors.append(exc)
+
+    submit_thread = threading.Thread(target=first_submit, daemon=True)
+    submit_thread.start()
+    assert first_started.wait(2), "first hub upload never started"
+    assert submit_errors == []
+    job = next(iter(queue._jobs.values()))
+
+    finished = threading.Thread(
+        target=lambda: asyncio.run(queue.mark_finished(job.job_id, "result-1")),
+        daemon=True,
+    )
+    finished.start()
+    # Give the second publication a chance to race if uploads are not serialized.
+    threading.Event().wait(0.05)
+    release_first.set()
+    submit_thread.join(timeout=2)
+    finished.join(timeout=2)
+    assert submit_errors == []
+    assert not submit_thread.is_alive(), "submit did not finish after first upload released"
+    assert not finished.is_alive(), "mark_finished did not finish after first upload released"
+    job = submitted["job"]
+
+    assert uploads[-1] == JobStatus.FINISHED
+    last = json.loads(remote["queue/jobs.json"])
+    assert last[0]["status"] == JobStatus.FINISHED
+
+    # Restart recovery overlays remote rows onto a fresh local queue.
+    restarted = JobQueue()
+    for item in last:
+        restored_job = Job(**item)
+        restarted._jobs[restored_job.job_id] = restored_job
+    restored = restarted._jobs[job.job_id]
+    assert restored.status == JobStatus.FINISHED
+    assert restored.result_id == "result-1"
