@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from clawbench.dynamics_archive import build_dynamics_report, load_task_runs_archive, safe_model_name, write_dynamics_report
 from clawbench.schemas import TaskRunResult, TokenUsage, ToolCall, Transcript, TranscriptMessage
 
@@ -113,3 +115,43 @@ def test_build_dynamics_report_includes_pairwise_sensitivity():
     assert same_task["n_pairs"] == 1
     assert "t1-demo-task" in same_task["per_task"]
     assert same_task["per_task"]["t1-demo-task"]["mean_score_delta"] > 0
+
+
+@pytest.mark.parametrize("contents", ['{"task_id":', '{}', b"\xff"])
+def test_load_task_runs_archive_rejects_corrupt_selected_run(tmp_path, contents):
+    task_dir = tmp_path / "model" / "t1-demo"
+    task_dir.mkdir(parents=True)
+    (task_dir / "run0.json").write_text(_run("t1-demo").model_dump_json())
+    corrupt = task_dir / "run1.json"
+    corrupt.write_bytes(contents if isinstance(contents, bytes) else contents.encode())
+
+    with pytest.raises(ValueError, match="run1.json"):
+        load_task_runs_archive(tmp_path)
+
+
+def test_load_task_runs_archive_rejects_unreadable_selected_run(tmp_path, monkeypatch):
+    task_dir = tmp_path / "model" / "t1-demo"
+    task_dir.mkdir(parents=True)
+    run_file = task_dir / "run0.json"
+    run_file.write_text(_run("t1-demo").model_dump_json())
+    original = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if path == run_file:
+            raise PermissionError("synthetic read failure")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(ValueError, match="run0.json"):
+        load_task_runs_archive(tmp_path)
+
+
+@pytest.mark.parametrize("filters", [{"tier": "tier1"}, {"task_ids": ["t1-demo"]}])
+def test_load_task_runs_archive_does_not_read_excluded_corrupt_runs(tmp_path, filters):
+    model_dir = tmp_path / "model"
+    for task_id in ["t1-demo", "t2-broken"]:
+        (model_dir / task_id).mkdir(parents=True)
+    (model_dir / "t1-demo" / "run0.json").write_text(_run("t1-demo").model_dump_json())
+    (model_dir / "t2-broken" / "run0.json").write_text("{broken")
+
+    assert list(load_task_runs_archive(tmp_path, **filters)) == ["t1-demo"]
