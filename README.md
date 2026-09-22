@@ -393,6 +393,11 @@ clawbench run \
 
 ### Analyze a real archive
 
+Offline dynamics analysis stops and names the affected file if a selected cached
+run cannot be read or validated. Repair or regenerate that run before retrying;
+invalid runs are never silently dropped from the analyzed cohort. Model, task,
+and tier filters still exclude unselected runs before loading.
+
 ```bash
 # Fair-comparison audit
 python3 scripts/audit_runs.py

@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Reject unreadable or invalid selected cached runs in offline dynamics reports instead of silently omitting them from the analyzed cohort (#88).
 - Stop all partially started background services on startup failure or cancellation and close parent log handles after spawning.
 - Isolate worker configuration test directories so concurrent test runs cannot delete one another's fixtures.
 - Refresh bundled Chromium through Playwright 1.62.1, align the Kubernetes MLflow server with client 3.15.2, and require Pydantic 2.13.5 bug fixes.

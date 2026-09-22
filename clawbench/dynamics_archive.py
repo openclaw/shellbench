@@ -152,8 +152,8 @@ def load_task_runs_archive(
                     run = TaskRunResult.model_validate_json(
                         run_file.read_text(encoding="utf-8")
                     )
-                except Exception:
-                    continue
+                except (OSError, ValueError) as exc:
+                    raise ValueError(f"Cannot load cached run {run_file}") from exc
                 runs.append(run)
 
             if runs:

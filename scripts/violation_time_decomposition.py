@@ -8,12 +8,8 @@ from pathlib import Path
 from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from clawbench.dynamics_archive import load_task_runs_by_model
+from clawbench.dynamics_archive import load_task_runs_by_model, safe_model_name
 from clawbench.trajectory import extract_shell_command
-
-
-def safe_name(value: str) -> str:
-    return value.replace("/", "_").replace(":", "_")
 
 
 def get_first_violation_turn(run):
@@ -259,7 +255,7 @@ def main():
             print(f"No events for {model_name}")
             continue
 
-        safe_model = safe_name(model_name)
+        safe_model = safe_model_name(model_name)
         model_out_dir = args.reports_dir / safe_model
         model_out_dir.mkdir(parents=True, exist_ok=True)
 

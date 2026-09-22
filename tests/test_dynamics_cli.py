@@ -74,3 +74,22 @@ def test_dynamics_report_cli_supports_no_plots(tmp_path: Path):
     assert "Saved 0 plots" in result.output
     assert (output_dir / "dynamics.json").exists()
     assert list(output_dir.glob("*.png")) == []
+
+
+def test_dynamics_report_rejects_partial_archive(tmp_path):
+    task_dir = tmp_path / "archive" / "model" / "t1-demo"
+    task_dir.mkdir(parents=True)
+    (task_dir / "run0.json").write_text(_run("t1-demo").model_dump_json())
+    corrupt = task_dir / "run1.json"
+    corrupt.write_text('{"task_id":')
+    output_dir = tmp_path / "out"
+
+    result = CliRunner().invoke(
+        cli,
+        ["dynamics-report", "--archive-dir", str(tmp_path / "archive"),
+         "--output-dir", str(output_dir), "--no-plots"],
+    )
+
+    assert result.exit_code != 0
+    assert str(corrupt) in result.output
+    assert not output_dir.exists()
