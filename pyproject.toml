@@ -10,11 +10,11 @@ dependencies = [
     "pydantic>=2.13.5,<3",
     "pyyaml>=6.0.3,<7",
     "datasets>=5.0.1,<6",
-    "gradio>=6.26.0,<7",
+    "gradio>=6.28.0,<7",
     "pillow>=12.3.0,<13",
     "httpx>=0.28.1,<1",
     "numpy>=2.4.6,<2.5; python_version < '3.12'",
-    "numpy>=2.5.2,<3; python_version >= '3.12'",
+    "numpy>=2.5.3,<3; python_version >= '3.12'",
     "rich>=15.0.0,<16",
     "click>=8.5.0,<9",
     # Runtime deps for the task completion verifier. The harness shells out
@@ -32,10 +32,10 @@ dev = [
     "pytest>=9.1.1,<10",
     "pytest-asyncio>=1.4.0,<2",
     "pre-commit>=4.6.2,<5",
-    "ruff>=0.16.5,<1",
+    "ruff>=0.16.8,<1",
 ]
 mlflow = [
-    "mlflow>=3.15.2,<4",
+    "mlflow>=3.16.1,<4",
 ]
 hermes = [
     "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main",
