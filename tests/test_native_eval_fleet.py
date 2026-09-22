@@ -834,8 +834,13 @@ def test_capacity_warmup_retries_same_run_without_recovery_churn(
     assert executor.dispatches == [retry_label, untouched_label]
 
 
-def test_model_cap_counts_adopted_run_before_dispatching_same_model(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "caps",
+    [{"model_max_runs": {"fable5": 1}}, {"provider_max_runs": {"anthropic": 1}}],
+    ids=["model", "provider"],
+)
+def test_caps_count_adopted_run_before_dispatching_same_model(
+    tmp_path: Path, caps: dict[str, dict[str, int]],
 ) -> None:
     adopted_label = "openclaw-fable5-full-2-r1-20260727"
     pending_fable_label = "openclaw-fable5-full-2-r2-20260727"
@@ -861,8 +866,9 @@ def test_model_cap_counts_adopted_run_before_dispatching_same_model(
         tmp_path,
         run_index,
         max_leases=2,
-        model_max_runs={"fable5": 1},
+        **caps,
     )
+    release_adopted = threading.Event()
     executor = FakeExecutor(
         config.local_root,
         expected_counts={
@@ -871,6 +877,7 @@ def test_model_cap_counts_adopted_run_before_dispatching_same_model(
             pending_gpt_label: 2,
         },
         running_labels={adopted_label},
+        checkpoint_blocks={adopted_label: release_adopted},
     )
     executor.leases["cbx_existing"] = {
         "id": "cbx_existing",
@@ -885,7 +892,20 @@ def test_model_cap_counts_adopted_run_before_dispatching_same_model(
     }
     executor.active_leases = 1
 
-    assert FleetController(config, executor=executor).run() == 0
+    result: list[int] = []
+    controller = threading.Thread(
+        target=lambda: result.append(FleetController(config, executor=executor).run())
+    )
+    controller.start()
+    try:
+        assert executor.wait_for_dispatch(pending_gpt_label, timeout=SCHEDULER_TEST_TIMEOUT)
+        assert pending_fable_label not in executor.dispatches
+    finally:
+        release_adopted.set()
+        controller.join(timeout=SCHEDULER_TEST_TIMEOUT)
+
+    assert not controller.is_alive()
+    assert result == [0]
 
     assert executor.dispatches == [pending_gpt_label, pending_fable_label]
     adopted_stop = executor.events.index(("stop", "cbx_existing"))
@@ -974,65 +994,6 @@ def test_model_task_concurrency_override_is_used_at_dispatch(tmp_path: Path) -> 
         fable_label: 2,
         gpt_label: 16,
     }
-
-
-def test_provider_cap_counts_adopted_run_before_dispatching_same_provider(
-    tmp_path: Path,
-) -> None:
-    adopted_label = "openclaw-fable5-full-2-r1-20260727"
-    pending_fable_label = "openclaw-fable5-full-2-r2-20260727"
-    pending_gpt_label = "openclaw-gpt55-full-2-r1-20260727"
-    adopted = _planned(_run_spec(adopted_label, model_slug="fable5"))
-    adopted["status"] = "running"
-    adopted["lease"] = {
-        "id": "cbx_existing",
-        "slug": "existing",
-        "provider": "aws",
-        "state": "active",
-    }
-    run_index = tmp_path / "manifests" / "run_index.json"
-    _write_index(
-        run_index,
-        [
-            _planned(_run_spec(pending_fable_label, model_slug="fable5")),
-            _planned(_run_spec(pending_gpt_label)),
-            adopted,
-        ],
-    )
-    config = _config(
-        tmp_path,
-        run_index,
-        max_leases=2,
-        provider_max_runs={"anthropic": 1},
-    )
-    executor = FakeExecutor(
-        config.local_root,
-        expected_counts={
-            adopted_label: 2,
-            pending_fable_label: 2,
-            pending_gpt_label: 2,
-        },
-        running_labels={adopted_label},
-    )
-    executor.leases["cbx_existing"] = {
-        "id": "cbx_existing",
-        "slug": "existing",
-        "state": "active",
-        "ready": True,
-        "serverType": "c7a.24xlarge",
-        "sshHost": "192.0.2.50",
-        "sshUser": "crabbox",
-        "sshPort": "22",
-        "sshKey": "/tmp/cbx_existing.key",
-    }
-    executor.active_leases = 1
-
-    assert FleetController(config, executor=executor).run() == 0
-
-    assert executor.dispatches == [pending_gpt_label, pending_fable_label]
-    adopted_stop = executor.events.index(("stop", "cbx_existing"))
-    pending_fable_dispatch = executor.events.index(("dispatch", pending_fable_label))
-    assert adopted_stop < pending_fable_dispatch
 
 
 def test_slow_capped_model_does_not_block_refilling_eligible_slot(
