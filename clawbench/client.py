@@ -204,6 +204,13 @@ class GatewayConfig:
     )
 
 
+class _GatewayRPCError(RuntimeError):
+    def __init__(self, method: str, code: str, message: str) -> None:
+        super().__init__(f"RPC {method} failed: {code} - {message}")
+        self.code = code
+        self.message = message
+
+
 class GatewayClient:
     """Persistent WebSocket client for the OpenClaw gateway."""
 
@@ -213,6 +220,7 @@ class GatewayClient:
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._event_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._listen_task: asyncio.Task[None] | None = None
+        self._agent_registration_deadlines: dict[str, float] = {}
 
     async def __aenter__(self) -> GatewayClient:
         await self.connect()
@@ -264,10 +272,10 @@ class GatewayClient:
                     "operator.pairing",
                 ]
                 client_info = {
-                    "id": "openclaw-control-ui",
+                    "id": "cli",
                     "version": __version__,
                     "platform": "linux",
-                    "mode": "ui",
+                    "mode": "cli",
                 }
                 connect_params: dict[str, Any] = {
                     "minProtocol": MIN_PROTOCOL_VERSION,
@@ -345,7 +353,29 @@ class GatewayClient:
             params["agentId"] = agent_id
         if label:
             params["label"] = label
-        response = await self._rpc("sessions.create", params)
+        loop = asyncio.get_running_loop()
+        deadline = self._agent_registration_deadlines.get(agent_id or "", 0.0)
+        while True:
+            remaining = deadline - loop.time()
+            try:
+                response = await self._rpc(
+                    "sessions.create", params,
+                    timeout=min(self.config.request_timeout, remaining) if remaining > 0 else None,
+                )
+                break
+            except _GatewayRPCError as exc:
+                remaining = deadline - loop.time()
+                # agents.create can return before its config hot reload applies.
+                if (
+                    remaining <= 0
+                    or exc.code != "INVALID_REQUEST"
+                    or exc.message != f'Unknown agent id "{agent_id}"'
+                ):
+                    raise
+                await asyncio.sleep(min(0.25, remaining))
+                if loop.time() >= deadline:
+                    raise
+        self._agent_registration_deadlines.pop(agent_id or "", None)
         payload = response.get("payload", {})
         key = payload.get("sessionKey") or payload.get("key", "")
         if not key:
@@ -425,7 +455,11 @@ class GatewayClient:
         agent_id = payload.get("agentId", "")
         if not agent_id:
             raise RuntimeError(f"agents.create returned no agentId: {payload}")
-        return str(agent_id)
+        agent_id = str(agent_id)
+        self._agent_registration_deadlines[agent_id] = (
+            asyncio.get_running_loop().time() + min(5.0, self.config.request_timeout)
+        )
+        return agent_id
 
     async def update_agent(
         self,
@@ -448,6 +482,7 @@ class GatewayClient:
         await self._rpc("agents.update", params)
 
     async def delete_agent(self, agent_id: str, *, delete_files: bool = False) -> None:
+        self._agent_registration_deadlines.pop(agent_id, None)
         try:
             await self._rpc("agents.delete", {"agentId": agent_id, "deleteFiles": delete_files})
         except Exception as exc:
@@ -645,19 +680,20 @@ class GatewayClient:
         effective_timeout = timeout if timeout is not None else self.config.request_timeout
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        await self._ws.send(json.dumps(frame))
         try:
+            await self._ws.send(json.dumps(frame))
             response = await asyncio.wait_for(future, timeout=effective_timeout)
         except asyncio.TimeoutError:
-            self._pending.pop(request_id, None)
             raise TimeoutError(
                 f"RPC {method} timed out after {effective_timeout:.1f}s"
             )
+        finally:
+            self._pending.pop(request_id, None)
 
         if not response.get("ok", False):
             error = response.get("error", {})
-            raise RuntimeError(
-                f"RPC {method} failed: {error.get('code', '?')} - {error.get('message', '')}"
+            raise _GatewayRPCError(
+                method, error.get("code", "?"), error.get("message", "")
             )
         return response
 
@@ -788,6 +824,8 @@ def _resolve_node_executable() -> str | None:
 
 
 def _is_transient_gateway_connect_error(exc: Exception) -> bool:
+    if isinstance(exc, _GatewayRPCError):
+        return exc.code == "UNAVAILABLE" and exc.message == "gateway starting; retry shortly"
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
         return True
     if isinstance(exc, websockets.exceptions.ConnectionClosed):
