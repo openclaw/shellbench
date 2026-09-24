@@ -439,6 +439,25 @@ clawbench dynamics-report \
 
 A single consumer GPU running an open-weight model is enough to develop plugin profiles and validate algorithmic ideas — no API keys or cloud spend required.
 
+ClawBench connects to the gateway as a CLI operator using a persistent device
+identity. On gateways that require pairing (including OpenClaw 2026.9.5), the
+first run can fail with `NOT_PAIRED`. On the gateway host, run
+`openclaw devices list`, verify the harness device and requested operator scopes,
+then run `openclaw devices approve <requestId>` and retry the benchmark. Existing
+devices can also require approval when the client identity or scopes change.
+Keep the harness's `OPENCLAW_STATE_DIR` stable across retries; its identity is
+stored in `identity/device.json` there (default: `~/.openclaw`). Node.js is required
+to sign the device challenge. Disabling device identity with
+`CLAWBENCH_DISABLE_GATEWAY_DEVICE_IDENTITY=1` does not replace approval: a token-only
+connection may lack the `operator.admin` scope needed to create benchmark agents.
+
+The gateway's `gateway starting; retry shortly` admission response is retried
+within `CLAWBENCH_CONNECT_TIMEOUT`; other RPC admission failures remain errors.
+After creating an agent, ClawBench tolerates its transient `Unknown agent id`
+session-creation response for up to five seconds from creation, capped by
+`CLAWBENCH_REQUEST_TIMEOUT`. Other errors fail immediately; a gateway that never
+registers the agent still fails the run.
+
 ```bash
 ollama pull gpt-oss:20b
 export OPENCLAW_GATEWAY_TOKEN=<your-gateway-token>
